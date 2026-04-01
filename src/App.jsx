@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { BookOpen, Users, GraduationCap, Settings, LogOut, Plus, Trash2, Edit, Eye, Clock, AlertTriangle, CheckCircle, XCircle, Monitor, Upload, Image, ChevronRight, Menu, X, Search, FileText, BarChart3, Shield, Lock, Save, RefreshCw, ChevronDown, ArrowLeft, Home, User, Hash, Layers, Play, Square, Award, Bell, AlertCircle } from "lucide-react";
+import mammoth from "mammoth";
 
 // ============= CONSTANTS =============
 const SCHOOL_NAME = "SMA Negeri 6 Pangkajene dan Kepulauan";
@@ -38,7 +39,7 @@ const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2
 // Ganti nilai di bawah ini dengan konfigurasi Firebase project Anda
 // Cara mendapatkannya: https://console.firebase.google.com → Project Settings → Web App
 import { initializeApp } from "firebase/app";
-import { getFirestore, doc, getDoc, setDoc } from "firebase/firestore";
+import { getFirestore, doc, getDoc, setDoc, onSnapshot } from "firebase/firestore";
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -88,9 +89,13 @@ const DEFAULT_DATA = {
 // ============= MAIN APP =============
 export default function ExamApp() {
   const [data, setData] = useState(null);
-  const [user, setUser] = useState(null);
+  const [user, setUser] = useState(() => {
+    try { const s = localStorage.getItem("exam_user"); return s ? JSON.parse(s) : null; } catch { return null; }
+  });
   const [loading, setLoading] = useState(true);
-  const [view, setView] = useState("login");
+  const [view, setView] = useState(() => {
+    try { return localStorage.getItem("exam_view") || "login"; } catch { return "login"; }
+  });
   const [toast, setToast] = useState(null);
 
   const showToast = useCallback((msg, type = "success") => {
@@ -98,19 +103,38 @@ export default function ExamApp() {
     setTimeout(() => setToast(null), 3000);
   }, []);
 
+  // Real-time sync with onSnapshot
   useEffect(() => {
+    const ref = doc(db, "examapp", "examapp_data");
+    
+    // Initial load
     (async () => {
-      let d = await store.get("examapp_data");
-      if (!d) {
-        d = DEFAULT_DATA;
-        await store.set("examapp_data", d);
+      let snap = await getDoc(ref);
+      if (!snap.exists()) {
+        await setDoc(ref, { value: DEFAULT_DATA });
+        snap = await getDoc(ref);
       }
+      let d = snap.data().value;
       if (!d.subjects || d.subjects.length === 0) d.subjects = MAPEL_K13;
       if (!d.sessions) d.sessions = [];
       if (!d.results) d.results = [];
       setData(d);
       setLoading(false);
     })();
+
+    // Listen for real-time changes
+    const unsub = onSnapshot(ref, (snap) => {
+      if (snap.exists()) {
+        const d = snap.data().value;
+        if (d) {
+          if (!d.subjects || d.subjects.length === 0) d.subjects = MAPEL_K13;
+          if (!d.sessions) d.sessions = [];
+          if (!d.results) d.results = [];
+          setData(d);
+        }
+      }
+    }, (err) => console.error("Sync error:", err));
+    return () => unsub();
   }, []);
 
   const saveData = useCallback(async (newData) => {
@@ -123,22 +147,28 @@ export default function ExamApp() {
     const { role, username, password } = credentials;
     if (role === "admin") {
       if (username === data.admin.username && password === data.admin.password) {
-        setUser({ role: "admin", name: "Administrator" });
-        setView("admin");
+        const u = { role: "admin", name: "Administrator" };
+        setUser(u); setView("admin");
+        localStorage.setItem("exam_user", JSON.stringify(u));
+        localStorage.setItem("exam_view", "admin");
         showToast("Login berhasil sebagai Admin");
       } else { showToast("Username atau password salah", "error"); }
     } else if (role === "guru") {
-      const guru = data.teachers.find(t => t.name.toLowerCase() === username.toLowerCase() && t.nip === password);
+      const guru = data.teachers.find(t => t.name.toLowerCase() === username.toLowerCase() && (t.password || t.nip) === password);
       if (guru) {
-        setUser({ role: "guru", ...guru });
-        setView("guru");
+        const u = { role: "guru", ...guru };
+        setUser(u); setView("guru");
+        localStorage.setItem("exam_user", JSON.stringify(u));
+        localStorage.setItem("exam_view", "guru");
         showToast(`Selamat datang, ${guru.name}`);
       } else { showToast("Nama atau NIP salah", "error"); }
     } else if (role === "siswa") {
       const siswa = data.students.find(s => s.name.toLowerCase() === username.toLowerCase() && s.nisn === password);
       if (siswa) {
-        setUser({ role: "siswa", ...siswa });
-        setView("siswa");
+        const u = { role: "siswa", ...siswa };
+        setUser(u); setView("siswa");
+        localStorage.setItem("exam_user", JSON.stringify(u));
+        localStorage.setItem("exam_view", "siswa");
         showToast(`Selamat datang, ${siswa.name}`);
       } else { showToast("Nama atau NISN salah", "error"); }
     }
@@ -147,6 +177,8 @@ export default function ExamApp() {
   const handleLogout = useCallback(() => {
     setUser(null);
     setView("login");
+    localStorage.removeItem("exam_user");
+    localStorage.removeItem("exam_view");
   }, []);
 
   if (loading) return <LoadingScreen />;
@@ -353,6 +385,8 @@ function AdminDashboard({ data, saveData, user, onLogout, showToast }) {
     { id: "students", label: "Data Siswa", icon: <GraduationCap size={18} /> },
     { id: "subjects", label: "Mata Pelajaran", icon: <BookOpen size={18} /> },
     { id: "exams", label: "Kelola Ujian", icon: <FileText size={18} /> },
+    { id: "questions", label: "Bank Soal", icon: <FileText size={18} /> },
+    { id: "import", label: "Import Soal", icon: <Upload size={18} /> },
     { id: "monitor", label: "Monitoring", icon: <Monitor size={18} /> },
     { id: "results", label: "Hasil Ujian", icon: <BarChart3 size={18} /> },
     { id: "settings", label: "Pengaturan", icon: <Settings size={18} /> },
@@ -365,6 +399,8 @@ function AdminDashboard({ data, saveData, user, onLogout, showToast }) {
       {tab === "students" && <StudentManager data={data} saveData={saveData} showToast={showToast} />}
       {tab === "subjects" && <SubjectManager data={data} saveData={saveData} showToast={showToast} />}
       {tab === "exams" && <ExamManager data={data} saveData={saveData} showToast={showToast} isAdmin />}
+      {tab === "questions" && <QuestionManager data={data} saveData={saveData} showToast={showToast} />}
+      {tab === "import" && <ImportSoal data={data} saveData={saveData} showToast={showToast} userId="admin" />}
       {tab === "monitor" && <MonitorView data={data} saveData={saveData} />}
       {tab === "results" && <ResultsView data={data} />}
       {tab === "settings" && <SettingsView data={data} saveData={saveData} showToast={showToast} />}
@@ -973,7 +1009,7 @@ function ExamManager({ data, saveData, showToast, isAdmin, userId }) {
 function MonitorView({ data, saveData }) {
   const [selectedExam, setSelectedExam] = useState(null);
   const [, forceUpdate] = useState(0);
-  useEffect(() => { const iv = setInterval(() => forceUpdate(n => n + 1), 5000); return () => clearInterval(iv); }, []);
+  useEffect(() => { const iv = setInterval(() => forceUpdate(n => n + 1), 3000); return () => clearInterval(iv); }, []);
 
   const activeExams = data.exams.filter(e => e.status === "active");
 
@@ -1052,10 +1088,35 @@ function MonitorView({ data, saveData }) {
   );
 }
 
+// ============= PRINT RESULTS PDF =============
+function printResults(exam, results, data) {
+  const subjectName = data.subjects.find(s => s.id === exam?.subjectId)?.name || "-";
+  const avg = results.length > 0 ? (results.reduce((a, r) => a + r.score, 0) / results.length).toFixed(1) : "0";
+  const highest = results.length > 0 ? Math.max(...results.map(r => r.score)).toFixed(1) : "0";
+  const lowest = results.length > 0 ? Math.min(...results.map(r => r.score)).toFixed(1) : "0";
+  const passed = results.filter(r => r.score >= 75).length;
+  
+  const rows = results.sort((a, b) => b.score - a.score).map((r, i) => {
+    const st = data.students.find(s => s.id === r.studentId);
+    return `<tr><td style="padding:6px 8px;border:1px solid #ddd;text-align:center">${i+1}</td><td style="padding:6px 8px;border:1px solid #ddd">${st?.name || "?"}</td><td style="padding:6px 8px;border:1px solid #ddd;text-align:center">${st?.kelas || "-"}</td><td style="padding:6px 8px;border:1px solid #ddd;text-align:center">${st?.nisn || "-"}</td><td style="padding:6px 8px;border:1px solid #ddd;text-align:center">${r.correct}/${exam?.questionIds.length||0}</td><td style="padding:6px 8px;border:1px solid #ddd;text-align:center;font-weight:bold;color:${r.score>=75?'#16a34a':r.score>=50?'#d97706':'#dc2626'}">${r.score.toFixed(1)}</td><td style="padding:6px 8px;border:1px solid #ddd;text-align:center">${r.score >= 75 ? 'Tuntas' : 'Belum Tuntas'}</td></tr>`;
+  }).join("");
+
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Laporan Hasil Ujian</title><style>body{font-family:'Segoe UI',sans-serif;padding:24px;color:#1e293b}h1{font-size:18px;margin:0}h2{font-size:14px;font-weight:normal;color:#475569;margin:4px 0 0}table{width:100%;border-collapse:collapse;margin-top:16px;font-size:12px}th{background:#1e293b;color:white;padding:8px;text-align:center;border:1px solid #ddd}.stats{display:flex;gap:16px;margin:16px 0}.stat{flex:1;padding:12px;background:#f1f5f9;border-radius:8px;text-align:center}.stat .val{font-size:20px;font-weight:bold;color:#1e293b}.stat .lbl{font-size:10px;color:#64748b;margin-top:2px}.header{border-bottom:2px solid #1e293b;padding-bottom:12px;margin-bottom:8px}.footer{margin-top:32px;font-size:11px;color:#94a3b8;text-align:center}@media print{body{padding:12px}}</style></head><body>
+  <div class="header"><h1>${SCHOOL_NAME}</h1><h2>Laporan Hasil ${exam?.title || "Ujian"}</h2><p style="font-size:12px;color:#64748b;margin-top:4px">Mata Pelajaran: ${subjectName} | Tanggal cetak: ${new Date().toLocaleDateString("id-ID", {weekday:'long',year:'numeric',month:'long',day:'numeric'})}</p></div>
+  <div class="stats"><div class="stat"><div class="val">${results.length}</div><div class="lbl">Total Peserta</div></div><div class="stat"><div class="val">${avg}</div><div class="lbl">Rata-rata</div></div><div class="stat"><div class="val">${highest}</div><div class="lbl">Nilai Tertinggi</div></div><div class="stat"><div class="val">${lowest}</div><div class="lbl">Nilai Terendah</div></div><div class="stat"><div class="val">${passed}/${results.length}</div><div class="lbl">Tuntas (≥75)</div></div></div>
+  <table><thead><tr><th>No</th><th>Nama Siswa</th><th>Kelas</th><th>NISN</th><th>Benar</th><th>Nilai</th><th>Keterangan</th></tr></thead><tbody>${rows}</tbody></table>
+  <div class="footer"><p>${SCHOOL_SHORT} — Sistem Ujian Digital | Dicetak oleh sistem</p></div>
+  <script>setTimeout(()=>window.print(),500)<\/script></body></html>`;
+  
+  const w = window.open("", "_blank");
+  w.document.write(html);
+  w.document.close();
+}
+
 // ============= RESULTS VIEW =============
 function ResultsView({ data }) {
   const [selectedExam, setSelectedExam] = useState(null);
-  const endedExams = data.exams.filter(e => e.status === "ended" || (data.results || []).some(r => r.examId === e.id));
+  const endedExams = data.exams.filter(e => e.status === "ended" || e.status === "active" || (data.results || []).some(r => r.examId === e.id));
 
   if (selectedExam) {
     const exam = data.exams.find(e => e.id === selectedExam);
@@ -1065,7 +1126,10 @@ function ResultsView({ data }) {
     return (
       <div>
         <button onClick={() => setSelectedExam(null)} className="flex items-center gap-2 text-blue-400 mb-4 hover:underline"><ArrowLeft size={16} />Kembali</button>
-        <h2 className="text-white text-2xl font-bold mb-4">{exam?.title} — Hasil</h2>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-white text-2xl font-bold">{exam?.title} — Hasil</h2>
+          <Btn onClick={() => printResults(exam, results, data)}><FileText size={14} />Cetak Laporan</Btn>
+        </div>
         <Card>
           {results.length === 0 ? <EmptyState icon={<BarChart3 size={40} className="mx-auto" />} text="Belum ada hasil" /> : (
             <div className="space-y-2">
@@ -1177,15 +1241,306 @@ function SettingsView({ data, saveData, showToast }) {
   );
 }
 
+// ============= IMPORT SOAL FROM DOCX =============
+function ImportSoal({ data, saveData, showToast, userId }) {
+  const [step, setStep] = useState(1);
+  const [soalText, setSoalText] = useState("");
+  const [kunciText, setKunciText] = useState("");
+  const [soalFile, setSoalFile] = useState(null);
+  const [kunciFile, setKunciFile] = useState(null);
+  const [parsed, setParsed] = useState([]);
+  const [subjectId, setSubjectId] = useState("");
+  const [importing, setImporting] = useState(false);
+  const [reading, setReading] = useState(false);
+
+  const readDocx = async (file) => {
+    const ab = await file.arrayBuffer();
+    const result = await mammoth.extractRawText({ arrayBuffer: ab });
+    return result.value;
+  };
+
+  const handleSoalUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setSoalFile(file);
+    setReading(true);
+    try {
+      const text = await readDocx(file);
+      setSoalText(text);
+      showToast("File soal berhasil dibaca");
+    } catch (err) {
+      showToast("Gagal membaca file: " + err.message, "error");
+    }
+    setReading(false);
+  };
+
+  const handleKunciUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setKunciFile(file);
+    setReading(true);
+    try {
+      const text = await readDocx(file);
+      setKunciText(text);
+      showToast("File kunci jawaban berhasil dibaca");
+    } catch (err) {
+      showToast("Gagal membaca file: " + err.message, "error");
+    }
+    setReading(false);
+  };
+
+  const parseAnswerKey = (txt) => {
+    const key = {};
+    const re = /\b(\d{1,2})\s*[\.\)\|\:]*\s*\*{0,2}\s*([A-Ea-e])\b/g;
+    let m;
+    while ((m = re.exec(txt)) !== null) {
+      const n = parseInt(m[1]);
+      if (n >= 1 && n <= 100) key[n] = m[2].toUpperCase();
+    }
+    return key;
+  };
+
+  const parseQuestions = (txt, ansKey) => {
+    const qs = [];
+    const lines = txt.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    const blocks = [];
+    let current = null;
+
+    for (const line of lines) {
+      const qMatch = line.match(/^\s*\*{0,2}\s*(\d{1,2})\s*[\.\)]\s*\*{0,2}\s*(.*)/);
+      if (qMatch) {
+        const num = parseInt(qMatch[1]);
+        if (num >= 1 && num <= 100) {
+          const maybeOpt = line.match(/^\s*\d{1,2}\s*[\.\)]\s*[A-E]\s*[\.\)]/);
+          if (!maybeOpt) {
+            if (current) blocks.push(current);
+            current = { num, lines: [qMatch[2]] };
+            continue;
+          }
+        }
+      }
+      if (current) current.lines.push(line);
+    }
+    if (current) blocks.push(current);
+
+    for (const block of blocks) {
+      const opts = {};
+      let qText = "";
+      let curOpt = null;
+      let foundOpt = false;
+
+      for (const line of block.lines) {
+        const optM = line.match(/^\s*([A-Ea-e])\s*[\.\)]\s*(.*)/);
+        if (optM) {
+          foundOpt = true;
+          curOpt = optM[1].toUpperCase();
+          opts[curOpt] = optM[2].trim();
+        } else if (curOpt && foundOpt) {
+          if (line.trim()) opts[curOpt] += " " + line.trim();
+        } else if (!foundOpt) {
+          qText += (qText ? "\n" : "") + line;
+        }
+      }
+
+      qText = qText.trim().replace(/\*\*/g, "").replace(/\\"/g, '"').replace(/\\'/g, "'");
+      const optKeys = ["A", "B", "C", "D", "E"].filter(k => opts[k]);
+
+      if (qText && optKeys.length >= 2) {
+        const correctLetter = ansKey[block.num] || null;
+        const correctIdx = correctLetter ? optKeys.indexOf(correctLetter) : -1;
+        qs.push({
+          num: block.num,
+          text: qText,
+          options: optKeys.map(k => opts[k]),
+          correctAnswer: correctIdx >= 0 ? correctIdx : 0,
+          hasKey: correctIdx >= 0
+        });
+      }
+    }
+
+    qs.sort((a, b) => a.num - b.num);
+    return qs;
+  };
+
+  const handleParse = () => {
+    if (!soalText) return showToast("Upload file soal terlebih dahulu", "error");
+    if (!subjectId) return showToast("Pilih mata pelajaran", "error");
+
+    const ansKey = kunciText ? parseAnswerKey(kunciText) : {};
+    const result = parseQuestions(soalText, ansKey);
+
+    if (result.length === 0) {
+      showToast("Tidak ditemukan soal. Pastikan format: 1. ... A. ... B. ... dst.", "error");
+      return;
+    }
+
+    setParsed(result);
+    setStep(2);
+    showToast(`${result.length} soal berhasil diparse!`);
+  };
+
+  const handleImport = () => {
+    if (parsed.length === 0) return;
+    setImporting(true);
+
+    const newQuestions = parsed.map(q => ({
+      id: genId(),
+      subjectId,
+      text: q.text,
+      image: "",
+      options: q.options,
+      correctAnswer: q.correctAnswer,
+      explanation: "",
+      createdBy: userId || "admin"
+    }));
+
+    const updatedData = { ...data, questions: [...data.questions, ...newQuestions] };
+    saveData(updatedData);
+    setImporting(false);
+    setStep(3);
+    showToast(`${newQuestions.length} soal berhasil diimport ke Bank Soal!`);
+  };
+
+  const handleReset = () => {
+    setStep(1);
+    setSoalText("");
+    setKunciText("");
+    setSoalFile(null);
+    setKunciFile(null);
+    setParsed([]);
+    setSubjectId("");
+  };
+
+  const withKey = parsed.filter(q => q.hasKey).length;
+
+  return (
+    <div>
+      <h2 className="text-white text-2xl font-bold mb-5">Import Soal dari Word</h2>
+
+      {step === 1 && (
+        <Card>
+          <div className="space-y-5">
+            <div>
+              <label className="text-blue-300 text-sm font-medium mb-2 block">📝 File Soal (.docx) *</label>
+              <label className="cursor-pointer block p-6 rounded-xl text-center transition hover:border-blue-500" style={{ border: "2px dashed rgba(59,130,246,0.3)", background: "rgba(15,23,42,0.5)" }}>
+                <Upload size={32} className="mx-auto mb-2 text-blue-400" />
+                <div className="text-white text-sm font-medium">{soalFile ? soalFile.name : "Klik untuk upload file soal"}</div>
+                <div className="text-slate-500 text-xs mt-1">Format: .docx (Word Document)</div>
+                <input type="file" accept=".docx" onChange={handleSoalUpload} className="hidden" />
+              </label>
+            </div>
+
+            <div>
+              <label className="text-blue-300 text-sm font-medium mb-2 block">🔑 Kunci Jawaban (.docx) - Opsional</label>
+              <label className="cursor-pointer block p-4 rounded-xl text-center transition hover:border-blue-500" style={{ border: "2px dashed rgba(59,130,246,0.2)", background: "rgba(15,23,42,0.3)" }}>
+                <div className="text-white text-sm">{kunciFile ? kunciFile.name : "Klik untuk upload kunci jawaban"}</div>
+                <div className="text-slate-500 text-xs mt-1">Jika tidak diupload, kunci bisa diatur manual nanti</div>
+                <input type="file" accept=".docx" onChange={handleKunciUpload} className="hidden" />
+              </label>
+            </div>
+
+            <div>
+              <label className="text-blue-300 text-sm font-medium mb-1 block">Mata Pelajaran *</label>
+              <select value={subjectId} onChange={e => setSubjectId(e.target.value)} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }}>
+                <option value="">-- Pilih Mapel --</option>
+                {data.subjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+
+            <Btn onClick={handleParse} disabled={!soalText || !subjectId || reading}>
+              {reading ? <><RefreshCw size={14} className="animate-spin" />Membaca file...</> : <><CheckCircle size={14} />Parse Soal Otomatis</>}
+            </Btn>
+          </div>
+        </Card>
+      )}
+
+      {step === 2 && (
+        <div>
+          <div className="grid grid-cols-3 gap-3 mb-4">
+            <div className="p-4 rounded-xl text-center" style={{ background: "rgba(59,130,246,0.1)", border: "1px solid rgba(59,130,246,0.2)" }}>
+              <div className="text-2xl font-bold text-blue-400">{parsed.length}</div>
+              <div className="text-slate-400 text-xs">Total Soal</div>
+            </div>
+            <div className="p-4 rounded-xl text-center" style={{ background: "rgba(22,163,74,0.1)", border: "1px solid rgba(22,163,74,0.2)" }}>
+              <div className="text-2xl font-bold text-green-400">{withKey}</div>
+              <div className="text-slate-400 text-xs">Ada Kunci</div>
+            </div>
+            <div className="p-4 rounded-xl text-center" style={{ background: "rgba(168,85,247,0.1)", border: "1px solid rgba(168,85,247,0.2)" }}>
+              <div className="text-2xl font-bold text-purple-400">{data.subjects.find(s => s.id === subjectId)?.name?.split(" ")[0] || "-"}</div>
+              <div className="text-slate-400 text-xs">Mapel</div>
+            </div>
+          </div>
+
+          {withKey > 0 && (
+            <Card>
+              <div className="text-slate-400 text-xs font-medium mb-2">Kunci Jawaban:</div>
+              <div className="grid grid-cols-10 gap-1">
+                {parsed.map(q => (
+                  <div key={q.num} className="p-1 rounded text-center text-xs" style={{ background: "rgba(15,23,42,0.5)" }}>
+                    <div className="text-slate-500">{q.num}</div>
+                    <div className="font-bold" style={{ color: q.hasKey ? "#4ade80" : "#64748b" }}>{q.hasKey ? String.fromCharCode(65 + q.correctAnswer) : "-"}</div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          )}
+
+          <Card>
+            <div className="text-slate-400 text-xs mb-3">Preview Soal:</div>
+            <div className="space-y-3 max-h-[45vh] overflow-y-auto pr-2">
+              {parsed.map(q => (
+                <div key={q.num} className="p-3 rounded-xl" style={{ background: "rgba(15,23,42,0.5)", borderLeft: "3px solid #3b82f6" }}>
+                  <div className="text-blue-400 text-xs font-bold mb-1">Soal {q.num}</div>
+                  <div className="text-white text-sm mb-2 whitespace-pre-wrap">{q.text.substring(0, 200)}{q.text.length > 200 ? "..." : ""}</div>
+                  <div className="flex flex-wrap gap-1">
+                    {q.options.map((o, oi) => (
+                      <span key={oi} className="px-2 py-0.5 rounded text-xs" style={{ background: oi === q.correctAnswer && q.hasKey ? "rgba(22,163,74,0.2)" : "rgba(51,65,85,0.5)", color: oi === q.correctAnswer && q.hasKey ? "#4ade80" : "#94a3b8" }}>
+                        {String.fromCharCode(65 + oi)}. {o.substring(0, 40)}{o.length > 40 ? "..." : ""} {oi === q.correctAnswer && q.hasKey ? "✓" : ""}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Card>
+
+          <div className="flex gap-3 mt-4">
+            <button onClick={handleReset} className="px-4 py-2.5 rounded-xl text-sm font-medium text-slate-400" style={{ border: "1px solid rgba(51,65,85,0.5)" }}>↩ Ulang</button>
+            <Btn onClick={handleImport} disabled={importing}>
+              {importing ? <><RefreshCw size={14} className="animate-spin" />Mengimport...</> : <><Plus size={14} />Import {parsed.length} Soal ke Bank Soal</>}
+            </Btn>
+          </div>
+        </div>
+      )}
+
+      {step === 3 && (
+        <Card>
+          <div className="text-center py-8">
+            <div className="text-5xl mb-4">✅</div>
+            <h3 className="text-white text-xl font-bold mb-2">Import Berhasil!</h3>
+            <p className="text-slate-400 text-sm mb-6">{parsed.length} soal berhasil ditambahkan ke Bank Soal {data.subjects.find(s => s.id === subjectId)?.name}</p>
+            <div className="flex gap-3 justify-center">
+              <button onClick={handleReset} className="px-4 py-2.5 rounded-xl text-sm font-medium text-slate-400" style={{ border: "1px solid rgba(51,65,85,0.5)" }}>Import Soal Lagi</button>
+              <Btn onClick={() => showToast("Silakan buka tab Bank Soal untuk melihat soal yang diimport")}>Lihat Bank Soal</Btn>
+            </div>
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
 // ============= TEACHER DASHBOARD =============
 function TeacherDashboard({ data, saveData, user, onLogout, showToast }) {
   const [tab, setTab] = useState("dashboard");
   const tabs = [
     { id: "dashboard", label: "Dashboard", icon: <Home size={18} /> },
+    { id: "import", label: "Import Soal", icon: <Upload size={18} /> },
     { id: "questions", label: "Bank Soal", icon: <FileText size={18} /> },
     { id: "exams", label: "Kelola Ujian", icon: <Layers size={18} /> },
     { id: "monitor", label: "Monitoring", icon: <Monitor size={18} /> },
     { id: "results", label: "Hasil Ujian", icon: <BarChart3 size={18} /> },
+    { id: "profile", label: "Profil & Sandi", icon: <Settings size={18} /> },
   ];
 
   return (
@@ -1211,19 +1566,116 @@ function TeacherDashboard({ data, saveData, user, onLogout, showToast }) {
         </div>
       )}
       {tab === "questions" && <QuestionManager data={data} saveData={saveData} showToast={showToast} userId={user.id} />}
+      {tab === "import" && <ImportSoal data={data} saveData={saveData} showToast={showToast} userId={user.id} />}
       {tab === "exams" && <ExamManager data={data} saveData={saveData} showToast={showToast} userId={user.id} />}
       {tab === "monitor" && <MonitorView data={data} saveData={saveData} />}
       {tab === "results" && <ResultsView data={data} />}
+      {tab === "profile" && <TeacherProfile data={data} saveData={saveData} user={user} showToast={showToast} />}
     </DashboardLayout>
+  );
+}
+
+// ============= TEACHER PROFILE & PASSWORD =============
+function TeacherProfile({ data, saveData, user, showToast }) {
+  const [oldPw, setOldPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [newPw2, setNewPw2] = useState("");
+  const [photo, setPhoto] = useState(user.photo || "");
+  const [bio, setBio] = useState(user.bio || "");
+
+  const handleChangePassword = () => {
+    if (!oldPw || !newPw || !newPw2) return showToast("Semua field harus diisi", "error");
+    if (newPw !== newPw2) return showToast("Password baru tidak cocok", "error");
+    if (newPw.length < 6) return showToast("Password minimal 6 karakter", "error");
+    
+    const teacher = data.teachers.find(t => t.id === user.id);
+    if (!teacher) return showToast("Guru tidak ditemukan", "error");
+    
+    const currentPw = teacher.password || teacher.nip;
+    if (oldPw !== currentPw) return showToast("Password lama salah", "error");
+    
+    const teachers = data.teachers.map(t => t.id === user.id ? { ...t, password: newPw } : t);
+    saveData({ ...data, teachers });
+    setOldPw(""); setNewPw(""); setNewPw2("");
+    showToast("Password berhasil diubah! Gunakan password baru saat login berikutnya.");
+  };
+
+  const handlePhotoUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (file.size > 2 * 1024 * 1024) return showToast("Ukuran foto maksimal 2MB", "error");
+    const reader = new FileReader();
+    reader.onload = (ev) => setPhoto(ev.target.result);
+    reader.readAsDataURL(file);
+  };
+
+  const handleSaveProfile = () => {
+    const teachers = data.teachers.map(t => t.id === user.id ? { ...t, photo, bio } : t);
+    saveData({ ...data, teachers });
+    showToast("Profil berhasil disimpan");
+  };
+
+  return (
+    <div>
+      <h2 className="text-white text-2xl font-bold mb-5">Profil & Keamanan</h2>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <Card>
+          <h3 className="text-white font-bold mb-4">Foto & Bio</h3>
+          <div className="flex items-center gap-4 mb-4">
+            <div className="w-20 h-20 rounded-full overflow-hidden flex items-center justify-center" style={{ background: "rgba(59,130,246,0.2)" }}>
+              {photo ? <img src={photo} alt="" className="w-full h-full object-cover" /> : <User size={32} className="text-blue-400" />}
+            </div>
+            <label className="cursor-pointer px-4 py-2 rounded-xl text-sm font-medium text-blue-400 hover:bg-blue-500/10 transition" style={{ border: "1px dashed rgba(59,130,246,0.4)" }}>
+              <Upload size={14} className="inline mr-2" />Ganti Foto
+              <input type="file" accept="image/*" onChange={handlePhotoUpload} className="hidden" />
+            </label>
+          </div>
+          <div className="space-y-3">
+            <Input label="Nama" value={user.name} disabled />
+            <Input label="NIP" value={user.nip} disabled />
+            <div>
+              <label className="text-blue-300 text-sm font-medium mb-1 block">Bio / Catatan</label>
+              <textarea value={bio} onChange={e => setBio(e.target.value)} rows={3} placeholder="Tuliskan bio singkat..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+            </div>
+            <Btn onClick={handleSaveProfile}><Save size={14} />Simpan Profil</Btn>
+          </div>
+        </Card>
+        <Card>
+          <h3 className="text-white font-bold mb-4">Ganti Password</h3>
+          <p className="text-slate-400 text-sm mb-4">Password default adalah NIP Anda. Ganti untuk keamanan yang lebih baik.</p>
+          <div className="space-y-3">
+            <Input label="Password Lama (NIP atau password saat ini)" type="password" value={oldPw} onChange={e => setOldPw(e.target.value)} placeholder="Masukkan password lama" />
+            <Input label="Password Baru" type="password" value={newPw} onChange={e => setNewPw(e.target.value)} placeholder="Minimal 6 karakter" />
+            <Input label="Konfirmasi Password Baru" type="password" value={newPw2} onChange={e => setNewPw2(e.target.value)} placeholder="Ulangi password baru" />
+            <Btn onClick={handleChangePassword}><Lock size={14} />Ubah Password</Btn>
+          </div>
+        </Card>
+      </div>
+    </div>
   );
 }
 
 // ============= STUDENT DASHBOARD =============
 function StudentDashboard({ data, saveData, user, onLogout, showToast }) {
   const [activeExam, setActiveExam] = useState(null);
+  const [resumeData, setResumeData] = useState(null);
+
+  // Check for active sessions to resume on mount
+  useEffect(() => {
+    const activeSession = (data.sessions || []).find(s => s.studentId === user.id && s.status === "active");
+    if (activeSession) {
+      const exam = data.exams.find(e => e.id === activeSession.examId);
+      if (exam && exam.status === "active") {
+        const end = new Date(exam.endTime);
+        if (new Date() < end) {
+          setResumeData({ exam, answers: activeSession.answers || {}, violations: activeSession.violations || 0 });
+        }
+      }
+    }
+  }, []);
 
   if (activeExam) {
-    return <ExamTaker data={data} saveData={saveData} user={user} exam={activeExam} onFinish={() => setActiveExam(null)} showToast={showToast} />;
+    return <ExamTaker data={data} saveData={saveData} user={user} exam={activeExam.exam || activeExam} onFinish={() => { setActiveExam(null); setResumeData(null); }} showToast={showToast} savedAnswers={activeExam.answers} savedViolations={activeExam.violations} />;
   }
 
   const now = new Date();
@@ -1242,15 +1694,31 @@ function StudentDashboard({ data, saveData, user, onLogout, showToast }) {
     <DashboardLayout user={user} onLogout={onLogout} tabs={[
       { id: "exams", label: "Ujian Tersedia", icon: <FileText size={18} /> },
       { id: "results", label: "Hasil Saya", icon: <Award size={18} /> },
+      { id: "profile", label: "Profil", icon: <User size={18} /> },
     ]} activeTab={activeExam ? "" : "exams"} setActiveTab={() => {}}>
       <div>
         <h2 className="text-white text-2xl font-bold mb-2">Selamat Datang, {user.name}</h2>
         <p className="text-slate-400 mb-6">Kelas {user.kelas} • NISN: {user.nisn}</p>
 
+        {resumeData && (
+          <Card className="mb-4" style={{ borderLeft: "3px solid #f59e0b" }}>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2 mb-1"><AlertTriangle size={16} className="text-amber-400" /><span className="text-amber-400 font-bold text-sm">Ujian Belum Selesai</span></div>
+                <h4 className="text-white font-bold">{resumeData.exam.title}</h4>
+                <div className="text-slate-400 text-xs">{Object.keys(resumeData.answers).length}/{resumeData.exam.questionIds.length} soal sudah dijawab</div>
+              </div>
+              <Btn onClick={() => setActiveExam({ exam: resumeData.exam, answers: resumeData.answers, violations: resumeData.violations })} variant="success"><Play size={14} />Lanjutkan Ujian</Btn>
+            </div>
+          </Card>
+        )}
+
         <h3 className="text-white font-bold text-lg mb-3">Ujian Tersedia</h3>
         {availableExams.length === 0 ? <Card className="mb-6"><EmptyState icon={<FileText size={40} className="mx-auto" />} text="Tidak ada ujian tersedia saat ini" /></Card> : (
           <div className="space-y-3 mb-6">
-            {availableExams.map(ex => (
+            {availableExams.map(ex => {
+              const hasSession = (data.sessions || []).find(s => s.studentId === user.id && s.examId === ex.id && s.status === "active");
+              return (
               <Card key={ex.id}>
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
@@ -1259,13 +1727,15 @@ function StudentDashboard({ data, saveData, user, onLogout, showToast }) {
                     <div className="text-blue-400 text-xs mt-1">Berakhir: {new Date(ex.endTime).toLocaleString("id-ID")}</div>
                   </div>
                   <Btn onClick={() => {
-                    if (confirm(`Mulai ujian "${ex.title}"?\n\nDurasi: ${ex.duration} menit\nJumlah soal: ${ex.questionIds.length}\n\nSetelah dimulai, Anda tidak dapat keluar.`)) {
-                      setActiveExam(ex);
+                    if (hasSession) {
+                      setActiveExam({ exam: ex, answers: hasSession.answers || {}, violations: hasSession.violations || 0 });
+                    } else if (confirm(`Mulai ujian "${ex.title}"?\n\nDurasi: ${ex.duration} menit\nJumlah soal: ${ex.questionIds.length}\n\nSetelah dimulai, Anda tidak dapat keluar.`)) {
+                      setActiveExam({ exam: ex });
                     }
-                  }}><Play size={14} />Mulai Ujian</Btn>
+                  }}>{hasSession ? <><Play size={14} />Lanjutkan</> : <><Play size={14} />Mulai Ujian</>}</Btn>
                 </div>
               </Card>
-            ))}
+            )})}
           </div>
         )}
 
@@ -1296,28 +1766,40 @@ function StudentDashboard({ data, saveData, user, onLogout, showToast }) {
 }
 
 // ============= EXAM TAKER (STUDENT) =============
-function ExamTaker({ data, saveData, user, exam, onFinish, showToast }) {
+function ExamTaker({ data, saveData, user, exam, onFinish, showToast, savedAnswers, savedViolations }) {
   const [currentQ, setCurrentQ] = useState(0);
-  const [answers, setAnswers] = useState({});
-  const [timeLeft, setTimeLeft] = useState(exam.duration * 60);
-  const [violations, setViolations] = useState(0);
+  const [answers, setAnswers] = useState(savedAnswers || {});
+  const [timeLeft, setTimeLeft] = useState(() => {
+    // If resuming, calculate remaining time from session
+    const session = (data.sessions || []).find(s => s.examId === exam.id && s.studentId === user.id && s.status === "active");
+    if (session && session.startedAt) {
+      const elapsed = Math.floor((Date.now() - session.startedAt) / 1000);
+      return Math.max(0, exam.duration * 60 - elapsed);
+    }
+    return exam.duration * 60;
+  });
+  const [violations, setViolations] = useState(savedViolations || 0);
   const [submitted, setSubmitted] = useState(false);
   const [result, setResult] = useState(null);
   const [showNav, setShowNav] = useState(false);
   const sessionRef = useRef(null);
+  const startTimeRef = useRef(Date.now());
 
   const questions = useMemo(() => {
     let qs = exam.questionIds.map(id => data.questions.find(q => q.id === id)).filter(Boolean);
     if (exam.shuffleQuestions) {
+      // Seeded shuffle so resume shows same order
+      const seed = (user.id + exam.id).split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+      const seededRandom = (s) => { let x = Math.sin(s) * 10000; return x - Math.floor(x); };
       const shuffled = [...qs];
       for (let i = shuffled.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
+        const j = Math.floor(seededRandom(seed + i) * (i + 1));
         [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
       }
       qs = shuffled;
     }
     return qs;
-  }, [exam, data.questions]);
+  }, [exam, data.questions, user.id]);
 
   // Timer
   useEffect(() => {
@@ -1384,13 +1866,13 @@ function ExamTaker({ data, saveData, user, exam, onFinish, showToast }) {
     const saveSession = () => {
       const sessions = [...(data.sessions || [])];
       const idx = sessions.findIndex(s => s.examId === exam.id && s.studentId === user.id);
-      const sessionData = { examId: exam.id, studentId: user.id, answers, status: "active", violations, lastUpdate: Date.now() };
-      if (idx >= 0) sessions[idx] = { ...sessions[idx], ...sessionData };
+      const sessionData = { examId: exam.id, studentId: user.id, answers, status: "active", violations, lastUpdate: Date.now(), startedAt: startTimeRef.current };
+      if (idx >= 0) { sessions[idx] = { ...sessions[idx], ...sessionData, startedAt: sessions[idx].startedAt || startTimeRef.current }; }
       else sessions.push({ id: genId(), ...sessionData });
       saveData({ ...data, sessions });
     };
     saveSession();
-    const iv = setInterval(saveSession, 10000);
+    const iv = setInterval(saveSession, 3000);
     return () => clearInterval(iv);
   }, [answers, violations, submitted]);
 

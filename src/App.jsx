@@ -195,20 +195,40 @@ export default function ExamApp() {
     return () => { if (unsub) unsub(); };
   }, []);
 
-  const saveData = useCallback(async (newData) => {
-    if (!newData || typeof newData !== "object") { console.error("saveData: invalid data"); return; }
-    lastSaveRef.current = Date.now();
-    isWritingRef.current = true;
-    setData(newData);
-    // Always cache locally first (instant, safe)
-    ls.set(CACHE_KEY, newData);
-    ls.set(BACKUP_KEY, newData);
-    // Then write to Firebase
-    await store.set("examapp_data", newData);
-    isWritingRef.current = false;
+  const saveQueue = useRef([]);
+  const isSaving = useRef(false);
+
+  const flushSave = useCallback(async () => {
+    if (isSaving.current || saveQueue.current.length === 0) return;
+    isSaving.current = true;
+    const latest = saveQueue.current[saveQueue.current.length - 1];
+    saveQueue.current = [];
+    try {
+      lastSaveRef.current = Date.now();
+      ls.set(CACHE_KEY, latest);
+      ls.set(BACKUP_KEY, latest);
+      await store.set("examapp_data", latest);
+    } catch (e) {
+      console.error("save failed, retrying:", e);
+      // Re-queue on failure
+      saveQueue.current.unshift(latest);
+      setTimeout(flushSave, 2000);
+    }
+    isSaving.current = false;
+    // Flush again if more items queued while we were saving
+    if (saveQueue.current.length > 0) flushSave();
   }, []);
 
-  // Expose saveData via ref so ExamTaker can always access latest data
+  const saveData = useCallback(async (newData) => {
+    if (!newData || typeof newData !== "object") { console.error("saveData: invalid data"); return; }
+    // Optimistic UI update
+    setData(newData);
+    // Queue the save (deduplicates rapid calls)
+    saveQueue.current.push(newData);
+    flushSave();
+  }, [flushSave]);
+
+  // Expose dataRef so ExamTaker can always access latest data
   const dataRef = useRef(null);
   useEffect(() => { dataRef.current = data; }, [data]);
 
@@ -271,8 +291,8 @@ export default function ExamApp() {
     <div className="min-h-screen" style={{ background: "linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%)" }}>
       {toast && <Toast msg={toast.msg} type={toast.type} />}
       {view === "login" && <LoginScreen onLogin={handleLogin} />}
-      {view === "admin" && <AdminDashboard data={data} saveData={saveData} user={user} onLogout={handleLogout} showToast={showToast} />}
-      {view === "guru" && <TeacherDashboard data={data} saveData={saveData} user={user} onLogout={handleLogout} showToast={showToast} updateUserSession={updateUserSession} />}
+      {view === "admin" && <AdminDashboard data={data} dataRef={dataRef} saveData={saveData} user={user} onLogout={handleLogout} showToast={showToast} />}
+      {view === "guru" && <TeacherDashboard data={data} dataRef={dataRef} saveData={saveData} user={user} onLogout={handleLogout} showToast={showToast} updateUserSession={updateUserSession} />}
       {view === "siswa" && <StudentDashboard data={data} dataRef={dataRef} saveData={saveData} user={user} onLogout={handleLogout} showToast={showToast} updateUserSession={updateUserSession} />}
     </div>
   );
@@ -486,7 +506,7 @@ function PhotoUpload({ currentPhoto, onPhoto, size = 80 }) {
 }
 
 // ============= ADMIN DASHBOARD =============
-function AdminDashboard({ data, saveData, user, onLogout, showToast }) {
+function AdminDashboard({ data, dataRef, saveData, user, onLogout, showToast }) {
   const [tab, setTab] = useState("dashboard");
   const tabs = [
     { id: "dashboard", label: "Dashboard", icon: <Home size={18} /> },
@@ -502,11 +522,11 @@ function AdminDashboard({ data, saveData, user, onLogout, showToast }) {
   return (
     <DashboardLayout user={user} onLogout={onLogout} tabs={tabs} activeTab={tab} setActiveTab={setTab}>
       {tab === "dashboard" && <AdminHome data={data} />}
-      {tab === "teachers" && <TeacherManager data={data} saveData={saveData} showToast={showToast} />}
-      {tab === "students" && <StudentManager data={data} saveData={saveData} showToast={showToast} />}
+      {tab === "teachers" && <TeacherManager data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} />}
+      {tab === "students" && <StudentManager data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} />}
       {tab === "subjects" && <SubjectManager data={data} saveData={saveData} showToast={showToast} />}
-      {tab === "banksoal" && <QuestionManager data={data} saveData={saveData} showToast={showToast} />}
-      {tab === "exams" && <ExamManager data={data} saveData={saveData} showToast={showToast} isAdmin />}
+      {tab === "banksoal" && <QuestionManager data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} />}
+      {tab === "exams" && <ExamManager data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} isAdmin />}
       {tab === "monitor" && <MonitorView data={data} />}
       {tab === "results" && <ResultsView data={data} />}
       {tab === "settings" && <SettingsView data={data} saveData={saveData} showToast={showToast} />}
@@ -554,7 +574,7 @@ function AdminHome({ data }) {
 }
 
 // ============= TEACHER MANAGER =============
-function TeacherManager({ data, saveData, showToast }) {
+function TeacherManager({ data, dataRef, saveData, showToast }) {
   const [showModal, setShowModal] = useState(false);
   const [editId, setEditId] = useState(null);
   const [form, setForm] = useState({ name: "", nip: "", subjects: [], photo: "" });
@@ -565,21 +585,23 @@ function TeacherManager({ data, saveData, showToast }) {
 
   const handleSave = () => {
     if (!form.name.trim() || !form.nip.trim()) return showToast("Nama dan NIP wajib diisi", "error");
-    let teachers = [...data.teachers];
+    const latest = dataRef?.current || data;
+    let teachers = [...(latest.teachers || [])];
     if (editId) {
       teachers = teachers.map(t => t.id === editId ? { ...t, ...form } : t);
     } else {
       if (teachers.find(t => t.nip === form.nip)) return showToast("NIP sudah terdaftar", "error");
       teachers.push({ id: genId(), ...form });
     }
-    saveData({ ...data, teachers });
+    saveData({ ...latest, teachers });
     setShowModal(false);
     showToast(editId ? "Data guru diperbarui" : "Guru berhasil ditambahkan");
   };
 
   const handleDelete = (id) => {
     if (!confirm("Hapus guru ini?")) return;
-    saveData({ ...data, teachers: data.teachers.filter(t => t.id !== id) });
+    const latest = dataRef?.current || data;
+    saveData({ ...latest, teachers: (latest.teachers || []).filter(t => t.id !== id) });
     showToast("Guru dihapus");
   };
 
@@ -650,7 +672,7 @@ function TeacherManager({ data, saveData, showToast }) {
 }
 
 // ============= STUDENT MANAGER =============
-function StudentManager({ data, saveData, showToast }) {
+function StudentManager({ data, dataRef, saveData, showToast }) {
   const [showModal, setShowModal] = useState(false);
   const [editId, setEditId] = useState(null);
   const [form, setForm] = useState({ name: "", nisn: "", kelas: KELAS_OPTIONS[0], peminatan: "MIPA", photo: "" });
@@ -662,21 +684,23 @@ function StudentManager({ data, saveData, showToast }) {
 
   const handleSave = () => {
     if (!form.name.trim() || !form.nisn.trim()) return showToast("Nama dan NISN wajib diisi", "error");
-    let students = [...data.students];
+    const latest = dataRef?.current || data;
+    let students = [...(latest.students || [])];
     if (editId) {
       students = students.map(s => s.id === editId ? { ...s, ...form } : s);
     } else {
       if (students.find(s => s.nisn === form.nisn)) return showToast("NISN sudah terdaftar", "error");
       students.push({ id: genId(), ...form });
     }
-    saveData({ ...data, students });
+    saveData({ ...latest, students });
     setShowModal(false);
     showToast(editId ? "Data siswa diperbarui" : "Siswa berhasil ditambahkan");
   };
 
   const handleDelete = (id) => {
     if (!confirm("Hapus siswa ini?")) return;
-    saveData({ ...data, students: data.students.filter(s => s.id !== id) });
+    const latest = dataRef?.current || data;
+    saveData({ ...latest, students: (latest.students || []).filter(s => s.id !== id) });
     showToast("Siswa dihapus");
   };
 
@@ -811,18 +835,23 @@ function SubjectManager({ data, saveData, showToast }) {
 }
 
 // ============= QUESTION MANAGER =============
-function QuestionManager({ data, saveData, showToast, userId }) {
+function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
   const [showModal, setShowModal] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [editId, setEditId] = useState(null);
   const [filterSubject, setFilterSubject] = useState("all");
-  const [form, setForm] = useState({ subjectId: "", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "" });
+  const [form, setForm] = useState({ subjectId: "", type: "pilgan", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "", rubrik: "" });
+  const [filterType, setFilterType] = useState("all");
 
   const myQuestions = userId ? data.questions.filter(q => q.createdBy === userId) : data.questions;
-  const filtered = filterSubject === "all" ? myQuestions : myQuestions.filter(q => q.subjectId === filterSubject);
+  const filtered = myQuestions.filter(q => {
+    if (filterSubject !== "all" && q.subjectId !== filterSubject) return false;
+    if (filterType !== "all" && (q.type || "pilgan") !== filterType) return false;
+    return true;
+  });
 
-  const openAdd = () => { setEditId(null); setForm({ subjectId: (data.subjects || [])[0]?.id || "", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "" }); setShowModal(true); };
-  const openEdit = (q) => { setEditId(q.id); setForm({ subjectId: q.subjectId, text: q.text, image: q.image || "", options: [...q.options, "", "", ""].slice(0, 5), correctAnswer: q.correctAnswer, explanation: q.explanation || "" }); setShowModal(true); };
+  const openAdd = () => { setEditId(null); setForm({ subjectId: (data.subjects || [])[0]?.id || "", type: "pilgan", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "", rubrik: "" }); setShowModal(true); };
+  const openEdit = (q) => { setEditId(q.id); setForm({ subjectId: q.subjectId, type: q.type || "pilgan", text: q.text, image: q.image || "", options: q.options?.length ? [...q.options, "", "", ""].slice(0, 5) : ["", "", "", "", ""], correctAnswer: q.correctAnswer || 0, explanation: q.explanation || "", rubrik: q.rubrik || "" }); setShowModal(true); };
 
   const handleImageUpload = (e) => {
     const file = e.target.files[0]; if (!file) return;
@@ -834,26 +863,36 @@ function QuestionManager({ data, saveData, showToast, userId }) {
 
   const handleSave = () => {
     if (!form.subjectId || !form.text.trim()) return showToast("Mapel dan teks soal wajib diisi", "error");
-    const validOpts = form.options.filter(o => o.trim());
-    if (validOpts.length < 2) return showToast("Minimal 2 pilihan jawaban", "error");
-    let questions = [...data.questions];
-    const qData = { ...form, options: form.options.filter(o => o.trim()), createdBy: userId || "admin" };
+    if (form.type === "pilgan") {
+      const validOpts = form.options.filter(o => o.trim());
+      if (validOpts.length < 2) return showToast("Minimal 2 pilihan jawaban", "error");
+    }
+    const latest = dataRef?.current || data;
+    let questions = [...(latest.questions || [])];
+    const qData = {
+      ...form,
+      options: form.type === "pilgan" ? form.options.filter(o => o.trim()) : [],
+      createdBy: userId || "admin",
+      type: form.type || "pilgan"
+    };
     if (editId) questions = questions.map(q => q.id === editId ? { ...q, ...qData } : q);
     else questions.push({ id: genId(), ...qData });
-    saveData({ ...data, questions });
+    saveData({ ...latest, questions });
     setShowModal(false);
     showToast(editId ? "Soal diperbarui" : "Soal berhasil ditambahkan");
   };
 
   const handleDelete = (id) => {
     if (!confirm("Hapus soal ini?")) return;
-    saveData({ ...data, questions: data.questions.filter(q => q.id !== id) });
+    const latest = dataRef?.current || data;
+    saveData({ ...latest, questions: (latest.questions || []).filter(q => q.id !== id) });
     showToast("Soal dihapus");
   };
 
   const handleBulkImport = (importedQuestions) => {
-    const questions = [...data.questions, ...importedQuestions.map(q => ({ id: genId(), ...q, createdBy: userId || "admin" }))];
-    saveData({ ...data, questions });
+    const latest = dataRef?.current || data;
+    const questions = [...(latest.questions || []), ...importedQuestions.map(q => ({ id: genId(), ...q, type: q.type || "pilgan", createdBy: userId || "admin" }))];
+    saveData({ ...latest, questions });
     setShowImport(false);
     showToast(`${importedQuestions.length} soal berhasil diimpor`);
   };
@@ -870,10 +909,17 @@ function QuestionManager({ data, saveData, showToast, userId }) {
         </div>
       </div>
       <Card>
-        <div className="mb-4">
+        <div className="mb-4 flex flex-wrap gap-2">
           <select value={filterSubject} onChange={e => setFilterSubject(e.target.value)} className="py-2 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.2)" }}>
             <option value="all">Semua Mata Pelajaran</option>
             {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+          <select value={filterType} onChange={e => setFilterType(e.target.value)} className="py-2 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.2)" }}>
+            <option value="all">Semua Tipe</option>
+            <option value="pilgan">Pilihan Ganda</option>
+            <option value="esai">Esai</option>
+            <option value="uraian">Uraian</option>
+            <option value="benar_salah">Benar/Salah</option>
           </select>
         </div>
         <div className="text-slate-400 text-xs mb-3">{filtered.length} soal</div>
@@ -883,7 +929,7 @@ function QuestionManager({ data, saveData, showToast, userId }) {
               <div key={q.id} className="p-3 rounded-xl" style={{ background: "rgba(15,23,42,0.5)" }}>
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex-1">
-                    <div className="text-blue-400 text-xs mb-1">{getSubjectName(q.subjectId)}</div>
+                    <div className="flex items-center gap-2 mb-1"><span className="text-blue-400 text-xs">{getSubjectName(q.subjectId)}</span><span className="px-1.5 py-0.5 rounded text-xs" style={{ background: q.type === "esai" ? "rgba(168,85,247,0.2)" : q.type === "uraian" ? "rgba(20,184,166,0.2)" : q.type === "benar_salah" ? "rgba(234,179,8,0.2)" : "rgba(59,130,246,0.2)", color: q.type === "esai" ? "#c084fc" : q.type === "uraian" ? "#2dd4bf" : q.type === "benar_salah" ? "#fbbf24" : "#60a5fa" }}>{q.type === "esai" ? "Esai" : q.type === "uraian" ? "Uraian" : q.type === "benar_salah" ? "Benar/Salah" : "Pilihan Ganda"}</span></div>
                     <div className="text-white text-sm mb-2">{i + 1}. {q.text.substring(0, 150)}{q.text.length > 150 ? "..." : ""}</div>
                     {q.image && <img src={q.image} alt="" className="max-h-24 rounded-lg mb-2" />}
                     <div className="flex flex-wrap gap-1">
@@ -910,10 +956,18 @@ function QuestionManager({ data, saveData, showToast, userId }) {
       {showModal && (
         <Modal title={editId ? "Edit Soal" : "Tambah Soal"} onClose={() => setShowModal(false)} wide>
           <div className="space-y-4">
-            <Select label="Mata Pelajaran" value={form.subjectId} onChange={e => setForm({ ...form, subjectId: e.target.value })}>
-              <option value="">-- Pilih Mapel --</option>
-              {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-            </Select>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <Select label="Mata Pelajaran" value={form.subjectId} onChange={e => setForm({ ...form, subjectId: e.target.value })}>
+                <option value="">-- Pilih Mapel --</option>
+                {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </Select>
+              <Select label="Tipe Soal" value={form.type} onChange={e => setForm({ ...form, type: e.target.value })}>
+                <option value="pilgan">Pilihan Ganda</option>
+                <option value="esai">Esai</option>
+                <option value="uraian">Uraian</option>
+                <option value="benar_salah">Benar / Salah</option>
+              </Select>
+            </div>
             <div>
               <label className="text-blue-300 text-sm font-medium mb-1 block">Teks Soal</label>
               <textarea value={form.text} onChange={e => setForm({ ...form, text: e.target.value })} rows={4} placeholder="Masukkan teks soal..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
@@ -933,22 +987,46 @@ function QuestionManager({ data, saveData, showToast, userId }) {
                 )}
               </div>
             </div>
-            <div>
-              <label className="text-blue-300 text-sm font-medium mb-2 block">Pilihan Jawaban</label>
-              {form.options.map((o, i) => (
-                <div key={i} className="flex items-center gap-2 mb-2">
-                  <button onClick={() => setForm(f => ({ ...f, correctAnswer: i }))} className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold shrink-0 transition" style={{ background: form.correctAnswer === i ? "#16a34a" : "rgba(51,65,85,0.5)", color: "white" }}>
-                    {String.fromCharCode(65 + i)}
-                  </button>
-                  <input value={o} onChange={e => { const opts = [...form.options]; opts[i] = e.target.value; setForm({ ...form, options: opts }); }} placeholder={`Pilihan ${String.fromCharCode(65 + i)}`} className="flex-1 py-2 px-3 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: `1px solid ${form.correctAnswer === i ? "rgba(22,163,74,0.5)" : "rgba(59,130,246,0.25)"}` }} />
+            {(form.type === "pilgan") && (
+              <div>
+                <label className="text-blue-300 text-sm font-medium mb-2 block">Pilihan Jawaban</label>
+                {form.options.map((o, i) => (
+                  <div key={i} className="flex items-center gap-2 mb-2">
+                    <button onClick={() => setForm(f => ({ ...f, correctAnswer: i }))} className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold shrink-0 transition" style={{ background: form.correctAnswer === i ? "#16a34a" : "rgba(51,65,85,0.5)", color: "white" }}>
+                      {String.fromCharCode(65 + i)}
+                    </button>
+                    <input value={o} onChange={e => { const opts = [...form.options]; opts[i] = e.target.value; setForm({ ...form, options: opts }); }} placeholder={`Pilihan ${String.fromCharCode(65 + i)}`} className="flex-1 py-2 px-3 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: `1px solid ${form.correctAnswer === i ? "rgba(22,163,74,0.5)" : "rgba(59,130,246,0.25)"}` }} />
+                  </div>
+                ))}
+                <p className="text-slate-500 text-xs mt-1">Klik huruf untuk menandai jawaban benar (hijau)</p>
+              </div>
+            )}
+            {form.type === "benar_salah" && (
+              <div>
+                <label className="text-blue-300 text-sm font-medium mb-2 block">Jawaban Benar</label>
+                <div className="flex gap-3">
+                  {["Benar", "Salah"].map((opt, i) => (
+                    <button key={opt} onClick={() => setForm(f => ({ ...f, correctAnswer: i, options: ["Benar", "Salah"] }))} className="px-6 py-2 rounded-xl text-sm font-bold transition" style={{ background: form.correctAnswer === i ? "#16a34a" : "rgba(51,65,85,0.5)", color: "white" }}>{opt}</button>
+                  ))}
                 </div>
-              ))}
-              <p className="text-slate-500 text-xs mt-1">Klik huruf untuk menandai jawaban benar (hijau)</p>
-            </div>
-            <div>
-              <label className="text-blue-300 text-sm font-medium mb-1 block">Pembahasan (Opsional)</label>
-              <textarea value={form.explanation} onChange={e => setForm({ ...form, explanation: e.target.value })} rows={2} placeholder="Tulis pembahasan..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
-            </div>
+              </div>
+            )}
+            {(form.type === "esai" || form.type === "uraian") && (
+              <div>
+                <label className="text-blue-300 text-sm font-medium mb-1 block">Kunci Jawaban / Model Jawaban</label>
+                <textarea value={form.explanation} onChange={e => setForm({ ...form, explanation: e.target.value })} rows={4} placeholder="Tulis kunci jawaban atau model jawaban yang diharapkan..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+                <div className="mt-3">
+                  <label className="text-blue-300 text-sm font-medium mb-1 block">Rubrik Penilaian (Opsional)</label>
+                  <textarea value={form.rubrik || ""} onChange={e => setForm({ ...form, rubrik: e.target.value })} rows={3} placeholder="Contoh: Skor 4: jawaban lengkap dan benar, Skor 3: benar tapi kurang lengkap..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+                </div>
+              </div>
+            )}
+            {form.type === "pilgan" && (
+              <div>
+                <label className="text-blue-300 text-sm font-medium mb-1 block">Pembahasan (Opsional)</label>
+                <textarea value={form.explanation} onChange={e => setForm({ ...form, explanation: e.target.value })} rows={2} placeholder="Tulis pembahasan..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+              </div>
+            )}
             <div className="flex justify-end gap-2 pt-2">
               <Btn variant="secondary" onClick={() => setShowModal(false)}>Batal</Btn>
               <Btn onClick={handleSave}><Save size={14} />{editId ? "Perbarui" : "Simpan"}</Btn>
@@ -1111,7 +1189,7 @@ function ImportSoalModal({ data, onImport, onClose, showToast }) {
 }
 
 // ============= EXAM MANAGER =============
-function ExamManager({ data, saveData, showToast, isAdmin, userId }) {
+function ExamManager({ data, dataRef, saveData, showToast, isAdmin, userId }) {
   const [showModal, setShowModal] = useState(false);
   const [editId, setEditId] = useState(null);
   const [form, setForm] = useState({ title: "", subjectId: "", targetKelas: [], duration: 90, startTime: "", endTime: "", shuffleQuestions: true, shuffleOptions: false, showResult: true, questionIds: [] });
@@ -1136,24 +1214,28 @@ function ExamManager({ data, saveData, showToast, isAdmin, userId }) {
     if (!form.title.trim() || !form.subjectId) return showToast("Judul dan mapel wajib diisi", "error");
     if (form.questionIds.length === 0) return showToast("Pilih minimal 1 soal", "error");
     if (form.targetKelas.length === 0) return showToast("Pilih minimal 1 kelas", "error");
-    let exams = [...data.exams];
-    const examData = { ...form, status: editId ? (data.exams.find(e => e.id === editId)?.status || "draft") : "draft", createdBy: userId || "admin" };
+    const latest = dataRef?.current || data;
+    let exams = [...(latest.exams || [])];
+    const examData = { ...form, status: editId ? (exams.find(e => e.id === editId)?.status || "draft") : "draft", createdBy: userId || "admin" };
     if (editId) exams = exams.map(e => e.id === editId ? { ...e, ...examData } : e);
     else exams.push({ id: genId(), ...examData });
-    saveData({ ...data, exams });
+    saveData({ ...latest, exams });
     setShowModal(false);
     showToast(editId ? "Ujian diperbarui" : "Ujian berhasil dibuat");
   };
 
   const toggleStatus = (examId, newStatus) => {
-    const exams = data.exams.map(e => e.id === examId ? { ...e, status: newStatus } : e);
-    saveData({ ...data, exams });
+    const latest = dataRef?.current || data;
+    const exams = latest.exams.map(e => e.id === examId ? { ...e, status: newStatus } : e);
+    saveData({ ...latest, exams });
     showToast(`Ujian ${newStatus === "active" ? "diaktifkan" : newStatus === "ended" ? "diakhiri" : "di-draft-kan"}`);
   };
 
   const handleDelete = (id) => {
     if (!confirm("Hapus ujian ini?")) return;
-    saveData({ ...data, exams: data.exams.filter(e => e.id !== id) });
+    const latest = dataRef?.current || data;
+    const exams = latest.exams.filter(e => e.id !== id);
+    saveData({ ...latest, exams });
     showToast("Ujian dihapus");
   };
 
@@ -1269,7 +1351,7 @@ function ExamManager({ data, saveData, showToast, isAdmin, userId }) {
 function MonitorView({ data }) {
   const [selectedExam, setSelectedExam] = useState(null);
   const [, forceUpdate] = useState(0);
-  useEffect(() => { const iv = setInterval(() => forceUpdate(n => n + 1), 3000); return () => clearInterval(iv); }, []);
+  useEffect(() => { const iv = setInterval(() => forceUpdate(n => n + 1), 2000); return () => clearInterval(iv); }, []);
 
   const activeExams = data.exams.filter(e => e.status === "active");
 
@@ -1283,13 +1365,16 @@ function MonitorView({ data }) {
     return (
       <div>
         <button onClick={() => setSelectedExam(null)} className="flex items-center gap-2 text-blue-400 mb-4 hover:underline"><ArrowLeft size={16} />Kembali</button>
-        <h2 className="text-white text-2xl font-bold mb-2">{exam.title}</h2>
-        <p className="text-slate-400 text-sm mb-4">Update otomatis setiap 3 detik</p>
+        <div className="flex items-center gap-3 mb-2">
+          <h2 className="text-white text-2xl font-bold">{exam.title}</h2>
+          <div className="flex items-center gap-2 px-3 py-1 rounded-full" style={{ background: "rgba(22,163,74,0.15)" }}><div className="w-2 h-2 rounded-full bg-green-400" style={{ animation: "pulse 1.5s infinite" }} /><span className="text-green-400 text-xs font-medium">LIVE</span></div>
+        </div>
+        <p className="text-slate-400 text-sm mb-4">Update otomatis setiap 2 detik</p>
         <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 mb-4">
           <StatCard icon={<Users size={20} className="text-blue-400" />} label="Total Peserta" value={targetStudents.length} />
           <StatCard icon={<Play size={20} className="text-green-400" />} label="Sedang Mengerjakan" value={sessions.filter(s => s.status === "active").length} color="#16a34a" />
           <StatCard icon={<CheckCircle size={20} className="text-amber-400" />} label="Selesai" value={sessions.filter(s => s.status === "submitted").length} color="#d97706" />
-          <StatCard icon={<AlertTriangle size={20} className="text-red-400" />} label="Belum Mulai" value={targetStudents.length - sessions.length} color="#dc2626" />
+          <StatCard icon={<AlertTriangle size={20} className="text-red-400" />} label="Belum Mulai" value={Math.max(0, targetStudents.length - sessions.length)} color="#dc2626" />
         </div>
         <Card>
           <h3 className="text-white font-bold mb-3">Status Peserta Real-time</h3>
@@ -1323,7 +1408,7 @@ function MonitorView({ data }) {
                         <div className="text-slate-500 text-xs">{lastUpdate}s lalu</div>
                       )}
                     </div>
-                    {violations > 0 && <div className="flex items-center gap-1 text-red-400 text-xs"><AlertTriangle size={12} />{violations}x</div>}
+                    {violations > 0 && <div className="flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-lg" style={{ background: "rgba(220,38,38,0.2)", color: "#f87171" }}><AlertTriangle size={12} />⚠️ {violations}x pelanggaran</div>}
                   </div>
                 </div>
               );
@@ -1390,10 +1475,14 @@ function ResultsView({ data }) {
   const [selectedExam, setSelectedExam] = useState(null);
   const [printing, setPrinting] = useState(false);
 
-  // Show all exams that have results OR are ended
+  // Show ALL exams that have at least 1 result, regardless of status
   const examsWithData = data.exams.filter(e =>
-    e.status === "ended" || (data.results || []).some(r => r.examId === e.id)
-  );
+    (data.results || []).some(r => r.examId === e.id) || e.status === "ended"
+  ).sort((a, b) => {
+    const ra = (data.results || []).filter(r => r.examId === a.id).length;
+    const rb = (data.results || []).filter(r => r.examId === b.id).length;
+    return rb - ra;
+  });
 
   const handlePrint = (exam, results) => {
     const subjectName = (data.subjects || []).find(s => s.id === exam?.subjectId)?.name || "";
@@ -1492,18 +1581,23 @@ function ResultsView({ data }) {
                 <div className="col-span-2">Benar</div>
                 <div className="col-span-3">Nilai</div>
               </div>
-              {results.sort((a, b) => b.score - a.score).map((r, i) => {
+              {results.sort((a, b) => (b.score || 0) - (a.score || 0)).map((r, i) => {
                 const student = data.students.find(s => s.id === r.studentId);
+                const scoreNull = r.score === null || r.score === undefined;
                 return (
                   <div key={r.id} className="grid grid-cols-12 gap-2 px-3 py-2 rounded-lg items-center hover:bg-white/5" style={{ background: i % 2 === 0 ? "rgba(15,23,42,0.4)" : "transparent" }}>
                     <div className="col-span-1 text-slate-400 text-sm">{i + 1}</div>
                     <div className="col-span-4 text-white text-sm font-medium">{student?.name || "?"}</div>
                     <div className="col-span-2 text-slate-400 text-sm">{student?.kelas || "-"}</div>
-                    <div className="col-span-2 text-slate-300 text-sm">{r.correct}/{totalQ}</div>
+                    <div className="col-span-2 text-slate-300 text-sm">{r.correct||0}/{totalQ}{r.hasEssay ? "+" : ""}</div>
                     <div className="col-span-3">
-                      <span className="px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
-                        {r.score.toFixed(1)}
-                      </span>
+                      {scoreNull ? (
+                        <span className="px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: "rgba(168,85,247,0.2)", color: "#c084fc" }}>Perlu Dinilai</span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
+                          {r.score.toFixed(1)}
+                        </span>
+                      )}
                     </div>
                   </div>
                 );
@@ -1522,9 +1616,52 @@ function ResultsView({ data }) {
     );
   }
 
+  const handleDownloadAllPDF = () => {
+    const allRows = examsWithData.map(ex => {
+      const results = (data.results || []).filter(r => r.examId === ex.id);
+      const avg = results.length > 0 ? (results.reduce((a, r) => a + (r.score || 0), 0) / results.length).toFixed(1) : "-";
+      return { ex, results, avg };
+    });
+    const printContent = `<!DOCTYPE html><html><head><title>Rekap Semua Hasil Ujian</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 20px; color: #000; font-size: 12px; }
+      h1 { text-align: center; font-size: 16px; } h2 { font-size: 13px; margin-top: 20px; border-bottom: 2px solid #333; padding-bottom: 4px; }
+      table { width: 100%; border-collapse: collapse; margin-bottom: 16px; font-size: 11px; }
+      th { background: #1e3a5f; color: white; padding: 5px 6px; text-align: left; }
+      td { padding: 4px 6px; border-bottom: 1px solid #ddd; }
+      tr:nth-child(even) { background: #f5f5f5; }
+      .pass { color: green; font-weight: bold; } .fail { color: red; font-weight: bold; }
+      @media print { body { margin: 8px; } }
+    </style></head><body>
+    <h1>${SCHOOL_NAME}</h1>
+    <p style="text-align:center;margin-bottom:16px">Rekap Hasil Ujian — Dicetak: ${new Date().toLocaleDateString("id-ID",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}</p>
+    ${allRows.map(({ ex, results, avg }) => {
+      const subj = (data.subjects || []).find(s => s.id === ex.subjectId)?.name || "";
+      const totalQ = ex.questionIds?.length || 0;
+      return `<h2>${ex.title} <span style="font-weight:normal;font-size:11px;color:#666">(${subj} • ${results.length} peserta • Rata-rata: ${avg})</span></h2>
+      <table><thead><tr><th>No</th><th>Nama Siswa</th><th>Kelas</th><th>Benar</th><th>Nilai</th><th>Ket.</th></tr></thead><tbody>
+      ${results.sort((a, b) => (b.score || 0) - (a.score || 0)).map((r, i) => {
+        const st = data.students.find(s => s.id === r.studentId);
+        const scoreDisplay = r.score === null ? "Belum dinilai" : r.score.toFixed(1);
+        const ket = r.score === null ? "MENUNGGU" : r.score >= 75 ? "LULUS" : "TIDAK LULUS";
+        const cls = r.score === null ? "" : r.score >= 75 ? "pass" : "fail";
+        return `<tr><td>${i+1}</td><td>${st?.name||"?"}</td><td>${st?.kelas||"-"}</td><td>${r.correct||0}/${totalQ}</td><td><strong>${scoreDisplay}</strong></td><td class="${cls}">${ket}</td></tr>`;
+      }).join("")}
+      </tbody></table>`;
+    }).join("")}
+    </body></html>`;
+    const w = window.open("", "_blank");
+    w.document.write(printContent);
+    w.document.close();
+    w.onload = () => w.print();
+  };
+
   return (
     <div>
-      <h2 className="text-white text-2xl font-bold mb-5">Hasil Ujian</h2>
+      <div className="flex items-center justify-between mb-5 flex-wrap gap-3">
+        <h2 className="text-white text-2xl font-bold">Hasil Ujian</h2>
+        {examsWithData.length > 0 && <Btn variant="secondary" onClick={handleDownloadAllPDF}><Download size={16} />Download Semua PDF</Btn>}
+      </div>
       {examsWithData.length === 0 ? <Card><EmptyState icon={<BarChart3 size={40} className="mx-auto" />} text="Belum ada hasil ujian" /></Card> : (
         <div className="space-y-3">
           {examsWithData.map(ex => {
@@ -1597,7 +1734,7 @@ function SettingsView({ data, saveData, showToast }) {
 }
 
 // ============= TEACHER DASHBOARD =============
-function TeacherDashboard({ data, saveData, user, onLogout, showToast, updateUserSession }) {
+function TeacherDashboard({ data, dataRef, saveData, user, onLogout, showToast, updateUserSession }) {
   const [tab, setTab] = useState("dashboard");
   const tabs = [
     { id: "dashboard", label: "Dashboard", icon: <Home size={18} /> },
@@ -1630,8 +1767,8 @@ function TeacherDashboard({ data, saveData, user, onLogout, showToast, updateUse
           </Card>
         </div>
       )}
-      {tab === "questions" && <QuestionManager data={data} saveData={saveData} showToast={showToast} userId={user.id} />}
-      {tab === "exams" && <ExamManager data={data} saveData={saveData} showToast={showToast} userId={user.id} />}
+      {tab === "questions" && <QuestionManager data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} userId={user.id} />}
+      {tab === "exams" && <ExamManager data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} userId={user.id} />}
       {tab === "monitor" && <MonitorView data={data} />}
       {tab === "results" && <ResultsView data={data} />}
       {tab === "profile" && <TeacherProfile data={data} saveData={saveData} user={user} showToast={showToast} updateUserSession={updateUserSession} />}
@@ -2011,9 +2148,18 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
     const finalViolations = violationsRef.current;
 
     let correct = 0;
-    questions.forEach((q, i) => { if (finalAnswers[i] === q.correctAnswer) correct++; });
-    const score = questions.length > 0 ? (correct / questions.length) * 100 : 0;
-    const resultData = { id: genId(), examId: exam.id, studentId: user.id, answers: { ...finalAnswers }, correct, score, violations: finalViolations, submittedAt: Date.now() };
+    let pilganCount = 0;
+    questions.forEach((q, i) => {
+      const type = q.type || "pilgan";
+      if (type === "pilgan" || type === "benar_salah") {
+        pilganCount++;
+        if (finalAnswers[i] === q.correctAnswer) correct++;
+      }
+      // essay/uraian: marked as "answered" if non-empty, scored by teacher later
+    });
+    const hasEssay = questions.some(q => q.type === "esai" || q.type === "uraian");
+    const score = pilganCount > 0 ? (correct / pilganCount) * 100 : (hasEssay ? null : 0);
+    const resultData = { id: genId(), examId: exam.id, studentId: user.id, answers: { ...finalAnswers }, correct, pilganCount, score, hasEssay, needsGrading: hasEssay, violations: finalViolations, submittedAt: Date.now() };
     setResult(resultData);
 
     // Use dataRef to get the absolute latest data
@@ -2092,8 +2238,8 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
               ))}
             </div>
             <div className="space-y-1 text-xs text-slate-400 mb-4">
-              <div className="flex items-center gap-2"><div className="w-4 h-4 rounded" style={{ background: "rgba(22,163,74,0.4)" }} />Dijawab ({Object.keys(answers).length})</div>
-              <div className="flex items-center gap-2"><div className="w-4 h-4 rounded" style={{ background: "rgba(51,65,85,0.5)" }} />Belum ({questions.length - Object.keys(answers).length})</div>
+              <div className="flex items-center gap-2"><div className="w-4 h-4 rounded" style={{ background: "rgba(22,163,74,0.4)" }} />Dijawab ({Object.values(answers).filter(v => v !== undefined && v !== "").length})</div>
+              <div className="flex items-center gap-2"><div className="w-4 h-4 rounded" style={{ background: "rgba(51,65,85,0.5)" }} />Belum ({questions.length - Object.values(answers).filter(v => v !== undefined && v !== "").length})</div>
             </div>
             <Btn variant="success" className="w-full justify-center" onClick={() => { setShowNav(false); handleSubmit(); }}><CheckCircle size={14} />Kumpulkan Jawaban</Btn>
           </div>
@@ -2108,15 +2254,43 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
           <div className="text-white text-base leading-relaxed mb-3" style={{ whiteSpace: "pre-wrap" }}>{q.text}</div>
           {q.image && <img src={q.image} alt="Gambar soal" className="max-w-full rounded-xl mb-3" style={{ maxHeight: "300px" }} />}
         </Card>
-        <div className="space-y-2 mb-6">
-          {q.options.map((opt, i) => (
-            <button key={i} onClick={() => setAnswers(a => ({ ...a, [currentQ]: i }))} className="w-full text-left flex items-start gap-3 p-4 rounded-xl transition-all" style={{ background: answers[currentQ] === i ? "rgba(59,130,246,0.2)" : "rgba(30,41,59,0.8)", border: `2px solid ${answers[currentQ] === i ? "#3b82f6" : "rgba(59,130,246,0.1)"}` }}>
-              <div className="w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold shrink-0" style={{ background: answers[currentQ] === i ? "#3b82f6" : "rgba(51,65,85,0.5)", color: "white" }}>
-                {String.fromCharCode(65 + i)}
-              </div>
-              <span className="text-white text-sm pt-1">{opt}</span>
-            </button>
-          ))}
+        {/* Answer input based on question type */}
+        <div className="mb-6">
+          {(!q.type || q.type === "pilgan") && (
+            <div className="space-y-2">
+              {q.options.map((opt, i) => (
+                <button key={i} onClick={() => setAnswers(a => ({ ...a, [currentQ]: i }))} className="w-full text-left flex items-start gap-3 p-4 rounded-xl transition-all" style={{ background: answers[currentQ] === i ? "rgba(59,130,246,0.2)" : "rgba(30,41,59,0.8)", border: `2px solid ${answers[currentQ] === i ? "#3b82f6" : "rgba(59,130,246,0.1)"}` }}>
+                  <div className="w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold shrink-0" style={{ background: answers[currentQ] === i ? "#3b82f6" : "rgba(51,65,85,0.5)", color: "white" }}>
+                    {String.fromCharCode(65 + i)}
+                  </div>
+                  <span className="text-white text-sm pt-1">{opt}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          {q.type === "benar_salah" && (
+            <div className="flex gap-3">
+              {["Benar", "Salah"].map((opt, i) => (
+                <button key={opt} onClick={() => setAnswers(a => ({ ...a, [currentQ]: i }))} className="flex-1 py-4 rounded-xl text-base font-bold transition-all" style={{ background: answers[currentQ] === i ? (i === 0 ? "rgba(22,163,74,0.3)" : "rgba(220,38,38,0.3)") : "rgba(30,41,59,0.8)", border: `2px solid ${answers[currentQ] === i ? (i === 0 ? "#16a34a" : "#dc2626") : "rgba(59,130,246,0.1)"}`, color: answers[currentQ] === i ? (i === 0 ? "#4ade80" : "#f87171") : "white" }}>
+                  {opt}
+                </button>
+              ))}
+            </div>
+          )}
+          {(q.type === "esai" || q.type === "uraian") && (
+            <div>
+              <label className="text-blue-300 text-sm mb-2 block">{q.type === "esai" ? "Tulis esai kamu di bawah ini:" : "Tulis uraian jawaban kamu:"}</label>
+              <textarea
+                value={answers[currentQ] || ""}
+                onChange={e => setAnswers(a => ({ ...a, [currentQ]: e.target.value }))}
+                rows={8}
+                placeholder="Ketik jawaban kamu di sini..."
+                className="w-full py-3 px-4 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500"
+                style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.3)", lineHeight: "1.6" }}
+              />
+              <div className="text-slate-500 text-xs mt-1 text-right">{(answers[currentQ] || "").length} karakter</div>
+            </div>
+          )}
         </div>
         <div className="flex items-center justify-between gap-3">
           <Btn variant="secondary" onClick={() => setCurrentQ(c => Math.max(0, c - 1))} disabled={currentQ === 0}><ArrowLeft size={14} />Sebelumnya</Btn>
@@ -2129,7 +2303,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
         <div className="mt-4 rounded-full h-2 overflow-hidden" style={{ background: "rgba(51,65,85,0.5)" }}>
           <div className="h-full rounded-full transition-all" style={{ width: `${(Object.keys(answers).length / questions.length) * 100}%`, background: "linear-gradient(90deg, #3b82f6, #16a34a)" }} />
         </div>
-        <div className="text-center text-slate-400 text-xs mt-1">{Object.keys(answers).length}/{questions.length} soal dijawab</div>
+        <div className="text-center text-slate-400 text-xs mt-1">{Object.values(answers).filter(v => v !== undefined && v !== "").length}/{questions.length} soal dijawab</div>
       </div>
       {violations > 0 && (
         <div className="fixed bottom-4 left-4 flex items-center gap-2 px-3 py-2 rounded-xl text-xs" style={{ background: "rgba(220,38,38,0.2)", color: "#f87171", border: "1px solid rgba(220,38,38,0.3)" }}>

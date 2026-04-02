@@ -7,6 +7,32 @@ import { getFirestore, doc, getDoc, setDoc, onSnapshot } from "firebase/firestor
 const SCHOOL_NAME = "SMA Negeri 6 Pangkajene dan Kepulauan";
 const SCHOOL_SHORT = "SMAN 6 PANGKEP";
 const SESSION_KEY = "sman6_user_session";
+const BACKUP_KEY = "sman6_data_backup";
+const CACHE_KEY = "sman6_data_cache";
+
+// Safe deep-merge: never overwrites non-empty arrays with empty ones
+function safeMerge(base, remote) {
+  if (!remote || typeof remote !== "object") return base;
+  const result = { ...base };
+  for (const key of Object.keys(remote)) {
+    const rv = remote[key];
+    const bv = base[key];
+    // Never replace non-empty array with empty array (data loss protection)
+    if (Array.isArray(bv) && Array.isArray(rv) && bv.length > 0 && rv.length === 0) {
+      result[key] = bv;
+    } else if (rv !== undefined && rv !== null) {
+      result[key] = rv;
+    }
+  }
+  return result;
+}
+
+// LocalStorage helpers with error handling
+const ls = {
+  get(key) { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : null; } catch { return null; } },
+  set(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); return true; } catch { return false; } },
+  remove(key) { try { localStorage.removeItem(key); } catch {} },
+};
 
 const MAPEL_K13 = [
   { id: "pai", name: "Pendidikan Agama Islam dan Budi Pekerti", category: "Wajib" },
@@ -56,13 +82,15 @@ const store = {
     } catch (e) { console.error("get error:", e); return null; }
   },
   async set(key, val) {
+    // Validate: never write null/undefined or empty critical arrays
+    if (val === null || val === undefined) { console.warn("store.set: blocked null write for", key); return; }
     try { await setDoc(doc(db, "examapp", key), { value: val }); }
     catch (e) { console.error("set error:", e); }
   },
   listen(key, callback) {
     return onSnapshot(doc(db, "examapp", key), (snap) => {
       if (snap.exists()) callback(snap.data().value, snap.metadata);
-    });
+    }, (err) => { console.error("snapshot error:", err); });
   }
 };
 
@@ -91,36 +119,76 @@ export default function ExamApp() {
   useEffect(() => {
     let unsub = null;
     (async () => {
-      let d = await store.get("examapp_data");
-      if (!d) { d = DEFAULT_DATA; await store.set("examapp_data", d); }
-      if (!d.subjects?.length) d.subjects = MAPEL_K13;
-      if (!d.sessions) d.sessions = [];
-      if (!d.results) d.results = [];
-      setData(d);
+      // 1. Load cached data immediately (instant UI)
+      const cached = ls.get(CACHE_KEY);
+      if (cached && Object.keys(cached).length > 4) {
+        const safe = safeMerge(DEFAULT_DATA, cached);
+        setData(safe);
+        setLoading(false);
+      }
+
+      // 2. Load from Firebase
+      let d = null;
+      try { d = await store.get("examapp_data"); } catch (e) { console.error("Firebase load failed:", e); }
+
+      if (d && typeof d === "object" && Object.keys(d).length > 0) {
+        // Merge with cache to prevent data loss: keep the richer version per field
+        const localCache = ls.get(CACHE_KEY) || {};
+        const merged = safeMerge(safeMerge(DEFAULT_DATA, d), {});
+        // For critical arrays, keep whichever has more data
+        for (const key of ["teachers","students","questions","exams","sessions","results"]) {
+          const remote = d[key] || [];
+          const local = localCache[key] || [];
+          merged[key] = remote.length >= local.length ? remote : local;
+        }
+        if (!merged.subjects?.length) merged.subjects = MAPEL_K13;
+        setData(merged);
+        ls.set(CACHE_KEY, merged);
+        ls.set(BACKUP_KEY, merged); // secondary backup
+      } else {
+        // Firebase returned null/empty — use cache, don't overwrite with DEFAULT_DATA
+        const cache = ls.get(CACHE_KEY) || ls.get(BACKUP_KEY);
+        if (cache && Object.keys(cache).length > 4) {
+          const safe = safeMerge(DEFAULT_DATA, cache);
+          setData(safe);
+          // Restore to Firebase from cache
+          await store.set("examapp_data", safe);
+        } else {
+          // Truly first run
+          await store.set("examapp_data", DEFAULT_DATA);
+          setData(DEFAULT_DATA);
+        }
+      }
       setLoading(false);
 
-      // Restore user session from localStorage
-      try {
-        const saved = localStorage.getItem(SESSION_KEY);
-        if (saved) {
-          const { user: savedUser, view: savedView } = JSON.parse(saved);
-          if (savedUser && savedView && savedView !== "login") {
-            setUser(savedUser);
-            setView(savedView);
-          }
-        }
-      } catch {}
+      // 3. Restore user session from localStorage
+      const savedSession = ls.get(SESSION_KEY);
+      if (savedSession?.user && savedSession?.view && savedSession.view !== "login") {
+        setUser(savedSession.user);
+        setView(savedSession.view);
+      }
 
-      // Real-time sync listener
+      // 4. Real-time sync listener — with data-loss protection
       unsub = store.listen("examapp_data", (remoteData, meta) => {
-        if (!remoteData) return;
-        if (meta.hasPendingWrites) return; // skip our own writes (optimistic)
-        if (Date.now() - lastSaveRef.current < 3000) return; // skip shortly after our save
-        setData({
-          ...DEFAULT_DATA, ...remoteData,
-          subjects: remoteData.subjects?.length ? remoteData.subjects : MAPEL_K13,
-          sessions: remoteData.sessions || [],
-          results: remoteData.results || [],
+        if (!remoteData || typeof remoteData !== "object") return;
+        if (meta.hasPendingWrites) return;
+        if (Date.now() - lastSaveRef.current < 3000) return;
+        setData(prev => {
+          if (!prev) return prev;
+          // Merge: never replace longer arrays with shorter ones
+          const merged = { ...prev };
+          for (const key of Object.keys(remoteData)) {
+            const rv = remoteData[key];
+            const pv = prev[key];
+            if (Array.isArray(pv) && Array.isArray(rv) && pv.length > 0 && rv.length === 0) {
+              // Keep local — remote is empty but local has data
+              continue;
+            }
+            merged[key] = rv;
+          }
+          if (!merged.subjects?.length) merged.subjects = MAPEL_K13;
+          ls.set(CACHE_KEY, merged);
+          return merged;
         });
       });
     })();
@@ -128,12 +196,21 @@ export default function ExamApp() {
   }, []);
 
   const saveData = useCallback(async (newData) => {
+    if (!newData || typeof newData !== "object") { console.error("saveData: invalid data"); return; }
     lastSaveRef.current = Date.now();
     isWritingRef.current = true;
     setData(newData);
+    // Always cache locally first (instant, safe)
+    ls.set(CACHE_KEY, newData);
+    ls.set(BACKUP_KEY, newData);
+    // Then write to Firebase
     await store.set("examapp_data", newData);
     isWritingRef.current = false;
   }, []);
+
+  // Expose saveData via ref so ExamTaker can always access latest data
+  const dataRef = useRef(null);
+  useEffect(() => { dataRef.current = data; }, [data]);
 
   const handleLogin = useCallback((credentials) => {
     if (!data) return;
@@ -173,7 +250,7 @@ export default function ExamApp() {
   const handleLogout = useCallback(() => {
     setUser(null);
     setView("login");
-    try { localStorage.removeItem(SESSION_KEY); } catch {}
+    ls.remove(SESSION_KEY);
   }, []);
 
   // Sync updated user data (e.g. after profile photo change)
@@ -196,7 +273,7 @@ export default function ExamApp() {
       {view === "login" && <LoginScreen onLogin={handleLogin} />}
       {view === "admin" && <AdminDashboard data={data} saveData={saveData} user={user} onLogout={handleLogout} showToast={showToast} />}
       {view === "guru" && <TeacherDashboard data={data} saveData={saveData} user={user} onLogout={handleLogout} showToast={showToast} updateUserSession={updateUserSession} />}
-      {view === "siswa" && <StudentDashboard data={data} saveData={saveData} user={user} onLogout={handleLogout} showToast={showToast} updateUserSession={updateUserSession} />}
+      {view === "siswa" && <StudentDashboard data={data} dataRef={dataRef} saveData={saveData} user={user} onLogout={handleLogout} showToast={showToast} updateUserSession={updateUserSession} />}
     </div>
   );
 }
@@ -1618,12 +1695,12 @@ function TeacherProfile({ data, saveData, user, showToast, updateUserSession }) 
 }
 
 // ============= STUDENT DASHBOARD =============
-function StudentDashboard({ data, saveData, user, onLogout, showToast, updateUserSession }) {
+function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, updateUserSession }) {
   const [activeExam, setActiveExam] = useState(null);
   const [tab, setTab] = useState("exams");
 
   if (activeExam) {
-    return <ExamTaker data={data} saveData={saveData} user={user} exam={activeExam} onFinish={() => { setActiveExam(null); setTab("results"); }} showToast={showToast} />;
+    return <ExamTaker data={data} dataRef={dataRef} saveData={saveData} user={user} exam={activeExam} onFinish={() => { setActiveExam(null); setTab("results"); }} showToast={showToast} />;
   }
 
   const now = new Date();
@@ -1775,7 +1852,7 @@ function StudentProfile({ data, saveData, user, showToast, updateUserSession }) 
 }
 
 // ============= EXAM TAKER (STUDENT) =============
-function ExamTaker({ data, saveData, user, exam, onFinish, showToast }) {
+function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast }) {
   // Check for existing session to resume
   const existingSession = useMemo(() => (data.sessions || []).find(s => s.examId === exam.id && s.studentId === user.id && s.status === "active"), []);
 
@@ -1854,39 +1931,98 @@ function ExamTaker({ data, saveData, user, exam, onFinish, showToast }) {
     return () => { document.removeEventListener("contextmenu", prevent); document.removeEventListener("copy", prevent); document.removeEventListener("keydown", preventKeys); };
   }, [submitted]);
 
-  // Save session every 3 seconds
+  // Use refs for latest values to avoid stale closure in interval
+  const answersRef = useRef(answers);
+  const violationsRef = useRef(violations);
+  const timeLeftRef = useRef(timeLeft);
+  const submittedRef = useRef(submitted);
+  useEffect(() => { answersRef.current = answers; }, [answers]);
+  useEffect(() => { violationsRef.current = violations; }, [violations]);
+  useEffect(() => { timeLeftRef.current = timeLeft; }, [timeLeft]);
+  useEffect(() => { submittedRef.current = submitted; }, [submitted]);
+
+  // Save session every 3 seconds — uses refs so always has fresh data
   useEffect(() => {
     if (submitted) return;
-    const saveSession = () => {
-      const sessions = [...(data.sessions || [])];
+
+    const saveSession = async () => {
+      if (submittedRef.current) return;
+      // CRITICAL: always read from dataRef (latest global data) not stale closure
+      const currentData = dataRef?.current || data;
+      if (!currentData) return;
+      const sessions = [...(currentData.sessions || [])];
       const idx = sessions.findIndex(s => s.examId === exam.id && s.studentId === user.id);
-      const sessionData = { examId: exam.id, studentId: user.id, answers, status: "active", violations, timeLeft, lastUpdate: Date.now() };
+      const sessionData = {
+        examId: exam.id, studentId: user.id,
+        answers: { ...answersRef.current },
+        status: "active",
+        violations: violationsRef.current,
+        timeLeft: timeLeftRef.current,
+        lastUpdate: Date.now()
+      };
       if (idx >= 0) sessions[idx] = { ...sessions[idx], ...sessionData };
       else sessions.push({ id: genId(), ...sessionData });
-      saveData({ ...data, sessions });
+
+      // Write sessions directly to avoid overwriting other data with stale state
+      const nextData = { ...currentData, sessions };
+      saveData(nextData);
     };
-    saveSession(); // immediate save
-    const iv = setInterval(saveSession, 3000); // save every 3s
+
+    saveSession(); // immediate on mount/answer change
+    const iv = setInterval(saveSession, 3000);
     return () => clearInterval(iv);
-  }, [answers, violations, timeLeft, submitted]);
+  }, [submitted]); // only re-register when submitted changes
+
+  // Also save immediately when answer changes (separate effect, uses ref)
+  useEffect(() => {
+    answersRef.current = answers;
+    // Debounced save on answer change
+    const t = setTimeout(() => {
+      if (!submittedRef.current) {
+        const currentData = dataRef?.current || data;
+        if (!currentData) return;
+        const sessions = [...(currentData.sessions || [])];
+        const idx = sessions.findIndex(s => s.examId === exam.id && s.studentId === user.id);
+        const sessionData = {
+          examId: exam.id, studentId: user.id,
+          answers: { ...answers },
+          status: "active",
+          violations: violationsRef.current,
+          timeLeft: timeLeftRef.current,
+          lastUpdate: Date.now()
+        };
+        if (idx >= 0) sessions[idx] = { ...sessions[idx], ...sessionData };
+        else sessions.push({ id: genId(), ...sessionData });
+        saveData({ ...currentData, sessions });
+      }
+    }, 800);
+    return () => clearTimeout(t);
+  }, [answers]);
 
   const handleSubmit = useCallback((auto = false) => {
-    if (submitted) return;
+    if (submittedRef.current) return;
     if (!auto && !confirm("Yakin ingin mengumpulkan jawaban? Tidak dapat diubah setelah ini.")) return;
+    submittedRef.current = true;
     setSubmitted(true);
     try { document.exitFullscreen?.(); } catch {}
 
+    // Use refs to get latest values (avoid stale closure)
+    const finalAnswers = answersRef.current;
+    const finalViolations = violationsRef.current;
+
     let correct = 0;
-    questions.forEach((q, i) => { if (answers[i] === q.correctAnswer) correct++; });
+    questions.forEach((q, i) => { if (finalAnswers[i] === q.correctAnswer) correct++; });
     const score = questions.length > 0 ? (correct / questions.length) * 100 : 0;
-    const resultData = { id: genId(), examId: exam.id, studentId: user.id, answers: { ...answers }, correct, score, violations, submittedAt: Date.now() };
+    const resultData = { id: genId(), examId: exam.id, studentId: user.id, answers: { ...finalAnswers }, correct, score, violations: finalViolations, submittedAt: Date.now() };
     setResult(resultData);
 
-    const results = [...(data.results || []).filter(r => !(r.examId === exam.id && r.studentId === user.id)), resultData];
-    const sessions = (data.sessions || []).map(s => s.examId === exam.id && s.studentId === user.id ? { ...s, status: "submitted" } : s);
-    saveData({ ...data, results, sessions });
+    // Use dataRef to get the absolute latest data
+    const currentData = dataRef?.current || data;
+    const results = [...(currentData.results || []).filter(r => !(r.examId === exam.id && r.studentId === user.id)), resultData];
+    const sessions = (currentData.sessions || []).map(s => s.examId === exam.id && s.studentId === user.id ? { ...s, status: "submitted" } : s);
+    saveData({ ...currentData, results, sessions });
     showToast(auto ? "Waktu habis! Jawaban dikumpulkan otomatis." : "Jawaban berhasil dikumpulkan!");
-  }, [submitted, answers, questions, exam, user, data, saveData, showToast, violations]);
+  }, [questions, exam, user, data, saveData, showToast]);
 
   const formatTime = s => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 

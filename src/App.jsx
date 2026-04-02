@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo, createContext, useContext } from "react";
 import { BookOpen, Users, GraduationCap, Settings, LogOut, Plus, Trash2, Edit, Eye, Clock, AlertTriangle, CheckCircle, XCircle, Monitor, Upload, ChevronRight, Menu, X, Search, FileText, BarChart3, Shield, Lock, Save, RefreshCw, ChevronDown, ArrowLeft, Home, User, Hash, Layers, Play, Square, Award, Bell, AlertCircle, Printer, Camera, Key, Download } from "lucide-react";
 import { initializeApp } from "firebase/app";
 import { getFirestore, doc, getDoc, setDoc, onSnapshot } from "firebase/firestore";
@@ -6,6 +6,9 @@ import { getFirestore, doc, getDoc, setDoc, onSnapshot } from "firebase/firestor
 // ============= CONSTANTS =============
 const SCHOOL_NAME = "SMA Negeri 6 Pangkajene dan Kepulauan";
 const SCHOOL_SHORT = "SMAN 6 PANGKEP";
+const SCHOOL_ADDRESS = "Jl. Pendidikan No. 2 Pulau Sapuka, Kab. Pangkajene dan Kepulauan, Prov. Sulawesi Selatan 90673";
+const SCHOOL_LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAIAAAABc2X6AAAuPUlEQVR42tV8eXgU15XvOffW0ptarV2gFW1IrGLfMQYMeAMDdky8xLHjiXEWO6szmSR+yctMPJ7Mm8RxEsd2HO8O2IlXwBhjDJh9E4vYhBASktC+9d5Vde95f1R3q4WZfG/mzXzve8X3NdXVVbfuuWf7neUKiWjfvv3z5s194Js/z8gZZURCDmeaEAIBCAAQ7A8a/kQCACAEBCCC+PfUI/kg2D8hoP1Eyi0IQJByBUESSbKAJFF88PiT8f8RABAxfvfw6PEBiQCAgJCAEBnnHJETkBmLZmTnPPWL7954w7w33tigAIAkAQAcECVxxeFIS9NUNUEhJsa9iqzk9SRRKecE11yEv3GBUl818gWYMqS9cNcYfnjQOBuAIBaLCimZZZKQDofLfkgBAGEJAFCdjkAwoEr/gSMfX2hsZIxJio88/IL4UMOTTD2Ha9KUcg8OLwUBANrcSL01hbDE6KnLkDinBPMTT+HIlUdkkkTZmDHVNROYI9+XmY3IbOlQAEAIAQCqqkeHhj758JWvfOX+dWuXEQEiApEkyRi3xcl+BedcSImInHNEJCIiAgSGzJYtzhkAkpSMc/sKY8yeHWPMfiT+rCQC4owjQyIiKQFR4VwSARFXFCJp08k5JwIiyRhLzIUA0SaTcWYzgzFus0rh/OChg88/98ry27+KDBnjwwQTgU2PqqqNF5tmzJizZOkS+P//6O7pbbrU4HA6ANFe0DjBcWFAMC2DMcY5tyzLsixFUTqutG/etKm8rExI8vl8yFhXV9eKG2/84N13hJA3r1yp6/rp+vqhwcFwKOTLzOzt6bl0sWn+wgWqpm754INFi5cE/P6zZ84UlZSQlG1tbVOmTU1P952oq7tj3TpV1U4erzt44MBNt96anz+q7tjRvZ99lpubd8uqW7ds2jzQ1/flBx/8bPcul9N1sbFx6bJll1tatmzadMvKlZdbLxcUFHR1dCqKMjg42N3VNX7ixNaW5mAwdNMtt1RUVZmmqaqqqqpcdRABQyRJwxyWJAGApJQkpZQOp64oipRSUZSf/eTHRw4dfPzn//TXDRuOHz2GDCdPnTZhwvif/uiHlmWVV5RPmzHzyKGDzz79NDJ2xxfXbfvoI13VSspKfv+bp/p7+rJzcvfu3nn61KlHv/f9l557LmYYH3+0ZfHipW/9+c933XtvX1/vt772td6erqnTpxUWFu78ZPtbb7yhavrllkvbt25tbGiYNXvOrk8++eSjbUIKruCrf3opEg6PH1/z0YcfDg0O9nR337Fu3cbX36gcO7aoqPCFZ5/xeLx1R4++smGDECKpMhC3RGRzmCUZLAWBJADgXLElnIhuvPkWb3p64/kGd5q3rKqqpHRMXl7OoQMHvF5fdnbuwf37AcCT5gkEhoL+IZ/P53a7iktLMnyZoUDghhXLQ6GA2+XOzMycNmNGRmamaRi5ubkZmZmeNA8i1h09YplGTc24Z3/7OwBwudyKqk2qrfUPDQHJ4uKSXZ/uyMzO6ups11Wlr7dXkpy7YMGVjisZmRmXLjYB4JTp0x1OR3ZeXtXYal3Ts3Nzrl+6NCnSjDFM2H8GKJME26QDAUvxdfZn08WLwYD/YlNjV2fH2jtuX3vnnZcvt+785JMx5eUVVZW7Pt0BANFwJHdUftGY0mAgCABnztT3dHdNmFz7zO+ePlNfbwqrr79v8/vvB4LBG1eu7OzorK8/xRWViKprxrnc7tNnTs9buAAAotFoRk7m755/PhKJ5OaPnj5r5pFDBzuudEyZOdOVljZ+/MTq6poXn3u2ual5aCiw9s51xSUl7779jtuT1thwfv++vcCUnz3x5P0PPiiEsG0kIgIiIhLEeRwX6aQ3J5AATMq4PyKAW29bPWvO3KkzZrS1tqanpyPi7PnzhCXKyisYZ+fPnZWSVtxy67zrrnM6XUR0y+o13V3dY8rKbl5124MPPZydnYMMu7s607zeW25b7fNl3Hn33bbNF5KKiotf3vjWwEBfTc04SXTP/V9e84U7ANnDjzw6uqDA7XY3NjRoDofT4TBMMzMjY+HiJQ8/+q2MjAwhhMPhsEzLtEwACAz5fVkZN6+8LTc/X0gJyIgEASBjJIxAf09G9mhLmLZkKwCgKAoAIANF1QEkB0IElSMgVtfUVNfUAEB1dbUtJ/n5+UmZqa2dAkB5eXl5eXnJixUVFfbJtOnT7ZPi4uLkrzk52SleWubn5+Xn5wFIhpiXaw8iq6qq7JPK+MnwMW7cuGuY46JUz08AxIEASGNIAE63l3FuWQbJBMG2AEgiVdUB4Ojlfir0xyJRxpmURESMIVHcyhERECAygrhXtH0mJHw/ETFkAChJxrEakW0RADEJXRhD+6VAhAkHbqNCSYQAgECScBhdom1Z4yhjGO1S/FcbOCAAoRDCmeY61j6ocI0kkZBEIKUcQbAlTCsWBYDGMDpFWjiKwNnf9HP4Ofw0DJz/Lw6Efxc5jrwh5cYEwo+/W0iRxjxtYUQAQdIyDM74MMG20UJAYAgAGme6gkIBm+Ak9MPkko6IKDBxZZh++wpehTBTFgLjIBIpCZQxfjEuCElMjsMMvAq5I/y7kQsH0hiQMKWUiu4AhoAwDDxs0hkDW7QAmSAQgGxkLERJEEvDb6arI4H4BEeCa0pMMeUpGl48SgJzguT4YOsJ4TVfA0ktukbwkLIqJGzqEDBOJgBYlmUDbmQIAPFPG26m8AUJABAT0oQEBFKCIJApcjCCkwCEcT4SJBDA50Ksq3VkpOjaI8DnRh7x7Mgb4gxBACIJQEiIyIQUcQ7bBDPgJO2RWIpJSFlRRAAiBCQkJAKpoVMjbkmIYQiBAcLnV50glbsIAEiEXCFpUcrFlKljgus4zC6kJD5Igv+UVUvOKoXJmOCXzSGGUiQ4bBhmnJu2MrNrTTx+ARFQgpQgHdzdaZx/T/zyX/Ubz8vdOjhknMMjnsKkVhABSAABDCODXUASQcLwIwkiUnQoGezbpJgWGZY0LIkjgmVKLtTIEDLuSpAIgRDB5jADgFgsai9C3HohjnRrI/RHktC4I515Dvdt/p99t74RfSwcjpTilBhGMc4TGslheyoEikuCG7hHRgMT+MNkDBB3S3Ajc+AIPg+TmdRuQmBSTvHJBTl8gsOwzAi33dqwIHx+BMCEuyVERDbshw3DSIJnW5lhRH5lmFpBlou7mvynPvQ/c6xrJ3LHCvrh7Zk/yFTSw0AGREcqUvzFDFBIwMAJjyMQDucV8D/PH785cHZDR2CVW+mNxDzgrgRuG7ARpp2SykDkYGJ6Xhogfir2N7drVXlzYlZIU9QUwzGCZoxzLpmyQDvsH04AINrQEtA2z1evNwFIn5LWNFj/6757+3Mujmoaa+nug9aWM5FPxrIZC5UvFcJEwmtaIwJUmNU9Tv1pWdEhzcGEoiwZ+xNh/X1Tx5TDwX8hrEawRnovHM5VIQCyYDC49VJrO7v0zHu//8mU79fmYUe/OB2IKk6vlCIBB0ZkeRgm0m8IiCkExw03opSUtNKfsz1SAXVz14ub/U8H0zsy9+Uscd3vLh11WuwY0Foatf0cxS3Gj3zO0UKaUhJJaScrEFEiMjQpa9mB6Lyu1l8srfkFIHDdOtS67kTk92pOBooQESawlgQAhgw5s1G3ZZkIknkyLkYdBuU+MnXsqplFoGOb2dDerRXpmRIkj6eScMRa4zASYyzFSscJZoykSIp00tAjgCArU0vb3rnhJfmo1+koPlkenBLZqP1cF3qpPulG+sZU6ybBpNDM3u4OZNzh9uhOp6pxBJCGZRoxSZLBECnpOvhDIWdL/6LS7J06DxHPQBmQxCVJzpimO7nKJEEsZkYj4WgoiES+rCxJAABezS0JLF/s3csXDjbt3n9655PrfheVRrc/5mcK59xGIpQkGxmlqLltpZWRzkwOG63ESkkSOnPu7tzyV/8T7nzd8Rf35FGrFKcronakO7LT5ehsozgkh1xpriPvv2eePzSmelx/xIiiYqouR2Z+RuGY7IIil1OxTDC7Tlva0PstOwblrJP+Q4X0lBKtk+oEVQdVV0PBWPulxoG2ZnOwWxNRJ1hpDv3MyeOZM5ZNWroi5A8RZ8g46JldlKEz60fjx80anQsAG+tPxWisR+FipImNE5IQGZnksKbpNv9t0A5J+wcoSbi560Lg6O8iX1Xd0cz9ubBS2+J8So1pBdHxa83Ha51zTS+YAM506L3S/tVbly1YsgyEFQoFOzs7G5ua609srfs0xPPLxkyZnZNXdSn6MhG5lFBIzjxnvuzMslSX2tpwsbluHx/qKM/1zagsK587Oy8vT3e5Adnmd9/5oHnA5eWCvAgQi4QQ0YVKcX6p5el9p377tsvbSvPmlXgnBS2hcJbM0MVjCSBpyykykeSw0+lIinwKhxGAODLTMrf3/QlK/M5NaWPb5udMH++PtZa6J9ewBU7hC6jhlqN1fU3nsnOyBy6dEYtrpZQEzO31lXt95VXVywECg/2HDh/evf310zx93PU3jioqCgyBwyFiZrCx/kzj4b2VHr5u9rSp01Y5Pd6kvFlCIEoLoPPkgfr33J1dvbnl48dMnhYzDIsD0x2t5qiTp+s9l/Uf3LQKBOxu6ToT1lwOlyCRiC5S9JmhEFacYM553DAm/LBtyyWQE50bev5pN9+Y1ZCOFeqhZR8yY0uWLCkJTPO5C9DDgbPjH7zxs/X3FpaWFZm9tnmwjQIRSUnIMM2XueSG5UtuWH7+1IkX3nzxwqjqeatuv3h0/6Htb3mY/MrqNYuvW5ScmJQS7QOAMwbIvrh0zopl8xsbzv7PZ1+tnDMXFS0WCQMDB9OnVs1ZcP3MAAVP9p/a39eX4VkqQSaxJsNhWJbE0inRUsJdJ/wwKaiaRuykutWZIzP/OXPG8ruDZkAHbaZzVT4bB064eHhff8MJn0Ljp81kjKWl+5L5Z3sgztG0rMbW1qb2NsOySgqLHvvW1z7euu3T5/9X85XG8sL8b9/3QGVJSXtXV09/vyVkfnZWfk6OkjIIY8yT7kvPzhnn9rjhpcOvPpNeNqFi5vxIKAgE5HRvbu/Y9LvHi2ucDy58rD+KvaYAloAP9jh2Kivhg4YzHkSkKCpjSlLZddA29/6xC5ocvXrnTd3vlf5WFbzKmjNTudPhU9pbWurfffH5X/3zxr++4w8E0r3eZDIp6UGJaGBw8GzTxYaWy4Fw6J2Pt6mKumLhwryuzu5+7ZZFSw6fOvXkCy/0DQ4CYmVR8Yzx42ZNnlyYn59Ee4wxIQQR+f3+2dNqv3z37Xc99E3f6KK8otJoLMYRPY7ChxY9dMe8maBBIOLfeKZLSS8GEDhcj5AAhAyJEhzWdc121sg5Y2gH9Ax5xIrs1V81tXDxn8trb1s1mDaUFRk9z/vFNDPjN+vXHd+9fda0KelZOcyuJiAi4lUcRsTc7OzJ1TW6pje1tXEAp8Px/ic72nt7i/Lz3ty6NRgOTx8/7oHVq03TmjpuXJrHfZX/txXEHtm0LG9WTk9r8w+X106at+SBJ/6ge71kRAaync+feLsXLhuW1+e+xYcIYEdwLCXpzkRSpDlXIB7r2MADbIKD0X6TBV069GcE9vXvCFidJVgzTbsNBs19m94SUkqSRGRPKDm/1GLexdbWDR9+WH+hQdcdRbm5/lCo+fx5IaVD1zp6e5Cgekypy+kKhsMTKittapO5JEi1oMNhEQlhhQNDhz96984fPuHwZWqKytTqo3v2V5U41i66/UrAfbIvAIxj3EonYguGJEZUHhCRJSMQCVIHx/bYX9til7KbvWVLK9VSZ0bfrFnGHYVplV39F1xeX3BoABlDxFgslkx3Jd+BADHDGBgcnD1x4v233dbc1r51794rPd1CCs4YADLkQooTDY3NVzq37d8fiUSmj6955N77CnJzU2lOJTgeBSAiotObzuywjvO+3o51Ny+eXVwBIAPhS2YEedooSkDGRFYhrtgpSAsQ43EFQwCUoGhMKQ5pdb70pgntkzrOWzt8aeUV6dOJpLSs5LTs2OOqSBIR/YGgKcW8qVM/PXToqdde9nl9C6dMycvOZoxv3Lp19tRpWV7vnrq6UDQ8qbKivKj42Jn6x3/z6ye/+/0sn4/oGmmtJAQmIimEXUYWwsrOGb219cS/bvt6UU16Bi4YlbkYyaJh4BFXL0qWS23zZQMxjEMQIEaD/kFuatY082jhBq8nffnQXfOiawQCyUTkDGjPI16NTsxSSimkyMrw7Tp86KW33xsK+seXV86ePLkoL7+ytDTL59u6Z/esSRMWTJ02tqz0yOnTu44cmTFhwq/+/h/++tFHLe3t2RkZMoXg5OA2wQlbFEeNnPFAMDAta8za2Y9UVZZw1fHRxcH2KDhxxJ2IOKzDUsqEgkhkaCc7paRub2OMyZxdY66veeSEOLw3vNc3qmZR+mpbdZOvtiwrOSf72HnwwJ6645zz4vw8Q5o5WdkO3bn3+Imy0T26pmdnZORmZLkcTkCcO2Xq2NIxbofjtQ82RSLR25cts30JQxSJtUsOHo/qhivSRACCpKbp5/sPFNTkNEfbYn6jPySZVmInACCZN0OUNIJgSgSPiIBEoCCrkrOOZbzWO7HtBe+jomRoqfVgbfD6mJDJ7JQtM6Zp2msvpRRCIOJ1s2ZPnzjpwPHjWz7bM+APdPX2cc5KRhUIop2HD/hDAY7oUJTegYHtB/Z7nO7Zk2t3H6s729y0/+SJmGHWVlf7vF4YSbA9+FX5CQRAIgVYtm/Gcx/+xldsePncTN9CJ7OTn2wErk6KtJ3pArTLiAiMAZBECFn+WKuDWeodGQ/HLjuaLp7f5HvhntrvCmml5kY45/FUvl2kAYgZxhubNp1vbr7S241IGd40XdNC4eDpxgtrlt4wpqBQYfxSW2tzZ+el1rbzLc3+YNDpdPUNDR0/e7a6rNw0Tdv3JvXWtv8JRBiXUyIgIK6oPb2t80exL3/xR/ZPb53pGZS6A2G4cmBb6ZQ0rc1YRkKinYwDFCQrPJO9aYo4Ly7VXfpszNuZkx2rxF+EsGzZTToht9vNOSeiUCjU1dVlGMaBEyeysrJygoFMn/cLK256/9MdKxdd70tL2/Tpp+/v2LFg+vRsn6+3rz8rL6+prc0yTcZ5/+CQYRiFObkF+Xk5WVk2qYZhdHZ2ejweu4fA4XAko9ek15JC+jKKNlx4e8/A1mJPkSZy/cZo7nDJRBSUgJZsmOBE/QIFWQAIyIDQhFg5m5PZMa4jo65p9PabCtekx/I34y9WhP7eRzmSrCSHpZRutxsAFi5cuHPnzo1vbkRC5nZeamq67+ZbywsKFK44nc5Rubl/d+edC5ua/MGAJcwxBRX1LS1zJk1aMmfO9gP7ayoqD5082dzW9pcPPphQVqYA+v1+0zTD4fDSpUsR0ePxJKz0MJDjjPlDQyVufdb4W0/1fhwIQ4iK0tJypBUFStRAEuaGSFJKQRwBAexEJiICSBAa03MdJZfo4Jhj87LNqlf0x3LbJhUWT+yjC/FGJCIhRDAYfOmll9LS0lRVLS4uNgzDNIymS80TC4svNJxvunCh80r7ZwcP5i5f7nK5xpaVAYBhmv5AYO0NN+Tn5ABALBL1d3cXOPRL0UhGdnZ/dw/nXNO09PT0nJyckydP1tXV9fb2poo6EUggRARVP9u/c2nlkgn5qwHg08auhkhE03gyiRcHFwylJJI07IcBQUpJiHGoBcSZslb9YbO672Tp5mN7jk3w3D+5fNLLJfdXX1ykWW4DDFVVOeePP/64EAKRRWPRaCQaM2KxWGxSOBIKhfzBQCwSMTnftP2Toba2sdXVC6+7Ttc0wzC8nrT8nJxwOPz+li2nz50zevuysrPmTZzk8/lysrKcTpfb49Z1XdM0h8OhaRpJaeuwqqo2hxliNBwa5XC1GnkPbf/xaHdxqXMGZxW6UxUkhv0X2nVwZieQlOGIDFBKifayASKwKEYL2PjCwelH1fcmw3U3TrjxD4UPhesds6L3gkdgEEOR8PZPPtm1a9fZ06dbmpv7+noNwyApVVX1eNyZWVm5OTnZOdnZ2TlOl/NiV1fDubNbNm96eP3DLpfL6dTrjh195eWX+4Rwanpfd2dL88VwKNTX29vd0z3QPxCORCzTQoa6w5mdnTOmrGzixInz5s83TIsxBkQq07sDrXMKtTUVc8PGlPP9/Uf6PIrDBdJESVd57GQkMZy1tAucgAyQxbu/iAQXa9Ifu6LVt8zb9cz+c3By3Arfmrrlf4XHIvQj2r7t4+3bPrZVSnO5Pek+3ZWuO1yKpoct0dcZqm8ZsMxTYBkutz5p4fzBluYhv3/vsePjp888f+r8uxs3aC5X1fQpjUeORk3LtKQEVDSdc4fu8JLDKXhUWEZ//+CF5pZ9+/enoi7Tskwjkp6X+euzzy6LTp2bPS1DUxxWyBQqJiEHxkXarrXYDyoAYJkWJdQ66bEIkREzMFrFZq7q/+Fzyt9xt3tN15eiiy9t73o5d6jaOcdfO+uWiZVLs4tLfNmFujdb0TXOIeoPCDOGCgOri1F/NBRoPl3feuEocMgqqESGwpIhujIojdlr5hoxxplnxqp12aOLM3Oz3F6f7sl0aKYZDXrzx2nuPAKUAsxYOOrvHept62xuaK6vO3dw36XmU+OzQzdUjdvvXrWp5ZO6K1qWs9rryh720snggVKjNzsRb5po5wckICZrOHahmgcpPNOz+oLct2/BG9uP/CHwtlqRcffMVVN2/OO/VA7NWx69o9eCaKRLRPaT/4wQDTJyNhbuD4c94RCZJkiBIJXy8bqmmrpmaJqpqFLTpK4LxiUACAIjirEISYsQTN0ULjXEdMBAvgzmCyyQrIKr49MyqjMK59bMm2sZXxbByOkLB7YFP54cGz23sHZuYe37DcF+5kAy5bAQxzMew72aiIBoi7QVrwElKw9ElNLkiKh9FZ/lQbZt/POuvtKqU5kNtTs7D4cud516dsoPCnqPXB8eArXLUqOoE/M4GWMIXZI4EUMEQIlAyChRFyOQKCUj+4wRZ8iQATACKQmktOFQB1A7yINEQpiaiKabfYV9MLfHrLl36opby6//08m2r+18YnH+jT6lOCrz0MFYMiuXUkWwoSWzewAB7eqhSBTRZUqH4XBxXYIVYdHV6j+GwX90+abPsjbEPsqtMMb55r/9mvfS/H7nBI+vS2czTZclOckYkGl3qybqU3hVFTRe/YonyiWIeEoN7bclYxhkwJEzhaEZM7oHQ1pF5q5XG944Fc2+OeP6R6fee6d/7V8uhyNaGkMCu5ElpXqOI4wWILK4SEspMB5A0bDGJ1RBEAByYJTl8P6AXv8g+PQbU36gZGviLXn4M2RWVW9f2YtzG87obd88P0/1DGpGvmJmglSJRxjaNVEBxAAFAALFCyCCbGTPYlKXkgjVmNQlASGPSYcEYOiICi0mMByJCXVUV+DCU9fdPWP0dI/3xA+OPrUj68K49JlDfQqqWZlZpsq5hWpMSEGCERImUhnxxmMbArMR3bTxjhNMYjeUBJwzN2ckzP5g9ORApHHIvOT/AvrcWPZszzfPy7oczz5X6KjemZkW9aU90XOTWvEG79SsMz9TRu+y+habRhaQheRGJQiWC5GAhwUQADKI50aRaQggpF0xUIAEMAUMC2IR0DNAtvzjZFmRW/Hc/tfe6d40Ma+8tnDynzOeHfXGaYPSAHSfYo7WemrScWKWo8zncjn1qATDFMlqdLxoCswGwsOth0xhyJidApBEjKFLYYFQ+GBX4EiP1RDmfUIVzAUcld47efctevGv+azfW+U9kbQuOO5zyFJv45Gh0gGTLvPcjcrUf2NtNcqZn2qTfmN1LDau3OEsecEKlZv9i5ADgYnABAoFdSPSD0JwtwcJHJF2dGQFLEe168SP51UcH9D+cuHlB6ffkafAnaVr7t7+xB3bX1ycv6DD73Oqeag4JVhDEgctOtMt3u+KlWmhOdl8RoEnM81lty4xG22RQJaSAEiW7EhKRCAkl8aHBvybWwO7uqnV0qTiRIUpCiEQEEkekFwRrT/UA0tY5rbY8rcp3Ko2eOXlPr4jTXp83gN1EZZj5Zxgzq2Ws01UPKpE2yDvEGTsUs/dJdr+h8QMAaYCTtO8cl9pa232lH87rwwa+965sSjbk//IniNTi07fPW7p3SDL3CUP7P6n307/2Rhv6ZeqfrxiS/umVgVIZZqC0iAARoAMgDMJrvMSz3cYmzoDSzP9N08c5VIVAmSMA+OIKJPVw2SPnhQCGXMpcKSpc2Nj6DKlgaoqOjGSkuLoxO6YBpBSCUWGZmL/Aq3jdlbyqjnxZGxCM/S28V4n5fXwfT4oH+P99AzsTxtYXghDdbjrTqzuIvUD6V5C9ABnESMWmpy34dkbvqFj3tScy79sen9Jya8B1D8tzLr/4NbD/VNnZC54uPaBpzeMmv3+2RpPsC3g0VwZoHCiBKQGIDt3QwRAHAE1pZe8G7pjdYcHFoT6VI6EyJgS7wlLth4iIkNFAnDAjSc7t5r5xDM4IyAh6dpdOAAMeJiUoBGrorNPKhjmnmO85E3KPTNUGWGhdm4Y4bUt0ObgF9M5taiDL8uzOnkKfMePcEQeGzL8p8W6E+3RO8uceQsKsr9/YuC5pte+Wval8owqzfj2Fz5uWFOscTOrMzZzgPTu/hhw4oxIWp8rPidTmgBEDAVzKA3S2dbrVhwuKU1JxJAN56UZQxtaOXQtbNFOv5tluMCMErEkRklt9o/XXeOuhBOLAo+YxKzQbF4/n/Mg4QDP2UfpxyLcYGP7Nc9JI01GTENpHJ37Wq/38DtmzgGlv0V6Cpon3/3dgrP/UOR2iMzOoX/6zt6zH188MkrJrxuY1i/m/Ft9EICYZirMAo7DXUCJOQxvIYBkCc3WTVIZoJSWYTJmN2QxOzuhxEuJwrKE6U7PZEbEGeo1M0fJa+zZoGFnntqXhAhEDIB4SCggiBNlG513Ysc6BkJqJNPCWv2JrD3vpdUdNtILOu77brhyvrv5SNq+V4o2bPn09JKP55Wjxx2yshAW/+VyFKSFmqmoFqqKDcXkVfsfMKXXK4XRKd1rREyBgSsKCd3pQSRLmE6HA22Cc3JzSFqxSDg9M9/B0Gg9h2XTIBaClJzQ57pVUvv/KLG03NYlRBNUA4g4U/SBK+lbNrpP7xAZo/pu/k5g3OKY6lbN8MC4pYGKed7TW0bvfY1Obh2asQamr4k6PVwDBG7Z0frVPUHX6OlL7hdJVToiUhRFNp/xut1Ol5cI/IMDGenp8S6e0tIxAGKwv8ebmZObm2+c2qnEM0A0DL1T2+9SIXmyw2nE/BhKBsSQ69zfw/sv9q7+Qev6F/snrzQkUcRPUmA0YEjZO/WO1vUbBhc/6Gw+zCKDkqlCkkWpqAyvsYHo86138Z7o4UBBEUbs5M68ojLN4ZJkdXe2jy4oiOtwdXWNLz299dK5oopxFZPnXNy1zTnQFdNcIMVIW4WQrCsM79Ya3uBk/yMiBiARGaJlRCNjpgUr5gKSjIQAooDMhngETBKx8JDJee/MdcrMO8gyUZjJQC7pKxFRwrVa5ZIl3uEnAAklSKY5ecdF2Xio4q6vcsajoeBgX/u0aQ8BABNCeL1ps2bNPnV0P1lmxaTZmSJk7vqz5vbaLR8jW7VGvg+HxQsBhSBhEQFYJklJlkmMQTRsmOGAGQgggiAmJEiCmEWM2STwmCFZ1B8NhWMRkyEigRAgZLxpX0iwLMJkb+bIvs6EfCUcCQEhMSlUpzv68Yujfd6SyknIWXvLBSKxYsWNAIlc3gNfeaC1+XRfzxVfVt6MxSvDb/9S729nqgOIRnaKXbO9lxAABC0rwFuLsNojV5bw2dl0VzlzgnigmudquDCfVbjl/BwY44J5OXB3GWNSzsuhYqf81nju4bCujN0+hqtSzMmiqZkwwYdpiszRaFEu3lOOIGhk29nnt+IlpExKpnucVxqiHz03/5Z7GDKn5jywZ1v12LG1tZOJiNkZ1ttuu21Maeln297TNK1mxuLKrIzQs4+63R4mZYJm+vyevGSFiiEKi/J0NiuHqWRl6pDG2fxcrPRYeToUu+jxKc5zA6Bz9i8zXKd7xIrR2qQMODEAUQGL8rWIhQd7ZLWP/XCy3hE28pxwf5nyvRp9SibLcbAZ2ZowpIKf38c3sqML7AwGunTd//uvT6mZOGbcVETe19tx4czhf/jRj+xSM0NEKaWmaf/yy18e3b+1p6PV4XTdsO5hT/12seEfHZmjSAogmWgrBEy02LJEozTGE+UQFTJg0Fm/8tJZy6VAc5AMUsMCm8P0xkWj0kcM5KuN0cEY+2OjUexhgQhLV+FySPh0KvPSP5+InR2UVenalYh8tSm2qd3QGQlJvTGpqjiyY83eWJfYlpdwvkjk9WVH//idrPaTi+9cHw74MzKyNr31wpQptXfddZe9MSke9NsbfVauXLl3//FHHv91MBDovdK88dlf0Bd/ztd+PzzYgySB8fimu0SAxzmS3eokQVdIQTAFEXITiJEEQEnoYGQSCAFOFUwJlgRFQcskhYPC0JTEGSqIAJIIIwYBA4WRzjFGYJnk1tEUYBLGtxsiAJCKaFgELJ5RRgQpLKZqLne6+cfvsI+eue/7v9Q0ly8r9/SxPX95+X8dP3Fi0qRJUkrGEgUIO1M7MDg4eeKE3KLxa+99ZHCgt+dKy9sv/qtx/f3al/85IqUIBzMdbJQT2iKkI0zJpMN9lKmBiljgwp3daApW4AYkmeUADuRWoCVIuoLZOvTGpM55RMCAAUhUm4kNAeiMQJUXr0QBSE7wMr8hooBpCkQF1A8xAKhIg/YQlngojVuMQVeURywEgMGYnJOHDX5USEQE9sckT8twBfuDzz7qOfXRF9b/D483w+lxD/V0/vbJbz/zzDPr16+3OZrYqJUommRlZm758KOzxz/76N2XfRlZuQWld339p6NPbQr/eKmztZ6n52U42MpR8huVfHw6LB2lMWL9ppKh8yUFGiMa7aLRTvnVsWq6gisK1YV5yqQstScKD1SqVV7I0mhNEa6vZBPTaXmBmq4yJumeMeyJSdptBWxVobamBA3Lui5fqU5XnEjpCs3NwfsrsC8klxU4xvt4yKDKdPhGNVcJI4I9WM4WZIsI01yZefqRTUPfnVXWe/q+7/4yzZvhTkv393X/9snvrF//8Pr16y3LStalMLX0bC/D3r37li+7oXrS/FVffCgcixiR2IndHxw6ti80+87CO77hGF0K0ZARiWQ7sN/kbVFW4pIVHtYSEkUuOD1IEzOUtrAkoJiFioJtAbqpEBuGRIYmmiOK6nCrZmRcmjjaD50RrEwnQ/JsHbJ18BsUMK1sp9IfYwwE59AUoBtGK29dshaPUrqj1B4mlckpWcrlgNUToQg65pR4Pj1wKvTuU65j789fvHLS7GWmGUvzZVy+UP+np396113rXn/9dbvVZril4Kpau01zff3p29euHgrKLz74vfSsUbFouKe9qW7XB2e6e42Za7Wl98tRFbFYlBkhsPd2EXIGQoLK0BTEOCaAIaoMTNNCh4vpHi3YR631Mq9CZhdiLCiMGBBRMnlo961L4kgJVAtCkKqiJQABNEamEIKY7vY4Nd24fDb8/u9cx96ZVDVuxtK1Tk86Q6ZpykfvvXpw95Yf//hHP//5z5NdXynQ4XPNBTbNoVDoW48+8vrrG+csWT1/8a1c0SPRcHfL+ZP7tjZ0dkfGLdIW3U1Vs0zVISMBMGPxnWAAbLiN186JSS3Nx9rO8YPvyuMfGw2HlMrp2rw1WLMwll8hES3LinfjI7ObH1OwO9k9vowkAKDq4E63asbk2b2xHS+7z+8dV1I8ceGtWbmFJIXL7WlrOv/my7/O8Dr+8Oxzy5cv+zy11ybYtmG2Vn/88cePff+xy+29C264beKMBarqjEVCXa0Xzh3+tOHi+aHMMTBrFZ9xC40qF0QiEiTLQLQrzAgkkSma2+vYszHy4vdjg50IwB1pMhrQnR5JyPIrnA//1l9QI8yYomjcjJpMkanTk4QkQdHQ6dER2ZUL0UMfwKH3Mofaa8ZOqJlxvS+nEBE0h9bZ3rL9gw09Vxof+uqDP3n8cY/Hk7RSV/efXJPgZE+FDUteefnlX/3qV1e6BqctWFE7bb7Hm2lYRn93e/OpAw0nD7cHQtEx07Q5a/jkxVbmKNM0KBokYaHqcPu72dbnoXSCNWai3tYQ/P16KxpQ88qJcSktV+lEuOXRUMkkUjR3a73SVBdefJ8ZDgAiSAlMQadbV1Xe3xE7/om1/6/uyyeLM9LHTp5VVD3V5c1SFYUBtLc27fnk/fZLp1etvPnHP/mJvY3v36P2bxGcKt4AIKR8/dVXnn766cam9srxM6fPXTK6pBSZGvIPdV4+f+nEgYsXTneRImrma/O+oIybazrSDEneI5uEtKJz1oIR1aJBaD+HnFPZVIVztafFOHeQeXPM2iXMiLINP6eqmcaU5bFoCJxul+7CsN84d0AeeMd5Yf9ohcoqJxTVTM3IK9R0p8p4JBpsqK87sGerEexZtfLmb3/ne/a2xKtM1H+Y4FRW218//PDDZ37/+8/27HN6c6fNXFRTO8uXlSelHOrvudJUf/HkgabmxkF3Lsxerc37Ah9VbmqOWH8HkOSKpiga77ssj30MV87LM7ujbef07GJl/Hxx7qDjS09E5q5lRpQBUVOdeWizevrTfCtQUV5VUjMtI69Ed7oVlVtm7MrlpuMHdzeePZqf67v77rvuf+ArhYWFNqlXtQL+Jwm+JtmNjY2vvfrKm2++2Xy5o6C0Zurs6yqra91pvphpDvS0tZ6razh54PKAP1w1T7vui2zCIpOrICz3kQ+MP3wtHBrUgVkgweGR0SABuFY/pjz4pNXZah3cJHa/7u1rriwuq5o8O690rMPlVVVFAvV2tp86tu/MiX0oogsXzPvSfffdeOPNqqr8n5P6HyM4VciToxPRjh2fvPH66x9++NFQMFpZM23q7OtLy6sVzREOBbtaGy4c39vQcKYvvYBfdw+fdwdTdbnld9DXxoyo2dduntmjFo51PfqimZ4bff8p2PtmPsZqaueWT57ryx6lajpnPDDYd+7U0fq6PZFgb+2kcWvWrr311pXJLb02ovgbAvxfQHDSjNtY3P7qDwS2bN70xuuvf/bZPqa6a2ddP2XmoszcUaZpDPZ0Xjyx7+Sx3R3SwZY+4Lj1m1GXgw0OcM3B+jtZJBD6bCPf+cqYzPRxMxcVV9W6vVmqwmORYFPD6RNH9gx0t9SMHbNmzeqVq1YXFRUlFz35FzL+w3tX/3MEp8p5Sos5tLW1vfXmm6+//npDY3NR2cTZC5aXVtQwVR0a6Lt4cl/dZx+2o0u57Xv6detkNBDZ+jzb9seavJzahbfkFFe4XG6OrLOj+fCe7edOHczLSV+zevXd99wzceKk1J6t/xyd/zUE/w3K9+3b++KfXti0eSsonlnzl0+cNt+Zlj7U3332yM7DOzcNjl0o+6+MHmyZf/M9BWNrnQ4nkLx4/tRn29/tvNwwe/b09evXr7pttd2nZEvTf1R0/3sJTqU8+SclAKCrq+vll1584YU/dXQNTp+/bPbCFZ707J7Oy/s3v+H2ZUxdtMqTliGleeb4oV3b/mqG+1fdtvLrX//GjBkzkirKGPs/tEb/bwhOVXL778/YvYkbNvz5qV//qrGpfe7ilVPnLOOqKoRgAE3n6nZsfcutyfu+fN/99z9QUFDwXyW6f4sn/32HlNI0zeTX5557trBgdFnFhL/7zpPf/ulztdMXedyeH/zgMb/fb99gWZbdifXfd/xvyF+yBM+BJPoAAAAASUVORK5CYII=";
+const THEME_KEY = "sman6_theme";
 const SESSION_KEY = "sman6_user_session";
 const BACKUP_KEY = "sman6_data_backup";
 const CACHE_KEY = "sman6_data_cache";
@@ -59,6 +62,30 @@ const MAPEL_K13 = [
   { id: "info", name: "Informatika", category: "Lintas Minat" },
 ];
 
+const MAPEL_MERDEKA = [
+  { id: "pai_m", name: "Pendidikan Agama Islam dan Budi Pekerti", category: "Umum" },
+  { id: "ppkn_m", name: "Pendidikan Pancasila", category: "Umum" },
+  { id: "bindo_m", name: "Bahasa Indonesia", category: "Umum" },
+  { id: "mtk_m", name: "Matematika", category: "Umum" },
+  { id: "bing_m", name: "Bahasa Inggris", category: "Umum" },
+  { id: "pjok_m", name: "Pendidikan Jasmani, Olahraga dan Kesehatan", category: "Umum" },
+  { id: "seni_m", name: "Seni dan Prakarya", category: "Umum" },
+  { id: "sejind_m", name: "Sejarah", category: "Umum" },
+  { id: "bio_m", name: "Biologi", category: "MIPA" },
+  { id: "fisika_m", name: "Fisika", category: "MIPA" },
+  { id: "kimia_m", name: "Kimia", category: "MIPA" },
+  { id: "mtk_lnj", name: "Matematika Lanjutan", category: "MIPA" },
+  { id: "eko_m", name: "Ekonomi", category: "IPS" },
+  { id: "geo_m", name: "Geografi", category: "IPS" },
+  { id: "sos_m", name: "Sosiologi", category: "IPS" },
+  { id: "sejdun_m", name: "Sejarah Dunia", category: "IPS" },
+  { id: "sastra_m", name: "Bahasa dan Sastra Indonesia", category: "Bahasa" },
+  { id: "sastraen_m", name: "Bahasa dan Sastra Inggris", category: "Bahasa" },
+  { id: "barabu_m", name: "Bahasa Arab", category: "Bahasa" },
+  { id: "info_m", name: "Informatika", category: "Informatika" },
+  { id: "projek_m", name: "Projek Penguatan Profil Pelajar Pancasila (P5)", category: "Projek" },
+];
+
 const KELAS_OPTIONS = ["X-MIPA 1","X-MIPA 2","X-MIPA 3","X-IPS 1","X-IPS 2","X-IPS 3","XI-MIPA 1","XI-MIPA 2","XI-MIPA 3","XI-IPS 1","XI-IPS 2","XI-IPS 3","XII-MIPA 1","XII-MIPA 2","XII-MIPA 3","XII-IPS 1","XII-IPS 2","XII-IPS 3"];
 const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
@@ -101,12 +128,33 @@ const DEFAULT_DATA = {
 };
 
 // ============= MAIN APP =============
+// ============= THEME CONTEXT =============
+const ThemeCtx = createContext("dark");
+const useTheme = () => useContext(ThemeCtx);
+
 export default function ExamApp() {
   const [data, setData] = useState(null);
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState("login");
   const [toast, setToast] = useState(null);
+  const [theme, setTheme] = useState(() => ls.get(THEME_KEY) || "dark");
+  const toggleTheme = useCallback(() => {
+    setTheme(t => { const next = t === "dark" ? "light" : "dark"; ls.set(THEME_KEY, next); return next; });
+  }, []);
+  const isDark = theme === "dark";
+  const T = {
+    bg: isDark ? "linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%)" : "linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 50%, #f0f9ff 100%)",
+    card: isDark ? "rgba(30,41,59,0.9)" : "rgba(255,255,255,0.95)",
+    cardBorder: isDark ? "rgba(59,130,246,0.15)" : "rgba(59,130,246,0.2)",
+    text: isDark ? "#ffffff" : "#0f172a",
+    textMuted: isDark ? "#94a3b8" : "#475569",
+    sidebar: isDark ? "linear-gradient(180deg, #1e293b 0%, #0f172a 100%)" : "linear-gradient(180deg, #1e3a5f 0%, #1e2d5a 100%)",
+    input: isDark ? "rgba(15,23,42,0.8)" : "rgba(241,245,249,0.9)",
+    inputBorder: isDark ? "rgba(59,130,246,0.25)" : "rgba(59,130,246,0.35)",
+    rowAlt: isDark ? "rgba(15,23,42,0.4)" : "rgba(241,245,249,0.6)",
+    itemHover: isDark ? "rgba(255,255,255,0.05)" : "rgba(59,130,246,0.05)",
+  };
   const lastSaveRef = useRef(0);
   const isWritingRef = useRef(false);
 
@@ -288,13 +336,15 @@ export default function ExamApp() {
   if (loading) return <LoadingScreen />;
 
   return (
-    <div className="min-h-screen" style={{ background: "linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%)" }}>
+    <ThemeCtx.Provider value={{ theme, toggleTheme, isDark, T }}>
+    <div className="min-h-screen" style={{ background: T.bg }}>
       {toast && <Toast msg={toast.msg} type={toast.type} />}
       {view === "login" && <LoginScreen onLogin={handleLogin} />}
       {view === "admin" && <AdminDashboard data={data} dataRef={dataRef} saveData={saveData} user={user} onLogout={handleLogout} showToast={showToast} />}
       {view === "guru" && <TeacherDashboard data={data} dataRef={dataRef} saveData={saveData} user={user} onLogout={handleLogout} showToast={showToast} updateUserSession={updateUserSession} />}
       {view === "siswa" && <StudentDashboard data={data} dataRef={dataRef} saveData={saveData} user={user} onLogout={handleLogout} showToast={showToast} updateUserSession={updateUserSession} />}
     </div>
+    </ThemeCtx.Provider>
   );
 }
 
@@ -324,6 +374,7 @@ function Toast({ msg, type }) {
 
 // ============= LOGIN SCREEN =============
 function LoginScreen({ onLogin }) {
+  const { isDark, toggleTheme } = useTheme();
   const [role, setRole] = useState("siswa");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -334,14 +385,14 @@ function LoginScreen({ onLogin }) {
     <div className="min-h-screen flex items-center justify-center p-4">
       <div className="w-full max-w-md">
         <div className="text-center mb-8">
-          <div className="w-20 h-20 mx-auto mb-4 rounded-2xl flex items-center justify-center" style={{ background: "linear-gradient(135deg, #3b82f6, #1d4ed8)" }}>
-            <GraduationCap size={40} color="white" />
-          </div>
-          <h1 className="text-2xl font-bold text-white mb-1">{SCHOOL_SHORT}</h1>
-          <p className="text-blue-300 text-sm">Sistem Ujian Sekolah Digital</p>
-          <p className="text-blue-400 text-xs mt-1">{SCHOOL_NAME}</p>
+          <img src={SCHOOL_LOGO} alt="Logo SMAN6" className="w-24 h-24 mx-auto mb-3 rounded-full object-cover shadow-2xl" style={{ border: "3px solid rgba(59,130,246,0.5)" }} />
+          <h1 className="text-2xl font-bold text-white mb-0.5">{SCHOOL_NAME}</h1>
+          <p className="text-blue-300 text-sm font-medium">Sistem Ujian Sekolah Digital</p>
+          <p className="text-blue-400 text-xs mt-1 leading-relaxed">{SCHOOL_ADDRESS}</p>
         </div>
         <div className="rounded-2xl p-6 shadow-2xl" style={{ background: "rgba(30,41,59,0.95)", backdropFilter: "blur(20px)", border: "1px solid rgba(59,130,246,0.2)" }}>
+          {/* Theme toggle */}
+          <div className="flex justify-end mb-2"><button onClick={toggleTheme} className="text-xs text-slate-400 hover:text-white flex items-center gap-1 px-2 py-1 rounded-lg hover:bg-white/10 transition">{isDark ? "☀️ Mode Terang" : "🌙 Mode Gelap"}</button></div>
           <div className="flex rounded-xl overflow-hidden mb-6" style={{ background: "rgba(15,23,42,0.8)" }}>
             {["siswa", "guru", "admin"].map(r => (
               <button key={r} onClick={() => { setRole(r); setUsername(""); setPassword(""); }} className="flex-1 py-2.5 text-sm font-semibold transition-all" style={{ background: role === r ? "#3b82f6" : "transparent", color: role === r ? "white" : "#94a3b8" }}>
@@ -378,19 +429,18 @@ function LoginScreen({ onLogin }) {
 
 // ============= SIDEBAR LAYOUT =============
 function DashboardLayout({ user, onLogout, tabs, activeTab, setActiveTab, children }) {
+  const { isDark, toggleTheme, T } = useTheme();
   const [sideOpen, setSideOpen] = useState(false);
   return (
     <div className="min-h-screen flex">
       {sideOpen && <div className="fixed inset-0 bg-black/60 z-40 lg:hidden" onClick={() => setSideOpen(false)} />}
-      <aside className={`fixed lg:static inset-y-0 left-0 z-50 w-64 flex flex-col transition-transform lg:translate-x-0 ${sideOpen ? "translate-x-0" : "-translate-x-full"}`} style={{ background: "linear-gradient(180deg, #1e293b 0%, #0f172a 100%)", borderRight: "1px solid rgba(59,130,246,0.15)" }}>
+      <aside className={`fixed lg:static inset-y-0 left-0 z-50 w-64 flex flex-col transition-transform lg:translate-x-0 ${sideOpen ? "translate-x-0" : "-translate-x-full"}`} style={{ background: T.sidebar, borderRight: "1px solid rgba(59,130,246,0.15)" }}>
         <div className="p-4 border-b" style={{ borderColor: "rgba(59,130,246,0.15)" }}>
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{ background: "linear-gradient(135deg, #3b82f6, #1d4ed8)" }}>
-              <GraduationCap size={22} color="white" />
-            </div>
-            <div>
-              <div className="text-white font-bold text-sm">{SCHOOL_SHORT}</div>
-              <div className="text-blue-400 text-xs">Ujian Digital</div>
+            <img src={SCHOOL_LOGO} alt="Logo" className="w-10 h-10 rounded-full object-cover shrink-0" />
+            <div className="overflow-hidden">
+              <div className="text-white font-bold text-sm truncate">{SCHOOL_SHORT}</div>
+              <div className="text-blue-400 text-xs truncate">Ujian Digital</div>
             </div>
           </div>
         </div>
@@ -414,12 +464,13 @@ function DashboardLayout({ user, onLogout, tabs, activeTab, setActiveTab, childr
             </button>
           ))}
         </nav>
-        <div className="p-3 mt-auto">
+        <div className="p-3 mt-auto space-y-1">
+          <button onClick={toggleTheme} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:text-white hover:bg-white/10 transition-all">{isDark ? "☀️" : "🌙"} {isDark ? "Mode Terang" : "Mode Gelap"}</button>
           <button onClick={onLogout} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-red-400 hover:bg-red-500/10 transition-all"><LogOut size={18} />Keluar</button>
         </div>
       </aside>
       <main className="flex-1 min-h-screen overflow-y-auto">
-        <header className="sticky top-0 z-30 px-4 py-3 flex items-center gap-3 lg:hidden" style={{ background: "rgba(15,23,42,0.95)", backdropFilter: "blur(12px)", borderBottom: "1px solid rgba(59,130,246,0.15)" }}>
+        <header className="sticky top-0 z-30 px-4 py-3 flex items-center gap-3 lg:hidden" style={{ background: isDark ? "rgba(15,23,42,0.95)" : "rgba(30,58,95,0.95)", backdropFilter: "blur(12px)", borderBottom: "1px solid rgba(59,130,246,0.15)" }}>
           <button onClick={() => setSideOpen(true)} className="text-white"><Menu size={24} /></button>
           <span className="text-white font-semibold">{tabs.find(t => t.id === activeTab)?.label}</span>
         </header>
@@ -430,26 +481,29 @@ function DashboardLayout({ user, onLogout, tabs, activeTab, setActiveTab, childr
 }
 
 // ============= REUSABLE COMPONENTS =============
-function Card({ children, className = "", ...props }) {
-  return <div className={`rounded-2xl p-5 ${className}`} style={{ background: "rgba(30,41,59,0.9)", border: "1px solid rgba(59,130,246,0.15)", ...props.style }}>{children}</div>;
+function Card({ children, className = "", style: extraStyle, ...props }) {
+  const { T } = useTheme();
+  return <div className={`rounded-2xl p-5 ${className}`} style={{ background: T.card, border: `1px solid ${T.cardBorder}`, ...extraStyle }} {...props}>{children}</div>;
 }
 function Btn({ children, variant = "primary", className = "", ...props }) {
   const styles = { primary: "linear-gradient(135deg, #3b82f6, #1d4ed8)", danger: "linear-gradient(135deg, #dc2626, #991b1b)", success: "linear-gradient(135deg, #16a34a, #15803d)", secondary: "rgba(51,65,85,0.8)", warning: "linear-gradient(135deg, #d97706, #b45309)" };
   return <button className={`px-4 py-2 rounded-xl text-white font-semibold text-sm transition-all hover:opacity-90 flex items-center gap-2 disabled:opacity-50 ${className}`} style={{ background: styles[variant] || styles.primary }} {...props}>{children}</button>;
 }
 function Input({ label, ...props }) {
+  const { T, isDark } = useTheme();
   return (
     <div>
-      {label && <label className="text-blue-300 text-sm font-medium mb-1 block">{label}</label>}
-      <input className="w-full py-2.5 px-3 rounded-xl bg-transparent text-white outline-none placeholder-slate-500 text-sm" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} {...props} />
+      {label && <label className="text-blue-400 text-sm font-medium mb-1 block">{label}</label>}
+      <input className="w-full py-2.5 px-3 rounded-xl outline-none text-sm" style={{ background: T.input, border: `1px solid ${T.inputBorder}`, color: T.text }} {...props} />
     </div>
   );
 }
 function Select({ label, children, ...props }) {
+  const { T } = useTheme();
   return (
     <div>
-      {label && <label className="text-blue-300 text-sm font-medium mb-1 block">{label}</label>}
-      <select className="w-full py-2.5 px-3 rounded-xl text-white outline-none text-sm" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} {...props}>{children}</select>
+      {label && <label className="text-blue-400 text-sm font-medium mb-1 block">{label}</label>}
+      <select className="w-full py-2.5 px-3 rounded-xl outline-none text-sm" style={{ background: T.input, border: `1px solid ${T.inputBorder}`, color: T.text }} {...props}>{children}</select>
     </div>
   );
 }
@@ -529,7 +583,7 @@ function AdminDashboard({ data, dataRef, saveData, user, onLogout, showToast }) 
       {tab === "exams" && <ExamManager data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} isAdmin />}
       {tab === "monitor" && <MonitorView data={data} />}
       {tab === "results" && <ResultsView data={data} />}
-      {tab === "settings" && <SettingsView data={data} saveData={saveData} showToast={showToast} />}
+      {tab === "settings" && <SettingsView data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} />}
     </DashboardLayout>
   );
 }
@@ -577,11 +631,11 @@ function AdminHome({ data }) {
 function TeacherManager({ data, dataRef, saveData, showToast }) {
   const [showModal, setShowModal] = useState(false);
   const [editId, setEditId] = useState(null);
-  const [form, setForm] = useState({ name: "", nip: "", subjects: [], photo: "" });
+  const [form, setForm] = useState({ name: "", nip: "", email: "", subjects: [], photo: "" });
   const [search, setSearch] = useState("");
 
-  const openAdd = () => { setEditId(null); setForm({ name: "", nip: "", subjects: [], photo: "" }); setShowModal(true); };
-  const openEdit = (t) => { setEditId(t.id); setForm({ name: t.name, nip: t.nip, subjects: t.subjects || [], photo: t.photo || "" }); setShowModal(true); };
+  const openAdd = () => { setEditId(null); setForm({ name: "", nip: "", email: "", subjects: [], photo: "" }); setShowModal(true); };
+  const openEdit = (t) => { setEditId(t.id); setForm({ name: t.name, nip: t.nip, email: t.email || "", subjects: t.subjects || [], photo: t.photo || "" }); setShowModal(true); };
 
   const handleSave = () => {
     if (!form.name.trim() || !form.nip.trim()) return showToast("Nama dan NIP wajib diisi", "error");
@@ -627,7 +681,7 @@ function TeacherManager({ data, dataRef, saveData, showToast }) {
                   {t.photo ? <img src={t.photo} alt="" className="w-10 h-10 rounded-full object-cover" /> : <div className="w-10 h-10 rounded-full flex items-center justify-center text-white font-bold" style={{ background: "linear-gradient(135deg, #3b82f6, #6366f1)" }}>{t.name[0]}</div>}
                   <div>
                     <div className="text-white font-medium text-sm">{t.name}</div>
-                    <div className="text-slate-400 text-xs">NIP: {t.nip} • {(t.subjects || []).length} mapel{t.password ? " • 🔑 Password custom" : ""}</div>
+                    <div className="text-slate-400 text-xs">NIP: {t.nip}{t.email ? ` • ${t.email}` : ""} • {(t.subjects || []).length} mapel{t.password ? " • 🔑 Password custom" : ""}</div>
                   </div>
                 </div>
                 <div className="flex gap-2">
@@ -647,6 +701,7 @@ function TeacherManager({ data, dataRef, saveData, showToast }) {
             </div>
             <Input label="Nama Lengkap" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="Masukkan nama guru" />
             <Input label="NIP" value={form.nip} onChange={e => setForm({ ...form, nip: e.target.value })} placeholder="Masukkan NIP" />
+            <Input label="Email (Opsional)" type="email" value={form.email || ""} onChange={e => setForm({ ...form, email: e.target.value })} placeholder="contoh@guru.sch.id" />
             <div>
               <label className="text-blue-300 text-sm font-medium mb-2 block">Mata Pelajaran yang Diampu</label>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-1 max-h-48 overflow-y-auto pr-1">
@@ -800,8 +855,17 @@ function SubjectManager({ data, saveData, showToast }) {
   return (
     <div>
       <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
-        <h2 className="text-white text-2xl font-bold">Mata Pelajaran K-13</h2>
-        <Btn onClick={() => setShowModal(true)}><Plus size={16} />Tambah Mapel</Btn>
+        <h2 className="text-white text-2xl font-bold">Mata Pelajaran</h2>
+        <div className="flex gap-2">
+          <Btn variant="secondary" onClick={() => {
+            const merdeka = MAPEL_MERDEKA.filter(m => !(data.subjects || []).find(s => s.id === m.id));
+            if (!merdeka.length) return showToast("Semua mapel Merdeka sudah ada", "warning");
+            if (!confirm(\`Tambahkan \${merdeka.length} mata pelajaran Kurikulum Merdeka?\`)) return;
+            saveData({ ...data, subjects: [...(data.subjects || []), ...merdeka] });
+            showToast(\`\${merdeka.length} mapel Kurikulum Merdeka ditambahkan\`);
+          }}><BookOpen size={16} />+ Kurikulum Merdeka</Btn>
+          <Btn onClick={() => setShowModal(true)}><Plus size={16} />Tambah Mapel</Btn>
+        </div>
       </div>
       {Object.entries(grouped).map(([cat, subjects]) => (
         <Card key={cat} className="mb-4">
@@ -1353,7 +1417,7 @@ function MonitorView({ data }) {
   const [, forceUpdate] = useState(0);
   useEffect(() => { const iv = setInterval(() => forceUpdate(n => n + 1), 2000); return () => clearInterval(iv); }, []);
 
-  const activeExams = data.exams.filter(e => e.status === "active");
+  const activeExams = useMemo(() => data.exams.filter(e => e.status === "active"), [data.exams]);
 
   if (selectedExam) {
     const exam = data.exams.find(e => e.id === selectedExam);
@@ -1529,7 +1593,7 @@ function ResultsView({ data }) {
               <td>${student?.kelas || "-"}</td>
               <td>${r.correct}/${totalQ}</td>
               <td><strong>${r.score.toFixed(1)}</strong></td>
-              <td class="${r.score >= 75 ? 'pass' : 'fail'}">${r.score >= 75 ? "LULUS" : "TIDAK LULUS"}</td>
+              <td>${r.score === null ? 'Perlu Dinilai' : r.score.toFixed(1)}</td>
             </tr>`;
           }).join("")}
         </tbody>
@@ -1538,8 +1602,8 @@ function ResultsView({ data }) {
         <strong>Rata-rata: ${avg}</strong> &nbsp;|&nbsp;
         Tertinggi: ${results.length > 0 ? Math.max(...results.map(r => r.score)).toFixed(1) : "-"} &nbsp;|&nbsp;
         Terendah: ${results.length > 0 ? Math.min(...results.map(r => r.score)).toFixed(1) : "-"} &nbsp;|&nbsp;
-        Lulus: ${results.filter(r => r.score >= 75).length} siswa &nbsp;|&nbsp;
-        Tidak Lulus: ${results.filter(r => r.score < 75).length} siswa
+        ≥75: ${results.filter(r => r.score !== null && r.score >= 75).length} siswa &nbsp;|&nbsp;
+        &lt;75: ${results.filter(r => r.score !== null && r.score < 75).length} siswa
       </div>
       </body></html>`;
 
@@ -1567,8 +1631,8 @@ function ResultsView({ data }) {
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
             <StatCard icon={<Users size={20} className="text-blue-400" />} label="Peserta" value={results.length} />
             <StatCard icon={<Award size={20} className="text-green-400" />} label="Rata-rata" value={avg} color="#16a34a" />
-            <StatCard icon={<CheckCircle size={20} className="text-amber-400" />} label="Lulus (≥75)" value={results.filter(r => r.score >= 75).length} color="#d97706" />
-            <StatCard icon={<XCircle size={20} className="text-red-400" />} label="Tidak Lulus" value={results.filter(r => r.score < 75).length} color="#dc2626" />
+            <StatCard icon={<CheckCircle size={20} className="text-amber-400" />} label="Di Atas 75" value={results.filter(r => r.score !== null && r.score >= 75).length} color="#d97706" />
+            <StatCard icon={<XCircle size={20} className="text-red-400" />} label="Di Bawah 75" value={results.filter(r => r.score !== null && r.score < 75).length} color="#dc2626" />
           </div>
         )}
         <Card>
@@ -1643,8 +1707,8 @@ function ResultsView({ data }) {
       ${results.sort((a, b) => (b.score || 0) - (a.score || 0)).map((r, i) => {
         const st = data.students.find(s => s.id === r.studentId);
         const scoreDisplay = r.score === null ? "Belum dinilai" : r.score.toFixed(1);
-        const ket = r.score === null ? "MENUNGGU" : r.score >= 75 ? "LULUS" : "TIDAK LULUS";
-        const cls = r.score === null ? "" : r.score >= 75 ? "pass" : "fail";
+        const ket = r.score === null ? "Perlu Dinilai" : `${r.score.toFixed(1)}`;
+        const cls = "";
         return `<tr><td>${i+1}</td><td>${st?.name||"?"}</td><td>${st?.kelas||"-"}</td><td>${r.correct||0}/${totalQ}</td><td><strong>${scoreDisplay}</strong></td><td class="${cls}">${ket}</td></tr>`;
       }).join("")}
       </tbody></table>`;
@@ -1677,7 +1741,7 @@ function ResultsView({ data }) {
                     <div className="flex gap-4 mt-1">
                       <span className="text-blue-400 text-xs">{results.length} peserta</span>
                       <span className="text-white text-xs">Rata-rata: <strong>{avg}</strong></span>
-                      {results.length > 0 && <span className="text-green-400 text-xs">Lulus: {passCount}/{results.length}</span>}
+                      {results.length > 0 && <span className="text-blue-400 text-xs">≥75: {passCount}/{results.length}</span>}
                     </div>
                   </div>
                   <ChevronRight size={20} className="text-slate-400" />
@@ -1692,13 +1756,15 @@ function ResultsView({ data }) {
 }
 
 // ============= SETTINGS (ADMIN) =============
-function SettingsView({ data, saveData, showToast }) {
+function SettingsView({ data, dataRef, saveData, showToast }) {
   const [pw, setPw] = useState({ old: "", new1: "", new2: "" });
   const handleChangePw = () => {
-    if (pw.old !== data.admin.password) return showToast("Password lama salah", "error");
+    const latest = dataRef?.current || data;
+    if (pw.old !== latest.admin.password) return showToast("Password lama salah", "error");
     if (pw.new1.length < 4) return showToast("Password baru minimal 4 karakter", "error");
     if (pw.new1 !== pw.new2) return showToast("Konfirmasi password tidak cocok", "error");
-    saveData({ ...data, admin: { ...data.admin, password: pw.new1 } });
+    // Only update admin field — preserve ALL other data
+    saveData({ ...latest, admin: { ...latest.admin, password: pw.new1 } });
     setPw({ old: "", new1: "", new2: "" });
     showToast("Password admin berhasil diubah");
   };
@@ -1719,7 +1785,7 @@ function SettingsView({ data, saveData, showToast }) {
         <h3 className="text-white font-bold mb-2">Informasi Sistem</h3>
         <div className="text-slate-300 text-sm space-y-1">
           <p>Sekolah: {SCHOOL_NAME}</p>
-          <p>Kurikulum: K-13</p>
+          <p>Kurikulum: K-13 & Merdeka Belajar</p>
           <p>Total Guru: {data.teachers.length} | Total Siswa: {data.students.length}</p>
           <p>Total Soal: {data.questions.length} | Total Ujian: {data.exams.length}</p>
         </div>
@@ -1934,7 +2000,7 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
                         <span className="px-3 py-1 rounded-full text-lg font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
                           {r.score.toFixed(1)}
                         </span>
-                        <div className="text-xs mt-1" style={{ color: r.score >= 75 ? "#4ade80" : "#f87171" }}>{r.score >= 75 ? "LULUS" : "TIDAK LULUS"}</div>
+
                       </div>
                     </div>
                   </Card>
@@ -2185,7 +2251,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
             <div className="space-y-3 mb-6">
               <div className="text-6xl font-bold" style={{ color: result.score >= 75 ? "#4ade80" : result.score >= 50 ? "#fbbf24" : "#f87171" }}>{result.score.toFixed(1)}</div>
               <div className="text-slate-300">Benar: {result.correct} dari {questions.length} soal</div>
-              <div className="text-lg font-semibold" style={{ color: result.score >= 75 ? "#4ade80" : "#f87171" }}>{result.score >= 75 ? "✓ LULUS" : "✗ TIDAK LULUS"}</div>
+
               {violations > 0 && <div className="text-red-400 text-sm flex items-center justify-center gap-1"><AlertTriangle size={14} />Pelanggaran: {violations}x</div>}
             </div>
           ) : (

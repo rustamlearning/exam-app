@@ -860,9 +860,9 @@ function SubjectManager({ data, saveData, showToast }) {
           <Btn variant="secondary" onClick={() => {
             const merdeka = MAPEL_MERDEKA.filter(m => !(data.subjects || []).find(s => s.id === m.id));
             if (!merdeka.length) return showToast("Semua mapel Merdeka sudah ada", "warning");
-            if (!confirm(\`Tambahkan \${merdeka.length} mata pelajaran Kurikulum Merdeka?\`)) return;
+            if (!confirm("Tambahkan " + merdeka.length + " mata pelajaran Kurikulum Merdeka?")) return;
             saveData({ ...data, subjects: [...(data.subjects || []), ...merdeka] });
-            showToast(\`\${merdeka.length} mapel Kurikulum Merdeka ditambahkan\`);
+            showToast(merdeka.length + " mapel Kurikulum Merdeka ditambahkan");
           }}><BookOpen size={16} />+ Kurikulum Merdeka</Btn>
           <Btn onClick={() => setShowModal(true)}><Plus size={16} />Tambah Mapel</Btn>
         </div>

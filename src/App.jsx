@@ -1143,23 +1143,29 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
 
     try {
       const prompt = buildPrompt();
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
-          }),
-        }
-      );
-      clearInterval(interval);
-      if (!res.ok) {
+      const models = ["gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-2.0-flash"];
+      let res, json, lastErr;
+      for (const model of models) {
+        setLoadingMsg("Mencoba model " + model + "...");
+        res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
+            }),
+          }
+        );
+        if (res.ok) { json = await res.json(); break; }
         const err = await res.json();
-        throw new Error(err?.error?.message || "Gagal menghubungi Gemini API");
+        lastErr = err?.error?.message || "Gagal";
+        if (!lastErr.includes("quota") && !lastErr.includes("RESOURCE_EXHAUSTED")) throw new Error(lastErr);
       }
-      const json = await res.json();
+      clearInterval(interval);
+      if (!json) throw new Error("Semua model Gemini sedang over quota. Coba lagi dalam beberapa menit.");
+
       const raw = json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
       const cleaned = raw.replace(/```json|```/g, "").trim();
       const start = cleaned.indexOf("[");

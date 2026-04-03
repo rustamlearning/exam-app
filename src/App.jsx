@@ -271,7 +271,8 @@ export default function ExamApp() {
     let nextView = "login";
 
     if (role === "admin") {
-      if (username === data.admin.username && password === data.admin.password) {
+      const adminCred = data.meta?.admin || { username: "admin", password: "admin123" };
+      if (username === adminCred.username && password === adminCred.password) {
         loggedUser = { role: "admin", name: "Administrator" };
         nextView = "admin";
         showToast("Login berhasil sebagai Admin");

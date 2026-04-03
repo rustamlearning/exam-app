@@ -1068,10 +1068,272 @@ function SubjectManager({ data, saveData, showToast }) {
   );
 }
 
+// ============= AI GENERATE MODAL =============
+function AIGenerateModal({ data, dataRef, saveData, showToast, userId, onClose }) {
+  const [step, setStep] = useState("form"); // form | loading | preview
+  const [aiForm, setAiForm] = useState({
+    subjectId: (data.subjects || [])[0]?.id || "",
+    topic: "",
+    type: "pilgan",
+    count: 5,
+    difficulty: "sedang",
+    extra: "",
+  });
+  const [generated, setGenerated] = useState([]);
+  const [selected, setSelected] = useState([]);
+  const [loadingMsg, setLoadingMsg] = useState("");
+
+  const geminiKey = data.meta?.geminiKey || "";
+
+  const getSubjectName = (id) => (data.subjects || []).find(s => s.id === id)?.name || "-";
+
+  const buildPrompt = () => {
+    const subjectName = getSubjectName(aiForm.subjectId);
+    const typeLabel = aiForm.type === "pilgan" ? "pilihan ganda (5 opsi A-E)" : aiForm.type === "benar_salah" ? "benar/salah" : "uraian singkat";
+    const diffLabel = { mudah: "mudah (tingkat SMA kelas X)", sedang: "sedang (tingkat SMA kelas XI)", sulit: "sulit (tingkat SMA kelas XII / HOTS)" }[aiForm.difficulty];
+    return `Kamu adalah guru SMA yang berpengalaman. Buat ${aiForm.count} soal ${typeLabel} mata pelajaran ${subjectName} materi "${aiForm.topic}" tingkat kesulitan ${diffLabel}.${aiForm.extra ? " Catatan tambahan: " + aiForm.extra : ""}
+
+WAJIB kembalikan HANYA array JSON valid, tanpa teks lain, tanpa markdown, tanpa komentar.
+
+Format JSON:
+${aiForm.type === "pilgan" ? `[
+  {
+    "text": "Pertanyaan soal di sini?",
+    "type": "pilgan",
+    "options": ["Opsi A", "Opsi B", "Opsi C", "Opsi D", "Opsi E"],
+    "correctAnswer": 0,
+    "explanation": "Pembahasan lengkap mengapa jawaban A benar."
+  }
+]` : aiForm.type === "benar_salah" ? `[
+  {
+    "text": "Pernyataan yang harus dinilai benar atau salah.",
+    "type": "benar_salah",
+    "options": ["Benar", "Salah"],
+    "correctAnswer": 0,
+    "explanation": "Pembahasan mengapa pernyataan ini Benar."
+  }
+]` : `[
+  {
+    "text": "Pertanyaan uraian di sini?",
+    "type": "uraian",
+    "options": [],
+    "correctAnswer": 0,
+    "explanation": "Kunci jawaban dan pembahasan lengkap."
+  }
+]`}
+
+Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan sesuai kurikulum K-13/Merdeka.`;
+  };
+
+  const handleGenerate = async () => {
+    if (!geminiKey) return showToast("API Key Gemini belum diatur. Minta admin untuk mengaturnya di menu Pengaturan.", "error");
+    if (!aiForm.topic.trim()) return showToast("Isi topik/materi terlebih dahulu", "error");
+    if (!aiForm.subjectId) return showToast("Pilih mata pelajaran", "error");
+
+    setStep("loading");
+    const msgs = [
+      "Menghubungi Gemini AI...",
+      "Menganalisis materi " + aiForm.topic + "...",
+      "Menyusun soal dan kunci jawaban...",
+      "Memvalidasi pembahasan...",
+    ];
+    let mi = 0;
+    setLoadingMsg(msgs[0]);
+    const interval = setInterval(() => { mi = (mi + 1) % msgs.length; setLoadingMsg(msgs[mi]); }, 2000);
+
+    try {
+      const prompt = buildPrompt();
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
+          }),
+        }
+      );
+      clearInterval(interval);
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err?.error?.message || "Gagal menghubungi Gemini API");
+      }
+      const json = await res.json();
+      const raw = json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      const cleaned = raw.replace(/```json|```/g, "").trim();
+      const start = cleaned.indexOf("[");
+      const end = cleaned.lastIndexOf("]");
+      if (start === -1 || end === -1) throw new Error("Format respons AI tidak valid");
+      const parsed = JSON.parse(cleaned.slice(start, end + 1));
+      if (!Array.isArray(parsed) || parsed.length === 0) throw new Error("Tidak ada soal yang dihasilkan");
+      const withMeta = parsed.map((q, i) => ({
+        ...q,
+        subjectId: aiForm.subjectId,
+        type: q.type || aiForm.type,
+        options: q.options || [],
+        correctAnswer: typeof q.correctAnswer === "number" ? q.correctAnswer : 0,
+        explanation: q.explanation || "",
+        _tempId: "ai_" + Date.now() + "_" + i,
+      }));
+      setGenerated(withMeta);
+      setSelected(withMeta.map(q => q._tempId));
+      setStep("preview");
+    } catch (e) {
+      clearInterval(interval);
+      showToast("Gagal: " + e.message, "error");
+      setStep("form");
+    }
+  };
+
+  const handleSave = () => {
+    const toSave = generated.filter(q => selected.includes(q._tempId));
+    if (!toSave.length) return showToast("Pilih minimal 1 soal", "error");
+    const latest = dataRef?.current || data;
+    const clean = toSave.map(({ _tempId, ...q }) => ({ id: "q" + Date.now() + Math.random().toString(36).slice(2, 6), ...q, createdBy: userId || "admin" }));
+    saveData({ ...latest, questions: [...(latest.questions || []), ...clean] }, ["questions"]);
+    showToast(`${clean.length} soal berhasil ditambahkan ke bank soal! 🎉`);
+    onClose();
+  };
+
+  const typeColors = { pilgan: { bg: "rgba(59,130,246,0.2)", color: "#60a5fa" }, benar_salah: { bg: "rgba(234,179,8,0.2)", color: "#fbbf24" }, uraian: { bg: "rgba(20,184,166,0.2)", color: "#2dd4bf" }, esai: { bg: "rgba(168,85,247,0.2)", color: "#c084fc" } };
+
+  return (
+    <Modal title="✨ Generate Soal dengan AI" onClose={onClose} wide>
+      {!geminiKey && (
+        <div className="mb-4 p-3 rounded-xl flex items-start gap-2" style={{ background: "rgba(234,179,8,0.1)", border: "1px solid rgba(234,179,8,0.3)" }}>
+          <AlertTriangle size={16} className="text-amber-400 mt-0.5 shrink-0" />
+          <p className="text-amber-300 text-sm">API Key Gemini belum diatur. Admin perlu menambahkan Gemini API Key di menu <strong>Pengaturan → Integrasi AI</strong>. Key gratis tersedia di <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" className="underline">aistudio.google.com</a></p>
+        </div>
+      )}
+
+      {step === "form" && (
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Mata Pelajaran</label>
+              <select value={aiForm.subjectId} onChange={e => setAiForm({ ...aiForm, subjectId: e.target.value })} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }}>
+                {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Tipe Soal</label>
+              <select value={aiForm.type} onChange={e => setAiForm({ ...aiForm, type: e.target.value })} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }}>
+                <option value="pilgan">Pilihan Ganda</option>
+                <option value="benar_salah">Benar / Salah</option>
+                <option value="uraian">Uraian</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Jumlah Soal</label>
+              <select value={aiForm.count} onChange={e => setAiForm({ ...aiForm, count: Number(e.target.value) })} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }}>
+                {[3,5,10,15,20].map(n => <option key={n} value={n}>{n} soal</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Tingkat Kesulitan</label>
+              <select value={aiForm.difficulty} onChange={e => setAiForm({ ...aiForm, difficulty: e.target.value })} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }}>
+                <option value="mudah">Mudah (C1-C2)</option>
+                <option value="sedang">Sedang (C3-C4)</option>
+                <option value="sulit">Sulit / HOTS (C5-C6)</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Topik / Materi <span className="text-red-400">*</span></label>
+            <input value={aiForm.topic} onChange={e => setAiForm({ ...aiForm, topic: e.target.value })} placeholder="Contoh: Sel dan Organel, Hukum Newton, Teks Narasi..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+          </div>
+          <div>
+            <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Instruksi Tambahan (opsional)</label>
+            <textarea value={aiForm.extra} onChange={e => setAiForm({ ...aiForm, extra: e.target.value })} rows={2} placeholder="Contoh: Fokus pada aspek aplikasi, sertakan konteks Indonesia, hindari soal menghafal..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+          </div>
+          <div className="flex justify-end gap-2">
+            <Btn variant="secondary" onClick={onClose}>Batal</Btn>
+            <Btn onClick={handleGenerate} disabled={!geminiKey}>
+              <span>✨</span> Generate {aiForm.count} Soal
+            </Btn>
+          </div>
+        </div>
+      )}
+
+      {step === "loading" && (
+        <div className="flex flex-col items-center justify-center py-12 gap-4">
+          <div className="w-12 h-12 rounded-full border-4 border-blue-500 border-t-transparent animate-spin" />
+          <p className="text-blue-300 text-sm font-medium">{loadingMsg}</p>
+          <p className="text-slate-500 text-xs">Gemini AI sedang menyusun soal berkualitas...</p>
+        </div>
+      )}
+
+      {step === "preview" && (
+        <div>
+          <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+            <p className="text-sm" style={{ color: "inherit", opacity: 0.8 }}><span className="text-green-400 font-bold">{generated.length} soal</span> berhasil digenerate. Pilih yang ingin disimpan:</p>
+            <div className="flex gap-2">
+              <button onClick={() => setSelected(generated.map(q => q._tempId))} className="text-xs text-blue-400 underline">Pilih Semua</button>
+              <button onClick={() => setSelected([])} className="text-xs text-slate-400 underline">Batal Semua</button>
+            </div>
+          </div>
+          <div className="space-y-3 max-h-[50vh] overflow-y-auto pr-1 mb-4">
+            {generated.map((q, i) => {
+              const isSelected = selected.includes(q._tempId);
+              const tc = typeColors[q.type] || typeColors.pilgan;
+              return (
+                <div key={q._tempId} onClick={() => setSelected(s => s.includes(q._tempId) ? s.filter(x => x !== q._tempId) : [...s, q._tempId])} className="p-3 rounded-xl cursor-pointer transition" style={{ background: isSelected ? "rgba(22,163,74,0.1)" : "rgba(15,23,42,0.5)", border: `1px solid ${isSelected ? "rgba(22,163,74,0.4)" : "rgba(59,130,246,0.15)"}` }}>
+                  <div className="flex items-start gap-2">
+                    <div className="w-5 h-5 rounded shrink-0 mt-0.5 flex items-center justify-center" style={{ background: isSelected ? "#16a34a" : "rgba(51,65,85,0.6)" }}>
+                      {isSelected && <CheckCircle size={14} className="text-white" />}
+                    </div>
+                    <div className="flex-1">
+                      <div className="flex gap-2 mb-1 flex-wrap">
+                        <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: tc.bg, color: tc.color }}>{q.type === "pilgan" ? "Pilihan Ganda" : q.type === "benar_salah" ? "Benar/Salah" : "Uraian"}</span>
+                        <span className="text-xs text-slate-400">Soal {i + 1}</span>
+                      </div>
+                      <p className="text-sm mb-2" style={{ color: "inherit" }}>{q.text}</p>
+                      {q.type === "pilgan" && q.options?.length > 0 && (
+                        <div className="space-y-0.5 mb-2">
+                          {q.options.map((opt, oi) => (
+                            <div key={oi} className="flex items-center gap-1.5 text-xs" style={{ color: oi === q.correctAnswer ? "#4ade80" : "#94a3b8" }}>
+                              <span className="font-bold">{String.fromCharCode(65 + oi)}.</span>
+                              <span>{opt}</span>
+                              {oi === q.correctAnswer && <CheckCircle size={10} />}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {q.type === "benar_salah" && (
+                        <p className="text-xs text-green-400 mb-1">✓ Jawaban: {q.options?.[q.correctAnswer] || "Benar"}</p>
+                      )}
+                      {q.explanation && (
+                        <div className="p-2 rounded-lg mt-1" style={{ background: "rgba(59,130,246,0.08)" }}>
+                          <p className="text-xs" style={{ color: "inherit", opacity: 0.75 }}><span className="text-blue-400 font-semibold">Pembahasan:</span> {q.explanation}</p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="flex justify-between items-center gap-2 flex-wrap">
+            <button onClick={() => { setStep("form"); setGenerated([]); setSelected([]); }} className="text-sm text-slate-400 underline">← Generate Ulang</button>
+            <div className="flex gap-2">
+              <Btn variant="secondary" onClick={onClose}>Batal</Btn>
+              <Btn onClick={handleSave} disabled={selected.length === 0}>
+                <Save size={14} /> Simpan {selected.length} Soal
+              </Btn>
+            </div>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
 // ============= QUESTION MANAGER =============
 function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
   const [showModal, setShowModal] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  const [showAI, setShowAI] = useState(false);
   const [editId, setEditId] = useState(null);
   const [filterSubject, setFilterSubject] = useState("all");
   const [form, setForm] = useState({ subjectId: "", type: "pilgan", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "", rubrik: "" });
@@ -1148,6 +1410,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
         <div className="flex gap-2 flex-wrap">
           {userId && <button onClick={() => setShowMineOnly(v => !v)} className="px-3 py-2 rounded-xl text-xs font-medium transition" style={{ background: showMineOnly ? "rgba(59,130,246,0.25)" : "rgba(51,65,85,0.5)", color: showMineOnly ? "#60a5fa" : "#94a3b8", border: "1px solid rgba(59,130,246,0.2)" }}>{showMineOnly ? "✓ Soal Saya" : "Semua Soal"}</button>}
           <Btn variant="secondary" onClick={() => setShowImport(true)}><Upload size={16} />Import</Btn>
+          <button onClick={() => setShowAI(true)} className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-semibold transition" style={{ background: "linear-gradient(135deg, rgba(168,85,247,0.3), rgba(59,130,246,0.3))", color: "#c084fc", border: "1px solid rgba(168,85,247,0.4)" }}>✨ Generate AI</button>
           <Btn onClick={openAdd}><Plus size={16} />Tambah Soal</Btn>
         </div>
       </div>
@@ -1195,6 +1458,8 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
       </Card>
 
       {showImport && <ImportSoalModal data={data} onImport={handleBulkImport} onClose={() => setShowImport(false)} showToast={showToast} />}
+
+      {showAI && <AIGenerateModal data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} userId={userId} onClose={() => setShowAI(false)} />}
 
       {showModal && (
         <Modal title={editId ? "Edit Soal" : "Tambah Soal"} onClose={() => setShowModal(false)} wide>
@@ -1982,6 +2247,32 @@ function ResultsView({ data }) {
   );
 }
 
+// ============= GEMINI KEY SETTING =============
+function GeminiKeySetting({ data, dataRef, saveData, showToast }) {
+  const [key, setKey] = useState(data.meta?.geminiKey || "");
+  const [show, setShow] = useState(false);
+  const handleSave = () => {
+    const latest = dataRef?.current || data;
+    const newMeta = { ...(latest.meta || {}), geminiKey: key.trim() };
+    saveData({ ...latest, meta: newMeta }, ["meta"]);
+    showToast("API Key Gemini berhasil disimpan ✓");
+  };
+  return (
+    <div className="flex gap-2 items-end max-w-lg">
+      <div className="flex-1">
+        <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Gemini API Key</label>
+        <div className="relative">
+          <input type={show ? "text" : "password"} value={key} onChange={e => setKey(e.target.value)} placeholder="AIzaSy..." className="w-full py-2.5 px-3 pr-10 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+          <button onClick={() => setShow(v => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white">
+            <Eye size={15} />
+          </button>
+        </div>
+      </div>
+      <Btn onClick={handleSave}><Save size={14} />Simpan</Btn>
+    </div>
+  );
+}
+
 // ============= SETTINGS (ADMIN) =============
 function SettingsView({ data, dataRef, saveData, showToast }) {
   const [pw, setPw] = useState({ old: "", new1: "", new2: "" });
@@ -2010,7 +2301,11 @@ function SettingsView({ data, dataRef, saveData, showToast }) {
         </div>
       </Card>
       <Card className="mb-4">
-        <h3 className="font-bold mb-2" style={{ color: "inherit" }}>Informasi Sistem</h3>
+        <h3 className="font-bold mb-1" style={{ color: "inherit" }}>🤖 Integrasi AI (Gemini)</h3>
+        <p className="text-xs mb-3" style={{ color: "inherit", opacity: 0.6 }}>API Key Gemini gratis untuk fitur Generate Soal AI. Dapatkan key di <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" className="text-blue-400 underline">aistudio.google.com/apikey</a></p>
+        <GeminiKeySetting data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} />
+      </Card>
+      <Card className="mb-4">
         <div className="text-slate-300 text-sm space-y-1">
           <p>Sekolah: {SCHOOL_NAME}</p>
           <p>Kurikulum: K-13 & Merdeka Belajar</p>

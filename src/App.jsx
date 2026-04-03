@@ -1143,7 +1143,7 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
 
     try {
       const prompt = buildPrompt();
-      const models = ["gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-2.0-flash"];
+      const models = ["gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash-8b"];
       let res, json, lastErr;
       for (const model of models) {
         setLoadingMsg("Mencoba model " + model + "...");

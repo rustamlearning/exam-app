@@ -1429,8 +1429,19 @@ function MonitorView({ data }) {
     const exam = data.exams.find(e => e.id === selectedExam);
     if (!exam) return null;
     const sessions = (data.sessions || []).filter(s => s.examId === selectedExam);
+    const examResults = (data.results || []).filter(r => r.examId === selectedExam);
     const targetStudents = data.students.filter(s => exam.targetKelas?.includes(s.kelas));
     const totalQ = exam.questionIds.length;
+    const getStudentStatus = (st) => {
+      const session = sessions.find(s => s.studentId === st.id);
+      const result = examResults.find(r => r.studentId === st.id);
+      if (result) return { status: "submitted", session, result };
+      if (session) return { status: session.status, session, result: null };
+      return { status: "belum", session: null, result: null };
+    };
+    const countActive = targetStudents.filter(s => getStudentStatus(s).status === "active").length;
+    const countDone = targetStudents.filter(s => getStudentStatus(s).status === "submitted").length;
+    const countPending = targetStudents.filter(s => getStudentStatus(s).status === "belum").length;
 
     return (
       <div>
@@ -1442,25 +1453,27 @@ function MonitorView({ data }) {
         <p className="text-sm mb-4" style={{ color: "inherit", opacity: 0.7 }}>Update otomatis setiap 2 detik</p>
         <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 mb-4">
           <StatCard icon={<Users size={20} className="text-blue-400" />} label="Total Peserta" value={targetStudents.length} />
-          <StatCard icon={<Play size={20} className="text-green-400" />} label="Sedang Mengerjakan" value={sessions.filter(s => s.status === "active").length} color="#16a34a" />
-          <StatCard icon={<CheckCircle size={20} className="text-amber-400" />} label="Selesai" value={sessions.filter(s => s.status === "submitted").length} color="#d97706" />
-          <StatCard icon={<AlertTriangle size={20} className="text-red-400" />} label="Belum Mulai" value={Math.max(0, targetStudents.length - sessions.length)} color="#dc2626" />
+          <StatCard icon={<Play size={20} className="text-green-400" />} label="Mengerjakan" value={countActive} color="#16a34a" />
+          <StatCard icon={<CheckCircle size={20} className="text-amber-400" />} label="Selesai" value={countDone} color="#d97706" />
+          <StatCard icon={<AlertTriangle size={20} className="text-red-400" />} label="Belum Mulai" value={countPending} color="#dc2626" />
         </div>
         <Card>
           <h3 className="font-bold mb-3" style={{ color: "inherit" }}>Status Peserta Real-time</h3>
           <div className="space-y-2 max-h-[55vh] overflow-y-auto">
-            {targetStudents.sort((a, b) => {
-              const sa = sessions.find(s => s.studentId === a.id);
-              const sb = sessions.find(s => s.studentId === b.id);
-              const order = { active: 0, submitted: 1, undefined: 2 };
-              return (order[sa?.status] ?? 2) - (order[sb?.status] ?? 2);
+            {[...targetStudents].sort((a, b) => {
+              const order = { active: 0, submitted: 1, belum: 2 };
+              return (order[getStudentStatus(a).status] ?? 2) - (order[getStudentStatus(b).status] ?? 2);
             }).map(st => {
-              const session = sessions.find(s => s.studentId === st.id);
-              const answered = Object.keys(session?.answers || {}).length;
-              let statusText = "Belum mulai", statusColor = "#64748b", bgColor = "rgba(15,23,42,0.4)";
-              if (session?.status === "active") { statusText = `Mengerjakan (${answered}/${totalQ})`; statusColor = "#3b82f6"; bgColor = "rgba(59,130,246,0.05)"; }
-              else if (session?.status === "submitted") { statusText = "Selesai"; statusColor = "#16a34a"; bgColor = "rgba(22,163,74,0.05)"; }
-              const violations = session?.violations || 0;
+              const { status, session, result } = getStudentStatus(st);
+              const answered = result ? Object.keys(result.answers || {}).length : Object.keys(session?.answers || {}).length;
+              let statusText = "Belum mulai", statusColor = "#64748b", bgColor = "rgba(15,23,42,0.3)";
+              if (status === "active") { statusText = "Mengerjakan (" + answered + "/" + totalQ + ")"; statusColor = "#3b82f6"; bgColor = "rgba(59,130,246,0.07)"; }
+              else if (status === "submitted") {
+                const score = result?.score;
+                statusText = (score !== null && score !== undefined) ? "Selesai — Nilai: " + score.toFixed(1) : "Selesai";
+                statusColor = "#16a34a"; bgColor = "rgba(22,163,74,0.07)";
+              }
+              const violations = result?.violations || session?.violations || 0;
               const lastUpdate = session?.lastUpdate ? Math.round((Date.now() - session.lastUpdate) / 1000) : null;
               return (
                 <div key={st.id} className="flex items-center justify-between px-3 py-2.5 rounded-xl" style={{ background: bgColor }}>
@@ -1471,14 +1484,14 @@ function MonitorView({ data }) {
                       <div className="text-xs" style={{ color: "inherit", opacity: 0.65 }}>{st.kelas} • NISN: {st.nisn}</div>
                     </div>
                   </div>
-                  <div className="flex items-center gap-3 text-right">
+                  <div className="flex items-center gap-3 text-right flex-wrap justify-end">
                     <div>
                       <div className="text-xs font-medium" style={{ color: statusColor }}>{statusText}</div>
-                      {session?.status === "active" && lastUpdate !== null && (
-                        <div className="text-slate-500 text-xs">{lastUpdate}s lalu</div>
+                      {status === "active" && lastUpdate !== null && (
+                        <div className="text-xs" style={{ opacity: 0.5 }}>{lastUpdate < 60 ? lastUpdate + "s lalu" : Math.round(lastUpdate/60) + "m lalu"}</div>
                       )}
                     </div>
-                    {violations > 0 && <div className="flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-lg" style={{ background: "rgba(220,38,38,0.2)", color: "#f87171" }}><AlertTriangle size={12} />⚠️ {violations}x pelanggaran</div>}
+                    {violations > 0 && <div className="flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-lg" style={{ background: "rgba(220,38,38,0.2)", color: "#f87171" }}><AlertTriangle size={12} />⚠️ {violations}x</div>}
                   </div>
                 </div>
               );
@@ -1490,9 +1503,9 @@ function MonitorView({ data }) {
           <h3 className="font-bold mb-3" style={{ color: "inherit" }}>Progress Keseluruhan</h3>
           <div className="space-y-2">
             {[
-              { label: "Selesai", count: sessions.filter(s => s.status === "submitted").length, color: "#16a34a", bg: "#16a34a" },
-              { label: "Sedang mengerjakan", count: sessions.filter(s => s.status === "active").length, color: "#3b82f6", bg: "#3b82f6" },
-              { label: "Belum mulai", count: targetStudents.length - sessions.length, color: "#64748b", bg: "#64748b" },
+              { label: "Selesai", count: countDone, color: "#16a34a", bg: "#16a34a" },
+              { label: "Sedang mengerjakan", count: countActive, color: "#3b82f6", bg: "#3b82f6" },
+              { label: "Belum mulai", count: countPending, color: "#64748b", bg: "#64748b" },
             ].map(item => (
               <div key={item.label}>
                 <div className="flex justify-between text-xs text-slate-400 mb-1">
@@ -1623,7 +1636,14 @@ function ResultsView({ data }) {
     const exam = data.exams.find(e => e.id === selectedExam);
     const results = (data.results || []).filter(r => r.examId === selectedExam);
     const totalQ = exam?.questionIds?.length || 0;
-    const avg = results.length > 0 ? (results.reduce((a, r) => a + r.score, 0) / results.length).toFixed(1) : "-";
+    const targetStudents = data.students.filter(s => exam?.targetKelas?.includes(s.kelas));
+    const submittedIds = new Set(results.map(r => r.studentId));
+    const notSubmitted = targetStudents.filter(s => !submittedIds.has(s.id));
+    const scoredResults = results.filter(r => r.score !== null && r.score !== undefined);
+    const avg = scoredResults.length > 0 ? (scoredResults.reduce((a, r) => a + r.score, 0) / scoredResults.length).toFixed(1) : "-";
+    const highest = scoredResults.length > 0 ? Math.max(...scoredResults.map(r => r.score)).toFixed(1) : "-";
+    const lowest = scoredResults.length > 0 ? Math.min(...scoredResults.map(r => r.score)).toFixed(1) : "-";
+    const rankedResults = [...results].sort((a, b) => (b.score||0) - (a.score||0));
 
     return (
       <div>
@@ -1633,14 +1653,12 @@ function ResultsView({ data }) {
         </div>
         <h2 className="text-2xl font-bold mb-1" style={{ color: "inherit" }}>{exam?.title} — Hasil</h2>
         <p className="text-sm mb-4" style={{ color: "inherit", opacity: 0.7 }}>{(data.subjects || []).find(s => s.id === exam?.subjectId)?.name} • {results.length} peserta</p>
-        {results.length > 0 && (
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
-            <StatCard icon={<Users size={20} className="text-blue-400" />} label="Peserta" value={results.length} />
-            <StatCard icon={<Award size={20} className="text-green-400" />} label="Rata-rata" value={avg} color="#16a34a" />
-            <StatCard icon={<CheckCircle size={20} className="text-amber-400" />} label="Di Atas 75" value={results.filter(r => r.score !== null && r.score >= 75).length} color="#d97706" />
-            <StatCard icon={<XCircle size={20} className="text-red-400" />} label="Di Bawah 75" value={results.filter(r => r.score !== null && r.score < 75).length} color="#dc2626" />
-          </div>
-        )}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+          <StatCard icon={<Users size={20} className="text-blue-400" />} label="Total Peserta" value={targetStudents.length} />
+          <StatCard icon={<Award size={20} className="text-green-400" />} label="Rata-rata" value={avg} color="#16a34a" />
+          <StatCard icon={<BarChart3 size={20} className="text-purple-400" />} label="Tertinggi" value={highest} color="#9333ea" />
+          <StatCard icon={<BarChart3 size={20} className="text-amber-400" />} label="Terendah" value={lowest} color="#d97706" />
+        </div>
         <Card>
           {results.length === 0 ? <EmptyState icon={<BarChart3 size={40} className="mx-auto" />} text="Belum ada hasil" /> : (
             <div>
@@ -1651,18 +1669,19 @@ function ResultsView({ data }) {
                 <div className="col-span-2">Benar</div>
                 <div className="col-span-3">Nilai</div>
               </div>
-              {results.sort((a, b) => (b.score || 0) - (a.score || 0)).map((r, i) => {
+              {rankedResults.map((r, i) => {
                 const student = data.students.find(s => s.id === r.studentId);
                 const scoreNull = r.score === null || r.score === undefined;
+                const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : String(i+1);
                 return (
-                  <div key={r.id} className="grid grid-cols-12 gap-2 px-3 py-2 rounded-lg items-center hover:bg-white/5" style={{ background: i % 2 === 0 ? "rgba(15,23,42,0.4)" : "transparent" }}>
-                    <div className="col-span-1 text-slate-400 text-sm">{i + 1}</div>
-                    <div className="col-span-4 text-white text-sm font-medium">{student?.name || "?"}</div>
-                    <div className="col-span-2 text-slate-400 text-sm">{student?.kelas || "-"}</div>
-                    <div className="col-span-2 text-slate-300 text-sm">{r.correct||0}/{totalQ}{r.hasEssay ? "+" : ""}</div>
-                    <div className="col-span-3">
+                  <div key={r.id} className="grid grid-cols-12 gap-2 px-3 py-2.5 rounded-lg items-center mb-0.5" style={{ background: i % 2 === 0 ? "rgba(15,23,42,0.3)" : "transparent" }}>
+                    <div className="col-span-1 text-sm font-bold text-center">{medal}</div>
+                    <div className="col-span-4 text-sm font-medium" style={{ color: "inherit" }}>{student?.name || "?"}</div>
+                    <div className="col-span-2 text-sm text-center" style={{ color: "inherit", opacity: 0.65 }}>{student?.kelas || "-"}</div>
+                    <div className="col-span-2 text-sm text-center" style={{ color: "inherit", opacity: 0.8 }}>{r.correct||0}/{totalQ}</div>
+                    <div className="col-span-3 text-center">
                       {scoreNull ? (
-                        <span className="px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: "rgba(168,85,247,0.2)", color: "#c084fc" }}>Perlu Dinilai</span>
+                        <span className="px-1.5 py-0.5 rounded text-xs" style={{ background: "rgba(168,85,247,0.2)", color: "#c084fc" }}>Dinilai</span>
                       ) : (
                         <span className="px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
                           {r.score.toFixed(1)}
@@ -1672,16 +1691,28 @@ function ResultsView({ data }) {
                   </div>
                 );
               })}
-              <div className="pt-3 mt-2 px-3" style={{ borderTop: "1px solid rgba(59,130,246,0.15)" }}>
-                <div className="text-sm" style={{ color: "inherit", opacity: 0.7 }}>
-                  Rata-rata: <span className="font-bold" style={{ color: "inherit" }}>{avg}</span> &nbsp;|&nbsp;
-                  Tertinggi: <span className="text-green-400 font-bold">{Math.max(...results.map(r => r.score)).toFixed(1)}</span> &nbsp;|&nbsp;
-                  Terendah: <span className="text-red-400 font-bold">{Math.min(...results.map(r => r.score)).toFixed(1)}</span>
-                </div>
+              <div className="mt-3 pt-3 px-3 flex flex-wrap gap-4" style={{ borderTop: "1px solid rgba(59,130,246,0.15)" }}>
+                <span className="text-xs" style={{ color: "inherit", opacity: 0.7 }}>Rata-rata: <strong>{avg}</strong></span>
+                <span className="text-xs text-green-400">Tertinggi: <strong>{highest}</strong></span>
+                <span className="text-xs text-red-400">Terendah: <strong>{lowest}</strong></span>
+                <span className="text-xs text-blue-400">Mengumpulkan: <strong>{results.length}/{targetStudents.length}</strong></span>
               </div>
             </div>
           )}
         </Card>
+        {notSubmitted.length > 0 && (
+          <Card className="mt-4">
+            <h3 className="font-bold mb-3" style={{ color: "inherit" }}>Belum Mengumpulkan ({notSubmitted.length} siswa)</h3>
+            <div className="space-y-1">
+              {notSubmitted.map(s => (
+                <div key={s.id} className="flex items-center justify-between px-3 py-2 rounded-lg" style={{ background: "rgba(220,38,38,0.06)" }}>
+                  <span className="text-sm" style={{ color: "inherit" }}>{s.name}</span>
+                  <span className="text-xs" style={{ color: "inherit", opacity: 0.6 }}>{s.kelas} • NISN: {s.nisn}</span>
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
       </div>
     );
   }

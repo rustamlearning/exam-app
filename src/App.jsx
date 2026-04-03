@@ -612,12 +612,173 @@ function AdminHome({ data }) {
   );
 }
 
+// ============= IMPORT DATA MODAL (Excel/CSV/Word) =============
+function ImportDataModal({ type, onImport, onClose, showToast }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [step, setStep] = useState("upload");
+
+  const parseCSVLine = (line) => {
+    const result = []; let cur = ""; let inQ = false;
+    for (let c of line) {
+      if (c === '"') { inQ = !inQ; }
+      else if (c === "," && !inQ) { result.push(cur.trim()); cur = ""; }
+      else cur += c;
+    }
+    result.push(cur.trim());
+    return result;
+  };
+
+  const parseFile = async (file) => {
+    setLoading(true);
+    try {
+      const ext = file.name.split(".").pop().toLowerCase();
+      let text = "";
+      if (ext === "csv" || ext === "txt") {
+        text = await file.text();
+      } else if (ext === "xlsx" || ext === "xls") {
+        // Load SheetJS from CDN
+        if (!window.XLSX) {
+          await new Promise((res, rej) => {
+            const s = document.createElement("script");
+            s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+            s.onload = res; s.onerror = rej;
+            document.head.appendChild(s);
+          });
+        }
+        const ab = await file.arrayBuffer();
+        const wb = window.XLSX.read(ab, { type: "array" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        text = window.XLSX.utils.sheet_to_csv(ws);
+      } else if (ext === "docx") {
+        if (!window.mammoth) {
+          await new Promise((res, rej) => {
+            const s = document.createElement("script");
+            s.src = "https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js";
+            s.onload = res; s.onerror = rej;
+            document.head.appendChild(s);
+          });
+        }
+        const ab = await file.arrayBuffer();
+        const result = await window.mammoth.extractRawText({ arrayBuffer: ab });
+        text = result.value;
+      }
+
+      const lines = text.split(/
+/).map(l => l.trim()).filter(Boolean);
+      const parsed = [];
+
+      if (type === "students") {
+        for (const line of lines) {
+          const cols = line.includes(",") ? parseCSVLine(line) : line.split(/	|;/).map(s => s.trim());
+          if (cols.length >= 2) {
+            const name = cols[0]?.replace(/^["']|["']$/g, "").trim();
+            const nisn = cols[1]?.replace(/^["']|["']$/g, "").trim();
+            const kelas = cols[2]?.replace(/^["']|["']$/g, "").trim() || "";
+            const peminatan = cols[3]?.replace(/^["']|["']$/g, "").trim() || "MIPA";
+            if (name && nisn && !/^(nama|name|siswa)/i.test(name)) {
+              parsed.push({ name, nisn, kelas, peminatan });
+            }
+          }
+        }
+      } else if (type === "teachers") {
+        for (const line of lines) {
+          const cols = line.includes(",") ? parseCSVLine(line) : line.split(/	|;/).map(s => s.trim());
+          if (cols.length >= 2) {
+            const name = cols[0]?.replace(/^["']|["']$/g, "").trim();
+            const nip = cols[1]?.replace(/^["']|["']$/g, "").trim();
+            const email = cols[2]?.replace(/^["']|["']$/g, "").trim() || "";
+            if (name && nip && !/^(nama|name|guru)/i.test(name)) {
+              parsed.push({ name, nip, email, subjects: [], photo: "" });
+            }
+          }
+        }
+      }
+
+      if (!parsed.length) return showToast("Tidak ada data valid ditemukan. Periksa format file.", "error");
+      setRows(parsed);
+      setStep("preview");
+    } catch(e) {
+      showToast("Gagal membaca file: " + e.message, "error");
+    }
+    setLoading(false);
+  };
+
+  const isStudent = type === "students";
+  const title = isStudent ? "Import Data Siswa" : "Import Data Guru";
+  const template = isStudent
+    ? "Nama Lengkap,NISN,Kelas,Peminatan
+Ahmad Fauzi,1234567890,XII-MIPA 1,MIPA
+Siti Rahayu,0987654321,XII-IPS 1,IPS"
+    : "Nama Lengkap,NIP,Email
+Budi Santoso,199001012020011001,budi@sman6.sch.id";
+
+  const downloadTemplate = () => {
+    const blob = new Blob([template], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = (isStudent ? "template_siswa" : "template_guru") + ".csv";
+    a.click();
+  };
+
+  return (
+    <Modal title={title} onClose={onClose} wide>
+      {step === "upload" && (
+        <div className="space-y-4">
+          <div className="p-4 rounded-xl" style={{ background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.2)" }}>
+            <p className="text-blue-300 text-sm font-medium mb-2">Format Kolom yang Dibutuhkan:</p>
+            <div className="font-mono text-xs" style={{ color: "inherit", opacity: 0.8 }}>
+              {isStudent ? "Kolom 1: Nama Lengkap | Kolom 2: NISN | Kolom 3: Kelas | Kolom 4: Peminatan" : "Kolom 1: Nama Lengkap | Kolom 2: NIP | Kolom 3: Email (opsional)"}
+            </div>
+            <button onClick={downloadTemplate} className="mt-2 text-xs text-blue-400 hover:underline flex items-center gap-1"><Download size={12} />Download Template CSV</button>
+          </div>
+          <label className="flex flex-col items-center justify-center gap-3 p-8 rounded-xl cursor-pointer transition" style={{ border: "2px dashed rgba(59,130,246,0.4)", background: "rgba(15,23,42,0.3)" }}>
+            <Upload size={32} className="text-blue-400" />
+            <span className="text-sm font-medium text-blue-300">{loading ? "Membaca file..." : "Klik untuk pilih file"}</span>
+            <span className="text-xs" style={{ color: "inherit", opacity: 0.5 }}>Format: .xlsx, .csv, .txt, .docx</span>
+            <input type="file" accept=".xlsx,.xls,.csv,.txt,.docx" onChange={e => { if (e.target.files[0]) parseFile(e.target.files[0]); }} className="hidden" disabled={loading} />
+          </label>
+        </div>
+      )}
+      {step === "preview" && (
+        <div>
+          <div className="flex items-center justify-between mb-4">
+            <span className="text-green-400 font-semibold">{rows.length} data terdeteksi</span>
+            <Btn variant="secondary" onClick={() => setStep("upload")}><ArrowLeft size={14} />Ganti File</Btn>
+          </div>
+          <div className="rounded-xl overflow-hidden mb-4" style={{ border: "1px solid rgba(59,130,246,0.2)" }}>
+            <div className="grid text-xs font-bold px-3 py-2" style={{ gridTemplateColumns: isStudent ? "1fr 1fr 1fr 1fr" : "1fr 1fr 1fr", background: "rgba(59,130,246,0.15)", color: "#60a5fa" }}>
+              <div>Nama</div>
+              <div>{isStudent ? "NISN" : "NIP"}</div>
+              {isStudent ? <><div>Kelas</div><div>Peminatan</div></> : <div>Email</div>}
+            </div>
+            <div className="max-h-60 overflow-y-auto">
+              {rows.map((r, i) => (
+                <div key={i} className="grid text-xs px-3 py-2" style={{ gridTemplateColumns: isStudent ? "1fr 1fr 1fr 1fr" : "1fr 1fr 1fr", background: i%2===0 ? "rgba(15,23,42,0.3)" : "transparent", color: "inherit" }}>
+                  <div>{r.name}</div>
+                  <div>{isStudent ? r.nisn : r.nip}</div>
+                  {isStudent ? <><div>{r.kelas}</div><div>{r.peminatan}</div></> : <div>{r.email}</div>}
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="flex justify-end gap-2">
+            <Btn variant="secondary" onClick={onClose}>Batal</Btn>
+            <Btn variant="success" onClick={() => onImport(rows)}><CheckCircle size={14} />Import {rows.length} Data</Btn>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
 // ============= TEACHER MANAGER =============
 function TeacherManager({ data, dataRef, saveData, showToast }) {
   const [showModal, setShowModal] = useState(false);
   const [editId, setEditId] = useState(null);
   const [form, setForm] = useState({ name: "", nip: "", email: "", subjects: [], photo: "" });
   const [search, setSearch] = useState("");
+  const [showImportModal, setShowImportModal] = useState(false);
 
   const openAdd = () => { setEditId(null); setForm({ name: "", nip: "", email: "", subjects: [], photo: "" }); setShowModal(true); };
   const openEdit = (t) => { setEditId(t.id); setForm({ name: t.name, nip: t.nip, email: t.email || "", subjects: t.subjects || [], photo: t.photo || "" }); setShowModal(true); };
@@ -651,7 +812,10 @@ function TeacherManager({ data, dataRef, saveData, showToast }) {
     <div>
       <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
         <h2 className="text-white text-2xl font-bold">Data Guru</h2>
-        <Btn onClick={openAdd}><Plus size={16} />Tambah Guru</Btn>
+        <div className="flex gap-2">
+          <Btn variant="secondary" onClick={() => setShowImportModal(true)}><Upload size={16} />Import Excel/CSV</Btn>
+          <Btn onClick={openAdd}><Plus size={16} />Tambah Guru</Btn>
+        </div>
       </div>
       <Card>
         <div className="mb-4 flex items-center rounded-xl px-3" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.2)" }}>
@@ -678,6 +842,16 @@ function TeacherManager({ data, dataRef, saveData, showToast }) {
           </div>
         )}
       </Card>
+      {showImportModal && (
+        <ImportDataModal type="teachers" onImport={(rows) => {
+          const latest = dataRef?.current || data;
+          const existing = latest.teachers || [];
+          const newTeachers = rows.filter(r => !existing.find(t => t.nip === r.nip)).map(r => ({ id: genId(), ...r }));
+          saveData({ ...latest, teachers: [...existing, ...newTeachers] }, ["teachers"]);
+          setShowImportModal(false);
+          showToast(newTeachers.length + " guru berhasil diimpor");
+        }} onClose={() => setShowImportModal(false)} showToast={showToast} />
+      )}
       {showModal && (
         <Modal title={editId ? "Edit Guru" : "Tambah Guru"} onClose={() => setShowModal(false)}>
           <div className="space-y-4">
@@ -718,6 +892,7 @@ function StudentManager({ data, dataRef, saveData, showToast }) {
   const [form, setForm] = useState({ name: "", nisn: "", kelas: KELAS_OPTIONS[0], peminatan: "MIPA", photo: "" });
   const [search, setSearch] = useState("");
   const [filterKelas, setFilterKelas] = useState("all");
+  const [showImportSiswa, setShowImportSiswa] = useState(false);
 
   const openAdd = () => { setEditId(null); setForm({ name: "", nisn: "", kelas: KELAS_OPTIONS[0], peminatan: "MIPA", photo: "" }); setShowModal(true); };
   const openEdit = (s) => { setEditId(s.id); setForm({ name: s.name, nisn: s.nisn, kelas: s.kelas, peminatan: s.peminatan || "MIPA", photo: s.photo || "" }); setShowModal(true); };
@@ -754,7 +929,10 @@ function StudentManager({ data, dataRef, saveData, showToast }) {
     <div>
       <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
         <h2 className="text-white text-2xl font-bold">Data Siswa</h2>
-        <Btn onClick={openAdd}><Plus size={16} />Tambah Siswa</Btn>
+        <div className="flex gap-2">
+          <Btn variant="secondary" onClick={() => setShowImportSiswa(true)}><Upload size={16} />Import Excel/CSV</Btn>
+          <Btn onClick={openAdd}><Plus size={16} />Tambah Siswa</Btn>
+        </div>
       </div>
       <Card>
         <div className="flex flex-wrap gap-3 mb-4">
@@ -788,6 +966,16 @@ function StudentManager({ data, dataRef, saveData, showToast }) {
           </div>
         )}
       </Card>
+      {showImportSiswa && (
+        <ImportDataModal type="students" onImport={(rows) => {
+          const latest = dataRef?.current || data;
+          const existing = latest.students || [];
+          const newStudents = rows.filter(r => !existing.find(s => s.nisn === r.nisn)).map(r => ({ id: genId(), ...r }));
+          saveData({ ...latest, students: [...existing, ...newStudents] }, ["students"]);
+          setShowImportSiswa(false);
+          showToast(newStudents.length + " siswa berhasil diimpor");
+        }} onClose={() => setShowImportSiswa(false)} showToast={showToast} />
+      )}
       {showModal && (
         <Modal title={editId ? "Edit Siswa" : "Tambah Siswa"} onClose={() => setShowModal(false)}>
           <div className="space-y-4">
@@ -892,12 +1080,17 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
   const [form, setForm] = useState({ subjectId: "", type: "pilgan", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "", rubrik: "" });
   const [filterType, setFilterType] = useState("all");
 
-  const myQuestions = userId ? data.questions.filter(q => q.createdBy === userId) : data.questions;
-  const filtered = myQuestions.filter(q => {
+  const [showMineOnly, setShowMineOnly] = useState(false);
+  // Show all questions (not just createdBy this user) - prevents visibility issues
+  // from real-time sync delay. User can filter to "mine only".
+  const allQ = data.questions || [];
+  const baseQ = (userId && showMineOnly) ? allQ.filter(q => q.createdBy === userId) : allQ;
+  const filtered = baseQ.filter(q => {
     if (filterSubject !== "all" && q.subjectId !== filterSubject) return false;
     if (filterType !== "all" && (q.type || "pilgan") !== filterType) return false;
     return true;
   });
+  const myCount = userId ? allQ.filter(q => q.createdBy === userId).length : allQ.length;
 
   const openAdd = () => { setEditId(null); setForm({ subjectId: (data.subjects || [])[0]?.id || "", type: "pilgan", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "", rubrik: "" }); setShowModal(true); };
   const openEdit = (q) => { setEditId(q.id); setForm({ subjectId: q.subjectId, type: q.type || "pilgan", text: q.text, image: q.image || "", options: q.options?.length ? [...q.options, "", "", ""].slice(0, 5) : ["", "", "", "", ""], correctAnswer: q.correctAnswer || 0, explanation: q.explanation || "", rubrik: q.rubrik || "" }); setShowModal(true); };
@@ -951,9 +1144,13 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
   return (
     <div>
       <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
-        <h2 className="text-white text-2xl font-bold">Bank Soal</h2>
-        <div className="flex gap-2">
-          <Btn variant="secondary" onClick={() => setShowImport(true)}><Upload size={16} />Import Word/PDF</Btn>
+        <div>
+          <h2 className="text-2xl font-bold" style={{ color: "inherit" }}>Bank Soal</h2>
+          {userId && <p className="text-xs mt-0.5" style={{ color: "inherit", opacity: 0.6 }}>Soal saya: {myCount} | Total: {allQ.length}</p>}
+        </div>
+        <div className="flex gap-2 flex-wrap">
+          {userId && <button onClick={() => setShowMineOnly(v => !v)} className="px-3 py-2 rounded-xl text-xs font-medium transition" style={{ background: showMineOnly ? "rgba(59,130,246,0.25)" : "rgba(51,65,85,0.5)", color: showMineOnly ? "#60a5fa" : "#94a3b8", border: "1px solid rgba(59,130,246,0.2)" }}>{showMineOnly ? "✓ Soal Saya" : "Semua Soal"}</button>}
+          <Btn variant="secondary" onClick={() => setShowImport(true)}><Upload size={16} />Import</Btn>
           <Btn onClick={openAdd}><Plus size={16} />Tambah Soal</Btn>
         </div>
       </div>
@@ -978,7 +1175,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
               <div key={q.id} className="p-3 rounded-xl" style={{ background: "rgba(15,23,42,0.5)" }}>
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex-1">
-                    <div className="flex items-center gap-2 mb-1"><span className="text-blue-400 text-xs">{getSubjectName(q.subjectId)}</span><span className="px-1.5 py-0.5 rounded text-xs" style={{ background: q.type === "esai" ? "rgba(168,85,247,0.2)" : q.type === "uraian" ? "rgba(20,184,166,0.2)" : q.type === "benar_salah" ? "rgba(234,179,8,0.2)" : "rgba(59,130,246,0.2)", color: q.type === "esai" ? "#c084fc" : q.type === "uraian" ? "#2dd4bf" : q.type === "benar_salah" ? "#fbbf24" : "#60a5fa" }}>{q.type === "esai" ? "Esai" : q.type === "uraian" ? "Uraian" : q.type === "benar_salah" ? "Benar/Salah" : "Pilihan Ganda"}</span></div>
+                    <div className="flex items-center gap-2 mb-1 flex-wrap"><span className="text-blue-400 text-xs">{getSubjectName(q.subjectId)}</span>{userId && q.createdBy !== userId && <span className="px-1.5 py-0.5 rounded text-xs" style={{ background: "rgba(168,85,247,0.15)", color: "#c084fc" }}>dari guru lain</span>}<span className="px-1.5 py-0.5 rounded text-xs" style={{ background: q.type === "esai" ? "rgba(168,85,247,0.2)" : q.type === "uraian" ? "rgba(20,184,166,0.2)" : q.type === "benar_salah" ? "rgba(234,179,8,0.2)" : "rgba(59,130,246,0.2)", color: q.type === "esai" ? "#c084fc" : q.type === "uraian" ? "#2dd4bf" : q.type === "benar_salah" ? "#fbbf24" : "#60a5fa" }}>{q.type === "esai" ? "Esai" : q.type === "uraian" ? "Uraian" : q.type === "benar_salah" ? "Benar/Salah" : "Pilihan Ganda"}</span></div>
                     <div className="text-white text-sm mb-2">{i + 1}. {q.text.substring(0, 150)}{q.text.length > 150 ? "..." : ""}</div>
                     {q.image && <img src={q.image} alt="" className="max-h-24 rounded-lg mb-2" />}
                     <div className="flex flex-wrap gap-1">
@@ -1378,7 +1575,7 @@ function ExamManager({ data, dataRef, saveData, showToast, isAdmin, userId }) {
               )}
             </div>
             <div className="flex flex-wrap gap-4">
-              {[["shuffleQuestions", "Acak urutan soal"], ["shuffleOptions", "Acak pilihan jawaban"], ["showResult", "Tampilkan hasil ke siswa"]].map(([k, label]) => (
+              {[["shuffleQuestions", "Acak urutan soal"], ["shuffleOptions", "Acak pilihan jawaban"], ["showResult", "Tampilkan hasil ke siswa"], ["isTryout", "Jadikan sebagai Tryout/Latihan (siswa bisa akses kapan saja)"]].map(([k, label]) => (
                 <label key={k} className="flex items-center gap-2 cursor-pointer">
                   <input type="checkbox" checked={form[k]} onChange={e => setForm({ ...form, [k]: e.target.checked })} className="w-4 h-4 rounded" />
                   <span className="text-slate-300 text-sm">{label}</span>
@@ -1536,6 +1733,7 @@ function MonitorView({ data }) {
 function ResultsView({ data }) {
   const [selectedExam, setSelectedExam] = useState(null);
   const [printing, setPrinting] = useState(false);
+  const [activeResultTab, setActiveResultTab] = useState("ranking");
 
   // Show ALL exams that have at least 1 result, regardless of status
   const examsWithData = data.exams.filter(e =>
@@ -1623,11 +1821,26 @@ function ResultsView({ data }) {
     const highest = scoredResults.length > 0 ? Math.max(...scoredResults.map(r => r.score)).toFixed(1) : "-";
     const lowest = scoredResults.length > 0 ? Math.min(...scoredResults.map(r => r.score)).toFixed(1) : "-";
     const rankedResults = [...results].sort((a, b) => (b.score||0) - (a.score||0));
+    // Per-question analysis
+    const questionAnalysis = exam?.questionIds?.map((qid, qi) => {
+      const q = data.questions.find(x => x.id === qid);
+      const answered = results.filter(r => r.answers && r.answers[qi] !== undefined && r.answers[qi] !== "");
+      const correct = results.filter(r => r.answers && r.answers[qi] === q?.correctAnswer);
+      const pct = answered.length > 0 ? Math.round(correct.length / answered.length * 100) : 0;
+      return { qi, q, answered: answered.length, correct: correct.length, pct };
+    }) || [];
+    // Score distribution
+    const dist = [0,0,0,0,0]; // 0-20,21-40,41-60,61-80,81-100
+    scoredResults.forEach(r => {
+      const idx = Math.min(4, Math.floor(r.score / 20));
+      dist[idx]++;
+    });
+    const maxDist = Math.max(...dist, 1);
 
     return (
       <div>
         <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
-          <button onClick={() => setSelectedExam(null)} className="flex items-center gap-2 text-blue-400 hover:underline"><ArrowLeft size={16} />Kembali</button>
+          <button onClick={() => { setSelectedExam(null); setActiveResultTab("ranking"); }} className="flex items-center gap-2 text-blue-400 hover:underline"><ArrowLeft size={16} />Kembali</button>
           <Btn variant="secondary" onClick={() => handlePrint(exam, results)}><Printer size={16} />Cetak Laporan PDF</Btn>
         </div>
         <h2 className="text-2xl font-bold mb-1" style={{ color: "inherit" }}>{exam?.title} — Hasil</h2>
@@ -1679,6 +1892,8 @@ function ResultsView({ data }) {
             </div>
           )}
         </Card>
+        </Card>}
+
         {notSubmitted.length > 0 && (
           <Card className="mt-4">
             <h3 className="font-bold mb-3" style={{ color: "inherit" }}>Belum Mengumpulkan ({notSubmitted.length} siswa)</h3>
@@ -1936,6 +2151,7 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
 
   const tabs = [
     { id: "exams", label: "Ujian Tersedia", icon: <FileText size={18} /> },
+    { id: "tryout", label: "Tryout / Latihan", icon: <Play size={18} /> },
     { id: "results", label: "Hasil Saya", icon: <Award size={18} /> },
     { id: "profile", label: "Profil Saya", icon: <User size={18} /> },
   ];
@@ -2028,8 +2244,203 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
         </div>
       )}
 
+      {tab === "tryout" && <TryoutView data={data} user={user} showToast={showToast} />}
       {tab === "profile" && <StudentProfile data={data} saveData={saveData} user={user} showToast={showToast} updateUserSession={updateUserSession} />}
     </DashboardLayout>
+  );
+}
+
+// ============= TRYOUT VIEW =============
+function TryoutView({ data, user, showToast }) {
+  const [activeExam, setActiveExam] = useState(null);
+  const [tryoutResult, setTryoutResult] = useState(null);
+
+  // All exams marked as tryout OR all ended exams available as practice
+  const tryoutExams = data.exams.filter(e =>
+    e.isTryout || e.status === "ended"
+  );
+
+  if (activeExam && !tryoutResult) {
+    return <TryoutTaker data={data} user={user} exam={activeExam}
+      onFinish={(res) => { setTryoutResult(res); }}
+      showToast={showToast} />;
+  }
+
+  if (tryoutResult) {
+    const exam = data.exams.find(e => e.id === activeExam?.id);
+    return (
+      <div>
+        <div className="text-center mb-6">
+          <div className="w-20 h-20 mx-auto rounded-full flex items-center justify-center mb-3" style={{ background: tryoutResult.score >= 75 ? "rgba(22,163,74,0.2)" : "rgba(220,38,38,0.15)" }}>
+            <Award size={36} style={{ color: tryoutResult.score >= 75 ? "#4ade80" : "#f87171" }} />
+          </div>
+          <h2 className="text-2xl font-bold mb-1" style={{ color: "inherit" }}>Tryout Selesai!</h2>
+          <p className="text-sm mb-4" style={{ color: "inherit", opacity: 0.7 }}>{exam?.title}</p>
+          <div className="text-6xl font-bold mb-2" style={{ color: tryoutResult.score >= 75 ? "#4ade80" : "#f87171" }}>{tryoutResult.score.toFixed(1)}</div>
+          <p className="text-sm mb-1" style={{ color: "inherit", opacity: 0.7 }}>Benar: {tryoutResult.correct} dari {tryoutResult.total} soal</p>
+          <p className="text-xs" style={{ color: "inherit", opacity: 0.5 }}>Ini adalah latihan — tidak tercatat sebagai nilai resmi</p>
+        </div>
+        {/* Per-question review */}
+        <Card className="mb-4">
+          <h3 className="font-bold mb-3" style={{ color: "inherit" }}>Review Jawaban</h3>
+          <div className="space-y-3 max-h-[50vh] overflow-y-auto">
+            {tryoutResult.questions.map((q, i) => {
+              const userAns = tryoutResult.answers[i];
+              const isCorrect = userAns === q.correctAnswer;
+              const qType = q.type || "pilgan";
+              return (
+                <div key={i} className="p-3 rounded-xl" style={{ background: isCorrect ? "rgba(22,163,74,0.08)" : "rgba(220,38,38,0.08)", border: "1px solid " + (isCorrect ? "rgba(22,163,74,0.2)" : "rgba(220,38,38,0.15)") }}>
+                  <div className="flex items-start gap-2 mb-2">
+                    <span className="text-xs px-1.5 py-0.5 rounded font-bold shrink-0" style={{ background: isCorrect ? "rgba(22,163,74,0.2)" : "rgba(220,38,38,0.2)", color: isCorrect ? "#4ade80" : "#f87171" }}>{isCorrect ? "✓" : "✗"}</span>
+                    <span className="text-sm" style={{ color: "inherit" }}><strong>#{i+1}</strong> {q.text?.substring(0,100)}</span>
+                  </div>
+                  {(qType === "pilgan" || qType === "benar_salah") && (
+                    <div className="text-xs space-y-1 ml-6">
+                      {userAns !== undefined && userAns !== q.correctAnswer && <div style={{ color: "#f87171" }}>Jawaban kamu: {qType === "benar_salah" ? (userAns === 0 ? "Benar" : "Salah") : (q.options?.[userAns] ? String.fromCharCode(65+userAns)+". "+q.options[userAns] : "-")}</div>}
+                      <div style={{ color: "#4ade80" }}>Kunci: {qType === "benar_salah" ? (q.correctAnswer === 0 ? "Benar" : "Salah") : (q.options?.[q.correctAnswer] ? String.fromCharCode(65+q.correctAnswer)+". "+q.options[q.correctAnswer] : "-")}</div>
+                      {q.explanation && <div className="text-blue-300 mt-1">💡 {q.explanation}</div>}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+        <div className="flex gap-3 justify-center">
+          <Btn variant="secondary" onClick={() => { setTryoutResult(null); setActiveExam(null); }}><ArrowLeft size={14} />Kembali</Btn>
+          <Btn onClick={() => { setTryoutResult(null); }}><RefreshCw size={14} />Coba Lagi</Btn>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <h2 className="text-2xl font-bold mb-2" style={{ color: "inherit" }}>Tryout & Latihan</h2>
+      <p className="text-sm mb-6" style={{ color: "inherit", opacity: 0.6 }}>Latihan ujian tanpa batas waktu dan nilai tidak tercatat. Cocok untuk persiapan ujian resmi.</p>
+      {tryoutExams.length === 0 ? (
+        <Card><EmptyState icon={<Play size={40} className="mx-auto" />} text="Belum ada tryout tersedia" /></Card>
+      ) : (
+        <div className="space-y-3">
+          {tryoutExams.map(ex => {
+            const subj = data.subjects?.find(s => s.id === ex.subjectId);
+            const qCount = ex.questionIds?.length || 0;
+            return (
+              <Card key={ex.id}>
+                <div className="flex items-center justify-between flex-wrap gap-3">
+                  <div>
+                    <div className="flex items-center gap-2 mb-1">
+                      <h3 className="font-bold" style={{ color: "inherit" }}>{ex.title}</h3>
+                      <span className="px-2 py-0.5 rounded-full text-xs" style={{ background: "rgba(168,85,247,0.2)", color: "#c084fc" }}>Tryout</span>
+                    </div>
+                    <p className="text-sm" style={{ color: "inherit", opacity: 0.7 }}>{subj?.name} • {qCount} soal • Tidak ada batas waktu</p>
+                  </div>
+                  <Btn onClick={() => setActiveExam(ex)}><Play size={14} />Mulai Latihan</Btn>
+                </div>
+              </Card>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============= TRYOUT TAKER =============
+function TryoutTaker({ data, user, exam, onFinish, showToast }) {
+  const questions = useMemo(() => {
+    let qs = (exam.questionIds || []).map(id => data.questions.find(q => q.id === id)).filter(Boolean);
+    if (exam.shuffleQuestions) {
+      qs = [...qs];
+      for (let i = qs.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [qs[i], qs[j]] = [qs[j], qs[i]];
+      }
+    }
+    return qs;
+  }, [exam, data.questions]);
+
+  const [currentQ, setCurrentQ] = useState(0);
+  const [answers, setAnswers] = useState({});
+  const [showNav, setShowNav] = useState(false);
+
+  const handleSubmit = () => {
+    if (!confirm("Selesaikan tryout ini?")) return;
+    let correct = 0;
+    questions.forEach((q, i) => {
+      if (!q.type || q.type === "pilgan" || q.type === "benar_salah") {
+        if (answers[i] === q.correctAnswer) correct++;
+      }
+    });
+    const total = questions.filter(q => !q.type || q.type === "pilgan" || q.type === "benar_salah").length || questions.length;
+    const score = total > 0 ? (correct / total) * 100 : 0;
+    onFinish({ score, correct, total, answers, questions });
+  };
+
+  const q = questions[currentQ];
+  if (!q) return null;
+  const answeredCount = Object.values(answers).filter(v => v !== undefined && v !== "").length;
+
+  return (
+    <div>
+      {/* Header */}
+      <div className="flex items-center justify-between mb-4 p-3 rounded-xl" style={{ background: "rgba(168,85,247,0.1)", border: "1px solid rgba(168,85,247,0.2)" }}>
+        <div>
+          <div className="text-sm font-bold" style={{ color: "#c084fc" }}>{exam.title} — Mode Latihan</div>
+          <div className="text-xs" style={{ color: "inherit", opacity: 0.6 }}>Soal {currentQ+1}/{questions.length} • {answeredCount} dijawab</div>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={() => setShowNav(!showNav)} className="p-2 rounded-lg" style={{ background: "rgba(51,65,85,0.5)", color: "inherit" }}><Hash size={16} /></button>
+        </div>
+      </div>
+
+      {showNav && (
+        <div className="fixed inset-0 z-[60]">
+          <div className="absolute inset-0 bg-black/60" onClick={() => setShowNav(false)} />
+          <div className="absolute right-0 top-0 bottom-0 w-64 p-4 overflow-y-auto" style={{ background: "#1e293b" }}>
+            <div className="flex items-center justify-between mb-4"><h3 className="font-bold" style={{ color: "inherit" }}>Navigasi Soal</h3><button onClick={() => setShowNav(false)}><X size={18} /></button></div>
+            <div className="grid grid-cols-5 gap-2">
+              {questions.map((_, i) => (
+                <button key={i} onClick={() => { setCurrentQ(i); setShowNav(false); }} className="aspect-square rounded-lg text-sm font-bold" style={{ background: answers[i] !== undefined ? "rgba(22,163,74,0.4)" : i === currentQ ? "#3b82f6" : "rgba(51,65,85,0.5)", color: "white" }}>{i+1}</button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <Card className="mb-4">
+        <div className="text-xs mb-2 text-blue-400">Soal {currentQ+1} dari {questions.length}</div>
+        <p className="text-base leading-relaxed mb-2" style={{ color: "inherit" }}>{q.text}</p>
+        {q.image && <img src={q.image} alt="" className="max-w-full rounded-xl mb-2" style={{ maxHeight: 200 }} />}
+      </Card>
+
+      <div className="mb-6">
+        {(!q.type || q.type === "pilgan") && q.options?.map((opt, i) => (
+          <button key={i} onClick={() => setAnswers(a => ({ ...a, [currentQ]: i }))} className="w-full text-left flex items-center gap-3 p-3 rounded-xl mb-2 transition" style={{ background: answers[currentQ] === i ? "rgba(59,130,246,0.2)" : "rgba(30,41,59,0.6)", border: "2px solid " + (answers[currentQ] === i ? "#3b82f6" : "rgba(59,130,246,0.1)") }}>
+            <div className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shrink-0" style={{ background: answers[currentQ] === i ? "#3b82f6" : "rgba(51,65,85,0.5)", color: "white" }}>{String.fromCharCode(65+i)}</div>
+            <span className="text-sm" style={{ color: "inherit" }}>{opt}</span>
+          </button>
+        ))}
+        {q.type === "benar_salah" && ["Benar","Salah"].map((opt, i) => (
+          <button key={opt} onClick={() => setAnswers(a => ({ ...a, [currentQ]: i }))} className="flex-1 mr-2 py-3 rounded-xl font-bold transition" style={{ background: answers[currentQ] === i ? (i===0?"rgba(22,163,74,0.3)":"rgba(220,38,38,0.3)") : "rgba(30,41,59,0.6)", border: "2px solid " + (answers[currentQ] === i ? (i===0?"#16a34a":"#dc2626") : "rgba(59,130,246,0.1)"), color: "inherit", minWidth: 100 }}>{opt}</button>
+        ))}
+        {(q.type === "esai" || q.type === "uraian") && (
+          <textarea value={answers[currentQ] || ""} onChange={e => setAnswers(a => ({ ...a, [currentQ]: e.target.value }))} rows={6} placeholder="Tulis jawaban kamu..." className="w-full p-3 rounded-xl text-sm outline-none resize-none" style={{ background: "rgba(15,23,42,0.6)", border: "1px solid rgba(59,130,246,0.3)", color: "inherit" }} />
+        )}
+      </div>
+
+      <div className="flex items-center justify-between">
+        <Btn variant="secondary" onClick={() => setCurrentQ(c => Math.max(0,c-1))} disabled={currentQ===0}><ArrowLeft size={14} />Sebelumnya</Btn>
+        {currentQ === questions.length-1 ? (
+          <Btn variant="success" onClick={handleSubmit}><CheckCircle size={14} />Selesai</Btn>
+        ) : (
+          <Btn onClick={() => setCurrentQ(c => Math.min(questions.length-1,c+1))}>Selanjutnya<ChevronRight size={14} /></Btn>
+        )}
+      </div>
+      <div className="mt-3 h-2 rounded-full overflow-hidden" style={{ background: "rgba(51,65,85,0.4)" }}>
+        <div className="h-full rounded-full" style={{ width: (answeredCount/questions.length*100) + "%", background: "#8b5cf6" }} />
+      </div>
+    </div>
   );
 }
 
@@ -2137,18 +2548,47 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
     return () => document.removeEventListener("fullscreenchange", handler);
   }, [submitted, showToast]);
 
-  // Prevent copy/paste
+  // Comprehensive lockdown
   useEffect(() => {
     if (submitted) return;
     const prevent = e => e.preventDefault();
     const preventKeys = e => {
-      if ((e.ctrlKey || e.metaKey) && ["c","v","a","p","s","u"].includes(e.key.toLowerCase())) e.preventDefault();
-      if (e.key === "F12" || (e.ctrlKey && e.shiftKey)) e.preventDefault();
+      // Block all common cheating shortcuts
+      if ((e.ctrlKey || e.metaKey) && ["c","v","a","p","s","u","i","j","k","r","f","g","e","n","t","w"].includes(e.key.toLowerCase())) e.preventDefault();
+      if (e.key === "F12" || e.key === "F5" || e.key === "F11") e.preventDefault();
+      if ((e.ctrlKey && e.shiftKey) || (e.altKey && e.key === "Tab")) e.preventDefault();
+      if (e.key === "PrintScreen") { e.preventDefault(); setViolations(v => v + 1); }
     };
+    const preventDrag = e => e.preventDefault();
+    const preventSelect = e => e.preventDefault();
+    // Block devtools open via resize (heuristic)
+    const devtoolsCheck = () => {
+      const threshold = 160;
+      if (window.outerWidth - window.innerWidth > threshold || window.outerHeight - window.innerHeight > threshold) {
+        setViolations(v => v + 1);
+      }
+    };
+    const devInterval = setInterval(devtoolsCheck, 3000);
     document.addEventListener("contextmenu", prevent);
     document.addEventListener("copy", prevent);
+    document.addEventListener("cut", prevent);
+    document.addEventListener("paste", prevent);
     document.addEventListener("keydown", preventKeys);
-    return () => { document.removeEventListener("contextmenu", prevent); document.removeEventListener("copy", prevent); document.removeEventListener("keydown", preventKeys); };
+    document.addEventListener("dragstart", preventDrag);
+    document.addEventListener("selectstart", preventSelect);
+    // Block print
+    window.addEventListener("beforeprint", prevent);
+    return () => {
+      clearInterval(devInterval);
+      document.removeEventListener("contextmenu", prevent);
+      document.removeEventListener("copy", prevent);
+      document.removeEventListener("cut", prevent);
+      document.removeEventListener("paste", prevent);
+      document.removeEventListener("keydown", preventKeys);
+      document.removeEventListener("dragstart", preventDrag);
+      document.removeEventListener("selectstart", preventSelect);
+      window.removeEventListener("beforeprint", prevent);
+    };
   }, [submitted]);
 
   // Use refs for latest values to avoid stale closure in interval

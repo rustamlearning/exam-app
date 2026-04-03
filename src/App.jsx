@@ -664,8 +664,7 @@ function ImportDataModal({ type, onImport, onClose, showToast }) {
         text = result.value;
       }
 
-      const lines = text.split(/
-/).map(l => l.trim()).filter(Boolean);
+      const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
       const parsed = [];
 
       if (type === "students") {

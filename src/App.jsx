@@ -265,26 +265,28 @@ export default function ExamApp() {
   useEffect(() => { dataRef.current = data; }, [data]);
 
   const handleLogin = useCallback((credentials) => {
-    if (!data) return;
+    const currentData = dataRef.current || data;
+    if (!currentData) return;
     const { role, username, password } = credentials;
     let loggedUser = null;
     let nextView = "login";
+    const adminCred = currentData.meta?.admin || currentData.admin || {};
 
     if (role === "admin") {
-      if (username === data.admin.username && password === data.admin.password) {
+      if (username === adminCred.username && password === adminCred.password) {
         loggedUser = { role: "admin", name: "Administrator" };
         nextView = "admin";
         showToast("Login berhasil sebagai Admin");
       } else { showToast("Username atau password salah", "error"); return; }
     } else if (role === "guru") {
-      const guru = data.teachers.find(t => t.name.toLowerCase() === username.toLowerCase() && (t.password ? t.password === password : t.nip === password));
+      const guru = currentData.teachers.find(t => t.name.toLowerCase() === username.toLowerCase() && (t.password ? t.password === password : t.nip === password));
       if (guru) {
         loggedUser = { role: "guru", ...guru };
         nextView = "guru";
         showToast(`Selamat datang, ${guru.name}`);
       } else { showToast("Nama atau NIP/Password salah", "error"); return; }
     } else if (role === "siswa") {
-      const siswa = data.students.find(s => s.name.toLowerCase() === username.toLowerCase() && s.nisn === password);
+      const siswa = currentData.students.find(s => s.name.toLowerCase() === username.toLowerCase() && s.nisn === password);
       if (siswa) {
         loggedUser = { role: "siswa", ...siswa };
         nextView = "siswa";
@@ -1134,7 +1136,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
   const handleBulkImport = (importedQuestions) => {
     const latest = dataRef?.current || data;
     const questions = [...(latest.questions || []), ...importedQuestions.map(q => ({ id: genId(), ...q, type: q.type || "pilgan", createdBy: userId || "admin" }))];
-    saveData({ ...latest, questions });
+    saveData({ ...latest, questions }, ["questions"]);
     setShowImport(false);
     showToast(`${importedQuestions.length} soal berhasil diimpor`);
   };
@@ -2230,8 +2232,8 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
                         {r.submittedAt && <div className="text-slate-500 text-xs mt-0.5">{new Date(r.submittedAt).toLocaleString("id-ID")}</div>}
                       </div>
                       <div className="text-right">
-                        <span className="px-3 py-1 rounded-full text-lg font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
-                          {r.score.toFixed(1)}
+                        <span className="px-3 py-1 rounded-full text-lg font-bold" style={{ background: (r.score ?? 0) >= 75 ? "rgba(22,163,74,0.2)" : (r.score ?? 0) >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: (r.score ?? 0) >= 75 ? "#4ade80" : (r.score ?? 0) >= 50 ? "#fbbf24" : "#f87171" }}>
+                          {r.score !== null && r.score !== undefined ? r.score.toFixed(1) : "Perlu Dinilai"}
                         </span>
 
                       </div>
@@ -2625,7 +2627,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
 
       // Write sessions directly to avoid overwriting other data with stale state
       const nextData = { ...currentData, sessions };
-      saveData(nextData);
+      saveData(nextData, ["sessions"]);
     };
 
     saveSession(); // immediate on mount/answer change

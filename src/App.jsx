@@ -101,28 +101,32 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 
+// ============= GRANULAR STORE =============
+const COLS = ["meta","teachers","students","subjects","questions","exams","sessions","results"];
+
 const store = {
-  async get(key) {
+  async getCol(col) {
     try {
-      const snap = await getDoc(doc(db, "examapp", key));
+      const snap = await getDoc(doc(db, "examapp2", col));
       return snap.exists() ? snap.data().value : null;
-    } catch (e) { console.error("get error:", e); return null; }
+    } catch(e) { console.error("getCol", col, e); return null; }
   },
-  async set(key, val) {
-    // Validate: never write null/undefined or empty critical arrays
-    if (val === null || val === undefined) { console.warn("store.set: blocked null write for", key); return; }
-    try { await setDoc(doc(db, "examapp", key), { value: val }); }
-    catch (e) { console.error("set error:", e); }
+  async setCol(col, val) {
+    if (val === undefined) return;
+    try { await setDoc(doc(db, "examapp2", col), { value: val, ts: Date.now() }); }
+    catch(e) { console.error("setCol", col, e); throw e; }
   },
-  listen(key, callback) {
-    return onSnapshot(doc(db, "examapp", key), (snap) => {
-      if (snap.exists()) callback(snap.data().value, snap.metadata);
-    }, (err) => { console.error("snapshot error:", err); });
+  listenCol(col, cb) {
+    return onSnapshot(
+      doc(db, "examapp2", col),
+      snap => { if (snap.exists()) cb(snap.data().value, snap.metadata); },
+      err => console.error("listenCol", col, err)
+    );
   }
 };
 
 const DEFAULT_DATA = {
-  admin: { username: "admin", password: "admin123" },
+  meta: { admin: { username: "admin", password: "admin123" } },
   teachers: [], students: [], subjects: MAPEL_K13,
   questions: [], exams: [], sessions: [], results: [],
 };
@@ -168,118 +172,93 @@ export default function ExamApp() {
     setTimeout(() => setToast(null), 3500);
   }, []);
 
-  // Load data + real-time listener
+  const unsubsRef = useRef([]);
+  const writeTimesRef = useRef({});
+
   useEffect(() => {
-    let unsub = null;
     (async () => {
-      // 1. Load cached data immediately (instant UI)
+      // 1. Instant cache load
       const cached = ls.get(CACHE_KEY);
-      if (cached && Object.keys(cached).length > 4) {
-        const safe = safeMerge(DEFAULT_DATA, cached);
-        setData(safe);
+      if (cached && (cached.teachers || cached.questions || cached.exams)) {
+        setData({ ...DEFAULT_DATA, ...cached });
         setLoading(false);
       }
 
-      // 2. Load from Firebase
-      let d = null;
-      try { d = await store.get("examapp_data"); } catch (e) { console.error("Firebase load failed:", e); }
-
-      if (d && typeof d === "object" && Object.keys(d).length > 0) {
-        // Merge with cache to prevent data loss: keep the richer version per field
-        const localCache = ls.get(CACHE_KEY) || {};
-        const merged = safeMerge(safeMerge(DEFAULT_DATA, d), {});
-        // For critical arrays, keep whichever has more data
-        for (const key of ["teachers","students","questions","exams","sessions","results"]) {
-          const remote = d[key] || [];
-          const local = localCache[key] || [];
-          merged[key] = remote.length >= local.length ? remote : local;
-        }
-        if (!merged.subjects?.length) merged.subjects = MAPEL_K13;
-        setData(merged);
-        ls.set(CACHE_KEY, merged);
-        ls.set(BACKUP_KEY, merged); // secondary backup
-      } else {
-        // Firebase returned null/empty — use cache, don't overwrite with DEFAULT_DATA
-        const cache = ls.get(CACHE_KEY) || ls.get(BACKUP_KEY);
-        if (cache && Object.keys(cache).length > 4) {
-          const safe = safeMerge(DEFAULT_DATA, cache);
-          setData(safe);
-          // Restore to Firebase from cache
-          await store.set("examapp_data", safe);
-        } else {
-          // Truly first run
-          await store.set("examapp_data", DEFAULT_DATA);
-          setData(DEFAULT_DATA);
-        }
-      }
-      setLoading(false);
-
-      // 3. Restore user session from localStorage
-      const savedSession = ls.get(SESSION_KEY);
-      if (savedSession?.user && savedSession?.view && savedSession.view !== "login") {
-        setUser(savedSession.user);
-        setView(savedSession.view);
-      }
-
-      // 4. Real-time sync listener — with data-loss protection
-      unsub = store.listen("examapp_data", (remoteData, meta) => {
-        if (!remoteData || typeof remoteData !== "object") return;
-        if (meta.hasPendingWrites) return;
-        if (Date.now() - lastSaveRef.current < 3000) return;
-        setData(prev => {
-          if (!prev) return prev;
-          // Merge: never replace longer arrays with shorter ones
-          const merged = { ...prev };
-          for (const key of Object.keys(remoteData)) {
-            const rv = remoteData[key];
-            const pv = prev[key];
-            if (Array.isArray(pv) && Array.isArray(rv) && pv.length > 0 && rv.length === 0) {
-              // Keep local — remote is empty but local has data
-              continue;
-            }
-            merged[key] = rv;
+      // 2. Load all collections in parallel
+      try {
+        const vals = await Promise.all(COLS.map(col => store.getCol(col)));
+        const d = {
+          meta: vals[0] || DEFAULT_DATA.meta,
+          teachers: vals[1] || [],
+          students: vals[2] || [],
+          subjects: vals[3]?.length ? vals[3] : MAPEL_K13,
+          questions: vals[4] || [],
+          exams: vals[5] || [],
+          sessions: vals[6] || [],
+          results: vals[7] || [],
+        };
+        setData(d);
+        setLoading(false);
+        ls.set(CACHE_KEY, d);
+        ls.set(BACKUP_KEY, d);
+        COLS.forEach((col, i) => {
+          if (vals[i] === null) {
+            const def = col === "subjects" ? MAPEL_K13 : col === "meta" ? DEFAULT_DATA.meta : [];
+            store.setCol(col, def).catch(console.error);
           }
-          if (!merged.subjects?.length) merged.subjects = MAPEL_K13;
-          ls.set(CACHE_KEY, merged);
-          return merged;
         });
+      } catch(e) {
+        console.error("Load error:", e);
+        const backup = ls.get(BACKUP_KEY) || ls.get(CACHE_KEY);
+        if (backup) setData({ ...DEFAULT_DATA, ...backup });
+        setLoading(false);
+      }
+
+      // 3. Restore session
+      const sess = ls.get(SESSION_KEY);
+      if (sess?.user && sess?.view && sess.view !== "login") {
+        setUser(sess.user); setView(sess.view);
+      }
+
+      // 4. Per-collection realtime listeners
+      COLS.forEach(col => {
+        const u = store.listenCol(col, (val, meta) => {
+          if (val === null || val === undefined) return;
+          if (meta.hasPendingWrites) return;
+          if (Date.now() - (writeTimesRef.current[col] || 0) < 1500) return;
+          setData(prev => {
+            if (!prev) return prev;
+            const next = { ...prev, [col]: val };
+            ls.set(CACHE_KEY, next);
+            return next;
+          });
+        });
+        unsubsRef.current.push(u);
       });
     })();
-    return () => { if (unsub) unsub(); };
+    return () => { unsubsRef.current.forEach(u => u()); };
   }, []);
 
-  const saveQueue = useRef([]);
-  const isSaving = useRef(false);
-
-  const flushSave = useCallback(async () => {
-    if (isSaving.current || saveQueue.current.length === 0) return;
-    isSaving.current = true;
-    const latest = saveQueue.current[saveQueue.current.length - 1];
-    saveQueue.current = [];
-    try {
-      lastSaveRef.current = Date.now();
-      ls.set(CACHE_KEY, latest);
-      ls.set(BACKUP_KEY, latest);
-      await store.set("examapp_data", latest);
-    } catch (e) {
-      console.error("save failed, retrying:", e);
-      // Re-queue on failure
-      saveQueue.current.unshift(latest);
-      setTimeout(flushSave, 2000);
-    }
-    isSaving.current = false;
-    // Flush again if more items queued while we were saving
-    if (saveQueue.current.length > 0) flushSave();
-  }, []);
-
-  const saveData = useCallback(async (newData) => {
-    if (!newData || typeof newData !== "object") { console.error("saveData: invalid data"); return; }
-    // Optimistic UI update
+  const saveData = useCallback(async (newData, hints) => {
+    if (!newData) return;
     setData(newData);
-    // Queue the save (deduplicates rapid calls)
-    saveQueue.current.push(newData);
-    flushSave();
-  }, [flushSave]);
+    ls.set(CACHE_KEY, newData);
+    ls.set(BACKUP_KEY, newData);
+    const toSave = hints || COLS.filter(col => {
+      const prev = dataRef.current;
+      return newData[col] !== undefined && (!prev || JSON.stringify(newData[col]) !== JSON.stringify(prev[col]));
+    });
+    await Promise.all(toSave.map(async col => {
+      if (newData[col] === undefined) return;
+      writeTimesRef.current[col] = Date.now();
+      try { await store.setCol(col, newData[col]); }
+      catch(e) {
+        await new Promise(r => setTimeout(r, 1500));
+        store.setCol(col, newData[col]).catch(console.error);
+      }
+    }));
+  }, []);
+
 
   // Expose dataRef so ExamTaker can always access latest data
   const dataRef = useRef(null);
@@ -653,7 +632,7 @@ function TeacherManager({ data, dataRef, saveData, showToast }) {
       if (teachers.find(t => t.nip === form.nip)) return showToast("NIP sudah terdaftar", "error");
       teachers.push({ id: genId(), ...form });
     }
-    saveData({ ...latest, teachers });
+    saveData({ ...latest, teachers }, ["teachers"]);
     setShowModal(false);
     showToast(editId ? "Data guru diperbarui" : "Guru berhasil ditambahkan");
   };
@@ -661,7 +640,7 @@ function TeacherManager({ data, dataRef, saveData, showToast }) {
   const handleDelete = (id) => {
     if (!confirm("Hapus guru ini?")) return;
     const latest = dataRef?.current || data;
-    saveData({ ...latest, teachers: (latest.teachers || []).filter(t => t.id !== id) });
+    saveData({ ...latest, teachers: (latest.teachers || []).filter(t => t.id !== id) }, ["teachers"]);
     showToast("Guru dihapus");
   };
 
@@ -753,7 +732,7 @@ function StudentManager({ data, dataRef, saveData, showToast }) {
       if (students.find(s => s.nisn === form.nisn)) return showToast("NISN sudah terdaftar", "error");
       students.push({ id: genId(), ...form });
     }
-    saveData({ ...latest, students });
+    saveData({ ...latest, students }, ["students"]);
     setShowModal(false);
     showToast(editId ? "Data siswa diperbarui" : "Siswa berhasil ditambahkan");
   };
@@ -761,7 +740,7 @@ function StudentManager({ data, dataRef, saveData, showToast }) {
   const handleDelete = (id) => {
     if (!confirm("Hapus siswa ini?")) return;
     const latest = dataRef?.current || data;
-    saveData({ ...latest, students: (latest.students || []).filter(s => s.id !== id) });
+    saveData({ ...latest, students: (latest.students || []).filter(s => s.id !== id) }, ["students"]);
     showToast("Siswa dihapus");
   };
 
@@ -844,14 +823,14 @@ function SubjectManager({ data, saveData, showToast }) {
   const handleAdd = () => {
     if (!form.name.trim()) return showToast("Nama mapel wajib diisi", "error");
     const subjects = [...(data.subjects || []), { id: genId(), ...form }];
-    saveData({ ...data, subjects });
+    saveData({ ...data, subjects }, ["subjects"]);
     setShowModal(false); setForm({ name: "", category: "Wajib" });
     showToast("Mata pelajaran ditambahkan");
   };
 
   const handleDelete = (id) => {
     if (!confirm("Hapus mata pelajaran ini?")) return;
-    saveData({ ...data, subjects: (data.subjects || []).filter(s => s.id !== id) });
+    saveData({ ...data, subjects: (data.subjects || []).filter(s => s.id !== id) }, ["subjects"]);
     showToast("Mata pelajaran dihapus");
   };
 
@@ -867,7 +846,7 @@ function SubjectManager({ data, saveData, showToast }) {
             const merdeka = MAPEL_MERDEKA.filter(m => !(data.subjects || []).find(s => s.id === m.id));
             if (!merdeka.length) return showToast("Semua mapel Merdeka sudah ada", "warning");
             if (!confirm("Tambahkan " + merdeka.length + " mata pelajaran Kurikulum Merdeka?")) return;
-            saveData({ ...data, subjects: [...(data.subjects || []), ...merdeka] });
+            saveData({ ...data, subjects: [...(data.subjects || []), ...merdeka] }, ["subjects"]);
             showToast(merdeka.length + " mapel Kurikulum Merdeka ditambahkan");
           }}><BookOpen size={16} />+ Kurikulum Merdeka</Btn>
           <Btn onClick={() => setShowModal(true)}><Plus size={16} />Tambah Mapel</Btn>
@@ -947,7 +926,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     };
     if (editId) questions = questions.map(q => q.id === editId ? { ...q, ...qData } : q);
     else questions.push({ id: genId(), ...qData });
-    saveData({ ...latest, questions });
+    saveData({ ...latest, questions }, ["questions"]);
     setShowModal(false);
     showToast(editId ? "Soal diperbarui" : "Soal berhasil ditambahkan");
   };
@@ -955,7 +934,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
   const handleDelete = (id) => {
     if (!confirm("Hapus soal ini?")) return;
     const latest = dataRef?.current || data;
-    saveData({ ...latest, questions: (latest.questions || []).filter(q => q.id !== id) });
+    saveData({ ...latest, questions: (latest.questions || []).filter(q => q.id !== id) }, ["questions"]);
     showToast("Soal dihapus");
   };
 
@@ -1289,7 +1268,7 @@ function ExamManager({ data, dataRef, saveData, showToast, isAdmin, userId }) {
     const examData = { ...form, status: editId ? (exams.find(e => e.id === editId)?.status || "draft") : "draft", createdBy: userId || "admin" };
     if (editId) exams = exams.map(e => e.id === editId ? { ...e, ...examData } : e);
     else exams.push({ id: genId(), ...examData });
-    saveData({ ...latest, exams });
+    saveData({ ...latest, exams }, ["exams"]);
     setShowModal(false);
     showToast(editId ? "Ujian diperbarui" : "Ujian berhasil dibuat");
   };
@@ -1297,7 +1276,7 @@ function ExamManager({ data, dataRef, saveData, showToast, isAdmin, userId }) {
   const toggleStatus = (examId, newStatus) => {
     const latest = dataRef?.current || data;
     const exams = latest.exams.map(e => e.id === examId ? { ...e, status: newStatus } : e);
-    saveData({ ...latest, exams });
+    saveData({ ...latest, exams }, ["exams"]);
     showToast(`Ujian ${newStatus === "active" ? "diaktifkan" : newStatus === "ended" ? "diakhiri" : "di-draft-kan"}`);
   };
 
@@ -1305,7 +1284,7 @@ function ExamManager({ data, dataRef, saveData, showToast, isAdmin, userId }) {
     if (!confirm("Hapus ujian ini?")) return;
     const latest = dataRef?.current || data;
     const exams = latest.exams.filter(e => e.id !== id);
-    saveData({ ...latest, exams });
+    saveData({ ...latest, exams }, ["exams"]);
     showToast("Ujian dihapus");
   };
 
@@ -1797,11 +1776,12 @@ function SettingsView({ data, dataRef, saveData, showToast }) {
   const [pw, setPw] = useState({ old: "", new1: "", new2: "" });
   const handleChangePw = () => {
     const latest = dataRef?.current || data;
-    if (pw.old !== latest.admin.password) return showToast("Password lama salah", "error");
+    const adminCred2 = latest.meta?.admin || latest.admin || {};
+    if (pw.old !== adminCred2.password) return showToast("Password lama salah", "error");
     if (pw.new1.length < 4) return showToast("Password baru minimal 4 karakter", "error");
     if (pw.new1 !== pw.new2) return showToast("Konfirmasi password tidak cocok", "error");
-    // Only update admin field — preserve ALL other data
-    saveData({ ...latest, admin: { ...latest.admin, password: pw.new1 } });
+    const newMeta2 = { ...(latest.meta || {}), admin: { ...adminCred2, password: pw.new1 } };
+    saveData({ ...latest, meta: newMeta2 }, ["meta"]);
     setPw({ old: "", new1: "", new2: "" });
     showToast("Password admin berhasil diubah");
   };
@@ -1830,7 +1810,7 @@ function SettingsView({ data, dataRef, saveData, showToast }) {
       <Card>
         <h3 className="text-red-400 font-bold mb-2">Zona Bahaya</h3>
         <p className="text-sm mb-3" style={{ color: "inherit", opacity: 0.7 }}>Reset seluruh data ke kondisi awal. Tidak dapat dibatalkan.</p>
-        <Btn variant="danger" onClick={() => { if (!confirm("PERINGATAN: Ini akan menghapus SEMUA data!")) return; if (!confirm("Yakin benar-benar ingin reset?")) return; saveData(DEFAULT_DATA); showToast("Data telah direset"); }}><AlertTriangle size={14} />Reset Semua Data</Btn>
+        <Btn variant="danger" onClick={() => { if (!confirm("PERINGATAN: Ini akan menghapus SEMUA data!")) return; if (!confirm("Yakin benar-benar ingin reset?")) return; saveData(DEFAULT_DATA, COLS); showToast("Data telah direset"); }}><AlertTriangle size={14} />Reset Semua Data</Btn>
       </Card>
     </div>
   );
@@ -1891,7 +1871,7 @@ function TeacherProfile({ data, saveData, user, showToast, updateUserSession }) 
     if (pw.new1.length < 4) return showToast("Password baru minimal 4 karakter", "error");
     if (pw.new1 !== pw.new2) return showToast("Konfirmasi tidak cocok", "error");
     const teachers = data.teachers.map(t => t.id === user.id ? { ...t, password: pw.new1 } : t);
-    saveData({ ...data, teachers });
+    saveData({ ...data, teachers }, ["teachers"]);
     const updatedUser = { ...user, password: pw.new1 };
     updateUserSession(updatedUser);
     setPw({ old: "", new1: "", new2: "" });
@@ -1900,7 +1880,7 @@ function TeacherProfile({ data, saveData, user, showToast, updateUserSession }) 
 
   const handleSavePhoto = () => {
     const teachers = data.teachers.map(t => t.id === user.id ? { ...t, photo } : t);
-    saveData({ ...data, teachers });
+    saveData({ ...data, teachers }, ["teachers"]);
     updateUserSession({ ...user, photo });
     showToast("Foto profil disimpan");
   };
@@ -2059,7 +2039,7 @@ function StudentProfile({ data, saveData, user, showToast, updateUserSession }) 
 
   const handleSavePhoto = () => {
     const students = data.students.map(s => s.id === user.id ? { ...s, photo } : s);
-    saveData({ ...data, students });
+    saveData({ ...data, students }, ["students"]);
     updateUserSession({ ...user, photo });
     showToast("Foto profil disimpan");
   };
@@ -2233,7 +2213,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
         };
         if (idx >= 0) sessions[idx] = { ...sessions[idx], ...sessionData };
         else sessions.push({ id: genId(), ...sessionData });
-        saveData({ ...currentData, sessions });
+        saveData({ ...currentData, sessions }, ["sessions"]);
       }
     }, 800);
     return () => clearTimeout(t);
@@ -2269,7 +2249,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
     const currentData = dataRef?.current || data;
     const results = [...(currentData.results || []).filter(r => !(r.examId === exam.id && r.studentId === user.id)), resultData];
     const sessions = (currentData.sessions || []).map(s => s.examId === exam.id && s.studentId === user.id ? { ...s, status: "submitted" } : s);
-    saveData({ ...currentData, results, sessions });
+    saveData({ ...currentData, results, sessions }, ["results","sessions"]);
     showToast(auto ? "Waktu habis! Jawaban dikumpulkan otomatis." : "Jawaban berhasil dikumpulkan!");
   }, [questions, exam, user, data, saveData, showToast]);
 

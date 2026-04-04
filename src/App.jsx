@@ -2852,7 +2852,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
     return () => clearTimeout(t);
   }, [answers]);
 
-  const handleSubmit = useCallback((auto = false) => {
+  const handleSubmit = useCallback(async (auto = false) => {
     if (submittedRef.current) return;
     if (!auto && !confirm("Yakin ingin mengumpulkan jawaban? Tidak dapat diubah setelah ini.")) return;
     submittedRef.current = true;

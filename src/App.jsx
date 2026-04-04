@@ -1143,28 +1143,38 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
 
     try {
       const prompt = buildPrompt();
-      const models = ["gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash-8b"];
-      let res, json, lastErr;
-      for (const model of models) {
-        setLoadingMsg("Mencoba model " + model + "...");
-        res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: prompt }] }],
-              generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
-            }),
-          }
-        );
-        if (res.ok) { json = await res.json(); break; }
-        const err = await res.json();
-        lastErr = err?.error?.message || "Gagal";
-        if (!lastErr.includes("quota") && !lastErr.includes("RESOURCE_EXHAUSTED")) throw new Error(lastErr);
+      const models = [
+        { name: "gemini-2.0-flash-lite", ver: "v1beta" },
+        { name: "gemini-2.0-flash", ver: "v1beta" },
+        { name: "gemini-1.5-flash", ver: "v1beta" },
+        { name: "gemini-1.5-pro", ver: "v1beta" },
+      ];
+      let json = null;
+      for (const m of models) {
+        setLoadingMsg(`Mencoba ${m.name}...`);
+        try {
+          const res = await fetch(
+            `https://generativelanguage.googleapis.com/${m.ver}/models/${m.name}:generateContent?key=${geminiKey}`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
+              }),
+            }
+          );
+          if (res.ok) { json = await res.json(); break; }
+          const errBody = await res.json();
+          const msg = errBody?.error?.message || "";
+          console.warn(`${m.name} failed:`, msg);
+          // continue to next model for any error
+        } catch (e) {
+          console.warn(`${m.name} exception:`, e.message);
+        }
       }
       clearInterval(interval);
-      if (!json) throw new Error("Semua model Gemini sedang over quota. Coba lagi dalam beberapa menit.");
+      if (!json) throw new Error("Semua model Gemini gagal. Kemungkinan quota API Key habis. Coba buat API Key baru di aistudio.google.com/apikey");
 
       const raw = json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
       const cleaned = raw.replace(/```json|```/g, "").trim();

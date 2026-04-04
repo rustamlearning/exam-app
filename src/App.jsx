@@ -102,8 +102,10 @@ const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 
 // ============= GRANULAR STORE =============
-// Each collection is its own Firestore document → no race conditions
-const COLS = ["meta","teachers","students","subjects","questions","exams","sessions","results"];
+// sessions & results stored as individual docs to prevent race conditions
+// with 100+ concurrent students
+const COLS = ["meta","teachers","students","subjects","questions","exams"];
+const STATIC_COLS = ["meta","teachers","students","subjects","questions","exams"];
 
 const store = {
   async getCol(col) {
@@ -112,16 +114,10 @@ const store = {
       return snap.exists() ? snap.data().value : null;
     } catch(e) { console.error("getCol", col, e); return null; }
   },
-  // setCol: NEVER writes undefined/null; retries once on failure
   async setCol(col, val) {
-    if (val === undefined || val === null) return;
+    if (val === undefined) return;
     try { await setDoc(doc(db, "examapp2", col), { value: val, ts: Date.now() }); }
-    catch(e) {
-      console.error("setCol err, retry:", col, e);
-      await new Promise(r => setTimeout(r, 2000));
-      try { await setDoc(doc(db, "examapp2", col), { value: val, ts: Date.now() }); }
-      catch(e2) { console.error("setCol retry failed:", col, e2); }
-    }
+    catch(e) { console.error("setCol", col, e); throw e; }
   },
   listenCol(col, cb) {
     return onSnapshot(
@@ -129,13 +125,48 @@ const store = {
       snap => { if (snap.exists()) cb(snap.data().value, snap.metadata); },
       err => console.error("listenCol", col, err)
     );
+  },
+  // Per-student session: no race condition, each student writes own doc
+  sessionKey(examId, studentId) { return examId + "_" + studentId; },
+  async saveSession(examId, studentId, sessionData) {
+    const key = this.sessionKey(examId, studentId);
+    try { await setDoc(doc(db, "sessions2", key), { ...sessionData, _key: key, ts: Date.now() }); }
+    catch(e) { console.error("saveSession", e); throw e; }
+  },
+  listenSessions(examId, cb) {
+    // Listen to all sessions for an exam using a collection query pattern
+    // We listen to the examapp2/sessions_meta doc which stores session keys
+    return onSnapshot(doc(db, "examapp2", "sessions_" + examId),
+      snap => { if (snap.exists()) cb(snap.data().sessions || []); },
+      err => console.error("listenSessions", err)
+    );
+  },
+  async saveResult(examId, studentId, resultData) {
+    const key = examId + "_" + studentId;
+    try { await setDoc(doc(db, "results2", key), { ...resultData, _key: key, ts: Date.now() }); }
+    catch(e) { console.error("saveResult", e); throw e; }
+  },
+  async getResults(examId) {
+    // Get results index for this exam
+    try {
+      const snap = await getDoc(doc(db, "examapp2", "results_" + examId));
+      return snap.exists() ? (snap.data().results || []) : [];
+    } catch(e) { return []; }
+  },
+  listenResults(examId, cb) {
+    return onSnapshot(doc(db, "examapp2", "results_" + examId),
+      snap => { if (snap.exists()) cb(snap.data().results || []); },
+      err => console.error("listenResults", err)
+    );
   }
 };
 
 const DEFAULT_DATA = {
   meta: { admin: { username: "admin", password: "admin123" } },
   teachers: [], students: [], subjects: MAPEL_K13,
-  questions: [], exams: [], sessions: [], results: [],
+  questions: [], exams: [],
+  // sessions & results loaded per-exam to avoid race conditions
+  sessions: [], results: [],
 };
 
 // ============= MAIN APP =============
@@ -171,56 +202,43 @@ export default function ExamApp() {
     navText: isDark ? "#60a5fa" : "#1d4ed8",
     badge: isDark ? "rgba(51,65,85,0.8)" : "rgba(226,232,240,0.9)",
   };
+  const lastSaveRef = useRef(0);
+  const isWritingRef = useRef(false);
 
   const showToast = useCallback((msg, type = "success") => {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 3500);
   }, []);
 
-  // ── refs ────────────────────────────────────────────────────────────────────
-  // dataRef: always holds the latest data so closures never go stale
-  const dataRef = useRef(null);
-  useEffect(() => { dataRef.current = data; }, [data]);
-
   const unsubsRef = useRef([]);
-  const writeTimesRef = useRef({}); // col → timestamp of last local write
+  const writeTimesRef = useRef({});
 
-  // ── load + listeners ────────────────────────────────────────────────────────
   useEffect(() => {
-    let cancelled = false;
     (async () => {
-      // 1. Instant paint from localStorage cache
+      // 1. Instant cache load
       const cached = ls.get(CACHE_KEY);
-      if (cached && Object.keys(cached).length > 2) {
-        const merged = { ...DEFAULT_DATA, ...cached };
-        setData(merged);
-        dataRef.current = merged;
+      if (cached && (cached.teachers || cached.questions || cached.exams)) {
+        setData({ ...DEFAULT_DATA, ...cached });
         setLoading(false);
       }
 
-      // 2. Load all collections from Firestore in parallel
+      // 2. Load all collections in parallel
       try {
         const vals = await Promise.all(COLS.map(col => store.getCol(col)));
-        if (cancelled) return;
-        // Merge: prefer Firebase value; fall back to cache; never replace
-        // non-empty array with empty array (protects against transient nulls)
-        const cached2 = ls.get(CACHE_KEY) || {};
         const d = {
-          meta:      vals[0] || cached2.meta     || DEFAULT_DATA.meta,
-          teachers:  (vals[1]?.length  ? vals[1]  : null) ?? cached2.teachers  ?? [],
-          students:  (vals[2]?.length  ? vals[2]  : null) ?? cached2.students  ?? [],
-          subjects:  (vals[3]?.length  ? vals[3]  : null) ?? cached2.subjects  ?? MAPEL_K13,
-          questions: (vals[4]?.length  ? vals[4]  : null) ?? cached2.questions ?? [],
-          exams:     (vals[5]?.length  ? vals[5]  : null) ?? cached2.exams     ?? [],
-          sessions:  (vals[6]?.length  ? vals[6]  : null) ?? cached2.sessions  ?? [],
-          results:   (vals[7]?.length  ? vals[7]  : null) ?? cached2.results   ?? [],
+          meta: vals[0] || DEFAULT_DATA.meta,
+          teachers: vals[1] || [],
+          students: vals[2] || [],
+          subjects: vals[3]?.length ? vals[3] : MAPEL_K13,
+          questions: vals[4] || [],
+          exams: vals[5] || [],
+          sessions: vals[6] || [],
+          results: vals[7] || [],
         };
         setData(d);
-        dataRef.current = d;
         setLoading(false);
         ls.set(CACHE_KEY, d);
         ls.set(BACKUP_KEY, d);
-        // Initialise missing collections in Firestore
         COLS.forEach((col, i) => {
           if (vals[i] === null) {
             const def = col === "subjects" ? MAPEL_K13 : col === "meta" ? DEFAULT_DATA.meta : [];
@@ -229,31 +247,25 @@ export default function ExamApp() {
         });
       } catch(e) {
         console.error("Load error:", e);
-        if (cancelled) return;
         const backup = ls.get(BACKUP_KEY) || ls.get(CACHE_KEY);
-        if (backup) { setData({ ...DEFAULT_DATA, ...backup }); dataRef.current = { ...DEFAULT_DATA, ...backup }; }
+        if (backup) setData({ ...DEFAULT_DATA, ...backup });
         setLoading(false);
       }
 
-      // 3. Restore login session
+      // 3. Restore session
       const sess = ls.get(SESSION_KEY);
       if (sess?.user && sess?.view && sess.view !== "login") {
         setUser(sess.user); setView(sess.view);
       }
 
-      // 4. Realtime listeners — one per collection
+      // 4. Per-collection realtime listeners
       COLS.forEach(col => {
         const u = store.listenCol(col, (val, meta) => {
           if (val === null || val === undefined) return;
-          // Skip if we just wrote this collection ourselves (avoid echo)
           if (meta.hasPendingWrites) return;
-          if (Date.now() - (writeTimesRef.current[col] || 0) < 2000) return;
+          if (Date.now() - (writeTimesRef.current[col] || 0) < 1500) return;
           setData(prev => {
             if (!prev) return prev;
-            const prevVal = prev[col];
-            // SAFETY: never replace a non-empty array with an empty one from server
-            if (Array.isArray(prevVal) && prevVal.length > 0 &&
-                Array.isArray(val) && val.length === 0) return prev;
             const next = { ...prev, [col]: val };
             ls.set(CACHE_KEY, next);
             return next;
@@ -262,90 +274,55 @@ export default function ExamApp() {
         unsubsRef.current.push(u);
       });
     })();
-    return () => {
-      cancelled = true;
-      unsubsRef.current.forEach(u => u());
-      unsubsRef.current = [];
-    };
+    return () => { unsubsRef.current.forEach(u => u()); };
   }, []);
 
-  // ── saveData ─────────────────────────────────────────────────────────────────
-  // hints: array of collection names that actually changed (e.g. ["questions"])
-  // ALWAYS pass hints when you know what changed — it prevents full-data saves.
   const saveData = useCallback(async (newData, hints) => {
     if (!newData) return;
-
-    // ── Safety guards: never wipe existing non-empty collections ──────────────
-    const prev = dataRef.current;
-    if (prev) {
-      const safeNewData = { ...newData };
-      const protectedCols = ["questions","teachers","students","exams","results","subjects"];
-      for (const col of protectedCols) {
-        if (
-          Array.isArray(prev[col]) && prev[col].length > 0 &&
-          safeNewData[col] !== undefined &&
-          Array.isArray(safeNewData[col]) && safeNewData[col].length === 0 &&
-          !(hints || []).includes(col)
-        ) {
-          // Caller didn't explicitly say this col changed — restore from prev
-          console.warn("saveData: safety restored", col, "from prev");
-          safeNewData[col] = prev[col];
-        }
-      }
-      // Update newData reference to safe version
-      newData = safeNewData;
-    }
-
-    // Optimistic local update first (instant UI)
     setData(newData);
-    dataRef.current = newData;
     ls.set(CACHE_KEY, newData);
     ls.set(BACKUP_KEY, newData);
-
-    // Determine which collections to persist
-    const toSave = hints
-      ? hints.filter(col => newData[col] !== undefined)
-      : COLS.filter(col => {
-          if (newData[col] === undefined) return false;
-          if (!prev) return true;
-          return JSON.stringify(newData[col]) !== JSON.stringify(prev[col]);
-        });
-
-    // Write each changed collection independently
+    const toSave = hints || COLS.filter(col => {
+      const prev = dataRef.current;
+      return newData[col] !== undefined && (!prev || JSON.stringify(newData[col]) !== JSON.stringify(prev[col]));
+    });
     await Promise.all(toSave.map(async col => {
-      if (newData[col] === undefined || newData[col] === null) return;
+      if (newData[col] === undefined) return;
       writeTimesRef.current[col] = Date.now();
-      await store.setCol(col, newData[col]);
+      try { await store.setCol(col, newData[col]); }
+      catch(e) {
+        await new Promise(r => setTimeout(r, 1500));
+        store.setCol(col, newData[col]).catch(console.error);
+      }
     }));
   }, []);
 
+
+  // Expose dataRef so ExamTaker can always access latest data
+  const dataRef = useRef(null);
+  useEffect(() => { dataRef.current = data; }, [data]);
+
   const handleLogin = useCallback((credentials) => {
-    // Always use freshest data — critical for newly added teachers/students
-    const d = dataRef.current || data;
-    if (!d) return;
+    if (!data) return;
     const { role, username, password } = credentials;
     let loggedUser = null;
     let nextView = "login";
-    const adminCred = d.meta?.admin || { username: "admin", password: "admin123" };
 
     if (role === "admin") {
-      if (username === adminCred.username && password === adminCred.password) {
+      if (username === data.admin.username && password === data.admin.password) {
         loggedUser = { role: "admin", name: "Administrator" };
         nextView = "admin";
         showToast("Login berhasil sebagai Admin");
       } else { showToast("Username atau password salah", "error"); return; }
     } else if (role === "guru") {
-      const guru = (d.teachers || []).find(t =>
-        t.name.toLowerCase() === username.toLowerCase() &&
-        (t.password ? t.password === password : t.nip === password));
+      const guru = data.teachers.find(t => t.name.toLowerCase() === username.toLowerCase() && (t.password ? t.password === password : t.nip === password));
       if (guru) {
         loggedUser = { role: "guru", ...guru };
         nextView = "guru";
         showToast(`Selamat datang, ${guru.name}`);
       } else { showToast("Nama atau NIP/Password salah", "error"); return; }
     } else if (role === "siswa") {
-      const siswa = (d.students || []).find(s =>
-        s.name.toLowerCase() === username.toLowerCase() && s.nisn === password);
+      const siswa = data.students.find(s => s.name.toLowerCase() === username.toLowerCase() && s.nisn === password);
       if (siswa) {
         loggedUser = { role: "siswa", ...siswa };
         nextView = "siswa";
@@ -725,7 +702,8 @@ function ImportDataModal({ type, onImport, onClose, showToast }) {
         text = result.value;
       }
 
-      const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      const lines = text.split(/
+/).map(l => l.trim()).filter(Boolean);
       const parsed = [];
 
       if (type === "students") {
@@ -767,8 +745,11 @@ function ImportDataModal({ type, onImport, onClose, showToast }) {
   const isStudent = type === "students";
   const title = isStudent ? "Import Data Siswa" : "Import Data Guru";
   const template = isStudent
-    ? `Nama Lengkap,NISN,Kelas,Peminatan\nAhmad Fauzi,1234567890,XII-MIPA 1,MIPA\nSiti Rahayu,0987654321,XII-IPS 1,IPS`
-    : `Nama Lengkap,NIP,Email\nBudi Santoso,199001012020011001,budi@sman6.sch.id`;
+    ? "Nama Lengkap,NISN,Kelas,Peminatan
+Ahmad Fauzi,1234567890,XII-MIPA 1,MIPA
+Siti Rahayu,0987654321,XII-IPS 1,IPS"
+    : "Nama Lengkap,NIP,Email
+Budi Santoso,199001012020011001,budi@sman6.sch.id";
 
   const downloadTemplate = () => {
     const blob = new Blob([template], { type: "text/csv" });
@@ -1128,737 +1109,96 @@ function SubjectManager({ data, saveData, showToast }) {
   );
 }
 
-// ============= AI GENERATE MODAL (Groq only) =============
-function AIGenerateModal({ data, dataRef, saveData, showToast, userId, onClose }) {
-  const [step, setStep] = useState("form");
-  const [aiForm, setAiForm] = useState({
-    subjectId: (data.subjects || [])[0]?.id || "",
-    topic: "",
-    type: "pilgan",
-    count: 5,
-    difficulty: "sedang",
-    extra: "",
-  });
-  const [generated, setGenerated] = useState([]);
-  const [selected, setSelected] = useState([]);
-  const [loadingMsg, setLoadingMsg] = useState("");
+// ============= MATH SYMBOL HELPER =============
+const MATH_SYMBOLS = [
+  { label: "±", val: "±" }, { label: "×", val: "×" }, { label: "÷", val: "÷" },
+  { label: "≠", val: "≠" }, { label: "≤", val: "≤" }, { label: "≥", val: "≥" },
+  { label: "≈", val: "≈" }, { label: "∞", val: "∞" }, { label: "√", val: "√(" },
+  { label: "²", val: "²" }, { label: "³", val: "³" }, { label: "π", val: "π" },
+  { label: "∑", val: "∑" }, { label: "∫", val: "∫" }, { label: "∆", val: "∆" },
+  { label: "α", val: "α" }, { label: "β", val: "β" }, { label: "θ", val: "θ" },
+  { label: "λ", val: "λ }, { label: "μ", val: "μ" }, { label: "σ", val: "σ" },
+  { label: "∈", val: "∈" }, { label: "∉", val: "∉" }, { label: "⊂", val: "⊂" },
+  { label: "∪", val: "∪" }, { label: "∩", val: "∩" }, { label: "∅", val: "∅" },
+  { label: "→", val: "→" }, { label: "⟹", val: "⟹" }, { label: "⟺", val: "⟺" },
+  { label: "⁻¹", val: "⁻¹" }, { label: "½", val: "½" }, { label: "¼", val: "¼" },
+  { label: "¾", val: "¾" }, { label: "°", val: "°" }, { label: "|x|", val: "|" },
+];
 
-  const groqKey = data.meta?.groqKey || "";
+// Fraction input helper: [a/b] → renders as fraction
+function MathTextarea({ value, onChange, placeholder, rows = 4, textareaRef }) {
+  const [showPalette, setShowPalette] = useState(false);
+  const internalRef = useRef(null);
+  const ref = textareaRef || internalRef;
 
-  const getSubjectName = (id) => (data.subjects || []).find(s => s.id === id)?.name || "-";
-
-  const buildPrompt = () => {
-    const subjectName = getSubjectName(aiForm.subjectId);
-    const typeLabel = aiForm.type === "pilgan" ? "pilihan ganda (5 opsi A-E)"
-      : aiForm.type === "benar_salah" ? "benar/salah"
-      : "uraian singkat";
-    const diffLabel = {
-      mudah: "mudah (tingkat SMA kelas X)",
-      sedang: "sedang (tingkat SMA kelas XI)",
-      sulit: "sulit (tingkat SMA kelas XII / HOTS)"
-    }[aiForm.difficulty];
-    return `Kamu adalah guru SMA berpengalaman. Buat ${aiForm.count} soal ${typeLabel} mata pelajaran ${subjectName} materi "${aiForm.topic}" tingkat ${diffLabel}.${aiForm.extra ? " Catatan: " + aiForm.extra : ""}
-
-Kembalikan HANYA array JSON valid, tanpa teks lain, tanpa markdown.
-
-Format:
-${aiForm.type === "pilgan" ? `[{"text":"Pertanyaan?","type":"pilgan","options":["A","B","C","D","E"],"correctAnswer":0,"explanation":"Pembahasan."}]`
-: aiForm.type === "benar_salah" ? `[{"text":"Pernyataan.","type":"benar_salah","options":["Benar","Salah"],"correctAnswer":0,"explanation":"Pembahasan."}]`
-: `[{"text":"Pertanyaan uraian?","type":"uraian","options":[],"correctAnswer":0,"explanation":"Kunci jawaban."}]`}
-
-Buat tepat ${aiForm.count} soal bervariasi sesuai kurikulum K-13/Merdeka.`;
+  const insertSymbol = (sym) => {
+    const el = ref.current;
+    if (!el) { onChange(value + sym); return; }
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    const newVal = value.substring(0, start) + sym + value.substring(end);
+    onChange(newVal);
+    setTimeout(() => {
+      el.focus();
+      el.setSelectionRange(start + sym.length, start + sym.length);
+    }, 0);
   };
 
-  const handleGenerate = async () => {
-    if (!groqKey) return showToast("API Key Groq belum diatur. Minta admin mengatur di Pengaturan → Integrasi AI.", "error");
-    if (!aiForm.topic.trim()) return showToast("Isi topik/materi terlebih dahulu", "error");
-    if (!aiForm.subjectId) return showToast("Pilih mata pelajaran", "error");
-
-    setStep("loading");
-    const msgs = [
-      "Menghubungi Groq AI...",
-      "Menganalisis materi " + aiForm.topic + "...",
-      "Menyusun soal dan kunci jawaban...",
-      "Memvalidasi hasil...",
-    ];
-    let mi = 0;
-    setLoadingMsg(msgs[0]);
-    const interval = setInterval(() => { mi = (mi + 1) % msgs.length; setLoadingMsg(msgs[mi]); }, 2000);
-
-    try {
-      const prompt = buildPrompt();
-      const groqModels = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"];
-      let raw = null;
-      const errorLog = [];
-
-      for (const model of groqModels) {
-        setLoadingMsg(`Groq AI (${model.split("-")[0]})...`);
-        try {
-          const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${groqKey}` },
-            body: JSON.stringify({
-              model,
-              messages: [{ role: "user", content: prompt }],
-              temperature: 0.7,
-              max_tokens: 8192,
-            }),
-          });
-          if (res.ok) {
-            const d = await res.json();
-            const text = d?.choices?.[0]?.message?.content || "";
-            const clean = text.replace(/```json|```/g, "").trim();
-            const si = clean.indexOf("["), ei = clean.lastIndexOf("]");
-            if (si !== -1 && ei !== -1) { raw = clean.slice(si, ei + 1); break; }
-          } else {
-            const err = await res.json();
-            errorLog.push(`${model}: ${(err?.error?.message || "").slice(0, 80)}`);
-          }
-        } catch (e) { errorLog.push(`${model}: ${e.message.slice(0, 80)}`); }
-      }
-
-      clearInterval(interval);
-      if (!raw) throw new Error("Semua model Groq gagal:\n" + errorLog.join("\n"));
-
-      const parsed = JSON.parse(raw);
-      if (!Array.isArray(parsed) || parsed.length === 0) throw new Error("Tidak ada soal yang dihasilkan");
-
-      const withMeta = parsed.map((q, i) => ({
-        ...q,
-        subjectId: aiForm.subjectId,
-        type: q.type || aiForm.type,
-        options: q.options || [],
-        correctAnswer: typeof q.correctAnswer === "number" ? q.correctAnswer : 0,
-        explanation: q.explanation || "",
-        _tempId: "ai_" + Date.now() + "_" + i,
-      }));
-      setGenerated(withMeta);
-      setSelected(withMeta.map(q => q._tempId));
-      setStep("preview");
-    } catch (e) {
-      clearInterval(interval);
-      showToast("Gagal generate soal: " + e.message, "error");
-      setStep("form");
+  const handleKeyboard = (e) => {
+    // Quick shortcuts: / for fraction helper
+    if (e.key === "/" && e.altKey) {
+      e.preventDefault();
+      const el = ref.current;
+      const start = el?.selectionStart || 0;
+      const sel = value.substring(el?.selectionStart || 0, el?.selectionEnd || 0);
+      const frac = sel ? `(${sel})/()` : "()/()";
+      insertSymbol(frac);
     }
   };
 
-  const handleSave = () => {
-    const toSave = generated.filter(q => selected.includes(q._tempId));
-    if (!toSave.length) return showToast("Pilih minimal 1 soal", "error");
-    const latest = dataRef?.current || data;
-    const clean = toSave.map(({ _tempId, ...q }) => ({
-      id: "q" + Date.now() + Math.random().toString(36).slice(2, 6),
-      ...q,
-      createdBy: userId || "admin"
-    }));
-    saveData({ ...latest, questions: [...(latest.questions || []), ...clean] }, ["questions"]);
-    showToast(`${clean.length} soal berhasil ditambahkan ke bank soal!`);
-    onClose();
-  };
-
-  const typeColors = {
-    pilgan: { bg: "rgba(59,130,246,0.2)", color: "#60a5fa" },
-    benar_salah: { bg: "rgba(234,179,8,0.2)", color: "#fbbf24" },
-    uraian: { bg: "rgba(20,184,166,0.2)", color: "#2dd4bf" },
-  };
-
-  return (
-    <Modal title="✨ Generate Soal dengan AI (Groq)" onClose={onClose} wide>
-      {!groqKey && (
-        <div className="mb-4 p-3 rounded-xl flex items-start gap-2" style={{ background: "rgba(234,179,8,0.1)", border: "1px solid rgba(234,179,8,0.3)" }}>
-          <AlertTriangle size={16} className="text-amber-400 mt-0.5 shrink-0" />
-          <p className="text-amber-300 text-sm">
-            Groq API Key belum diatur. Admin perlu menambahkan key gratis di menu{" "}
-            <strong>Pengaturan → Integrasi AI</strong>. Daftar gratis di{" "}
-            <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" className="underline">console.groq.com</a>
-          </p>
-        </div>
-      )}
-
-      {step === "form" && (
-        <div className="space-y-4">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Mata Pelajaran</label>
-              <select value={aiForm.subjectId} onChange={e => setAiForm({ ...aiForm, subjectId: e.target.value })} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }}>
-                {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Tipe Soal</label>
-              <select value={aiForm.type} onChange={e => setAiForm({ ...aiForm, type: e.target.value })} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }}>
-                <option value="pilgan">Pilihan Ganda</option>
-                <option value="benar_salah">Benar / Salah</option>
-                <option value="uraian">Uraian</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Jumlah Soal</label>
-              <select value={aiForm.count} onChange={e => setAiForm({ ...aiForm, count: Number(e.target.value) })} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }}>
-                {[3,5,10,15,20].map(n => <option key={n} value={n}>{n} soal</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Tingkat Kesulitan</label>
-              <select value={aiForm.difficulty} onChange={e => setAiForm({ ...aiForm, difficulty: e.target.value })} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }}>
-                <option value="mudah">Mudah (C1-C2)</option>
-                <option value="sedang">Sedang (C3-C4)</option>
-                <option value="sulit">Sulit / HOTS (C5-C6)</option>
-              </select>
-            </div>
-          </div>
-          <div>
-            <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Topik / Materi <span className="text-red-400">*</span></label>
-            <input value={aiForm.topic} onChange={e => setAiForm({ ...aiForm, topic: e.target.value })} onKeyDown={e => e.key === "Enter" && handleGenerate()} placeholder="Contoh: Sel dan Organel, Hukum Newton, Teks Narasi..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
-          </div>
-          <div>
-            <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Instruksi Tambahan (opsional)</label>
-            <textarea value={aiForm.extra} onChange={e => setAiForm({ ...aiForm, extra: e.target.value })} rows={2} placeholder="Contoh: Fokus pada aplikasi, konteks Indonesia..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
-          </div>
-          <div className="flex justify-end gap-2">
-            <Btn variant="secondary" onClick={onClose}>Batal</Btn>
-            <Btn onClick={handleGenerate} disabled={!groqKey}>
-              <span>✨</span> Generate {aiForm.count} Soal
-            </Btn>
-          </div>
-        </div>
-      )}
-
-      {step === "loading" && (
-        <div className="flex flex-col items-center justify-center py-12 gap-4">
-          <div className="w-12 h-12 rounded-full border-4 border-blue-500 border-t-transparent" style={{ animation: "spin 1s linear infinite" }} />
-          <p className="text-blue-300 text-sm font-medium">{loadingMsg}</p>
-          <p className="text-slate-500 text-xs">Groq AI sedang menyusun soal...</p>
-          <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
-        </div>
-      )}
-
-      {step === "preview" && (
-        <div>
-          <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-            <p className="text-sm" style={{ color: "inherit", opacity: 0.8 }}>
-              <span className="text-green-400 font-bold">{generated.length} soal</span> berhasil digenerate. Pilih yang ingin disimpan:
-            </p>
-            <div className="flex gap-2">
-              <button onClick={() => setSelected(generated.map(q => q._tempId))} className="text-xs text-blue-400 underline">Pilih Semua</button>
-              <button onClick={() => setSelected([])} className="text-xs text-slate-400 underline">Batal Semua</button>
-            </div>
-          </div>
-          <div className="space-y-3 max-h-[50vh] overflow-y-auto pr-1 mb-4">
-            {generated.map((q, i) => {
-              const isSelected = selected.includes(q._tempId);
-              const tc = typeColors[q.type] || typeColors.pilgan;
-              return (
-                <div key={q._tempId} onClick={() => setSelected(s => s.includes(q._tempId) ? s.filter(x => x !== q._tempId) : [...s, q._tempId])} className="p-3 rounded-xl cursor-pointer transition" style={{ background: isSelected ? "rgba(22,163,74,0.1)" : "rgba(15,23,42,0.5)", border: `1px solid ${isSelected ? "rgba(22,163,74,0.4)" : "rgba(59,130,246,0.15)"}` }}>
-                  <div className="flex items-start gap-2">
-                    <div className="w-5 h-5 rounded shrink-0 mt-0.5 flex items-center justify-center" style={{ background: isSelected ? "#16a34a" : "rgba(51,65,85,0.6)" }}>
-                      {isSelected && <CheckCircle size={14} className="text-white" />}
-                    </div>
-                    <div className="flex-1">
-                      <div className="flex gap-2 mb-1 flex-wrap">
-                        <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: tc.bg, color: tc.color }}>{q.type === "pilgan" ? "Pilihan Ganda" : q.type === "benar_salah" ? "Benar/Salah" : "Uraian"}</span>
-                        <span className="text-xs text-slate-400">#{i + 1}</span>
-                      </div>
-                      <p className="text-sm mb-2" style={{ color: "inherit" }}><MathText text={q.text} /></p>
-                      {q.type === "pilgan" && q.options?.length > 0 && (
-                        <div className="space-y-0.5 mb-1">
-                          {q.options.map((opt, oi) => (
-                            <div key={oi} className="flex items-center gap-1.5 text-xs" style={{ color: oi === q.correctAnswer ? "#4ade80" : "#94a3b8" }}>
-                              <span>{oi === q.correctAnswer ? "✓" : "○"}</span>
-                              <span>{String.fromCharCode(65+oi)}. {opt}</span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                      {q.explanation && <p className="text-xs text-blue-300 mt-1">💡 {q.explanation.substring(0,120)}</p>}
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-          <div className="flex justify-end gap-2">
-            <Btn variant="secondary" onClick={() => setStep("form")}><ArrowLeft size={14} />Kembali</Btn>
-            <Btn variant="success" onClick={handleSave} disabled={selected.length === 0}>
-              <Save size={14} />Simpan {selected.length} Soal ke Bank Soal
-            </Btn>
-          </div>
-        </div>
-      )}
-    </Modal>
-  );
-}
-
-// ============================================================
-// ============= SCIENCE EDITOR SYSTEM ========================
-// ============================================================
-let _katexLoaded = false;
-function loadKaTeX() {
-  if (_katexLoaded) return Promise.resolve();
-  return new Promise(resolve => {
-    if (document.getElementById("katex-css")) { _katexLoaded = true; resolve(); return; }
-    const link = document.createElement("link");
-    link.id = "katex-css"; link.rel = "stylesheet";
-    link.href = "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css";
-    document.head.appendChild(link);
-    const s = document.createElement("script");
-    s.src = "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js";
-    s.onload = () => {
-      const s2 = document.createElement("script");
-      s2.src = "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/mhchem.min.js";
-      s2.onload = () => { _katexLoaded = true; resolve(); };
-      s2.onerror = () => { _katexLoaded = true; resolve(); };
-      document.head.appendChild(s2);
-    };
-    document.head.appendChild(s);
-  });
-}
-
-function MathText({ text, className = "" }) {
-  const ref = useRef(null);
-  useEffect(() => {
-    if (!ref.current || !text) return;
-    loadKaTeX().then(() => {
-      if (!ref.current || !window.katex) return;
-      try {
-        let html = text.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-        html = html.replace(/\$\$(.+?)\$\$/gs, (_, e) => {
-          try { return window.katex.renderToString(e.trim(), { displayMode:true, throwOnError:false, trust:true }); }
-          catch { return `<code style="color:#f87171">$$${e}$$</code>`; }
-        });
-        html = html.replace(/\$(.+?)\$/g, (_, e) => {
-          try { return window.katex.renderToString(e.trim(), { displayMode:false, throwOnError:false, trust:true }); }
-          catch { return `<code style="color:#f87171">$${e}$</code>`; }
-        });
-        html = html.replace(/\n/g,"<br/>");
-        ref.current.innerHTML = html;
-      } catch { ref.current.textContent = text; }
-    });
-  }, [text]);
-  return <span ref={ref} className={className}>{text}</span>;
-}
-
-// Symbol groups
-const SCI_SYMBOLS = {
-  "Matematika": [
-    {l:"Pecahan",k:"\\frac{a}{b}"},{l:"Akar",k:"\\sqrt{x}"},{l:"Akar n",k:"\\sqrt[n]{x}"},
-    {l:"Pangkat",k:"x^{2}"},{l:"Indeks",k:"x_{i}"},{l:"±",k:"\\pm"},{l:"×",k:"\\times"},
-    {l:"÷",k:"\\div"},{l:"≠",k:"\\neq"},{l:"≈",k:"\\approx"},{l:"≡",k:"\\equiv"},
-    {l:"≤",k:"\\leq"},{l:"≥",k:"\\geq"},{l:"∞",k:"\\infty"},{l:"∝",k:"\\propto"},
-    {l:"sin",k:"\\sin(x)"},{l:"cos",k:"\\cos(x)"},{l:"tan",k:"\\tan(x)"},
-    {l:"log",k:"\\log_{a}(x)"},{l:"ln",k:"\\ln(x)"},{l:"|x|",k:"\\left|x\\right|"},
-  ],
-  "Kalkulus": [
-    {l:"Integral",k:"\\int_{a}^{b} f(x)\\,dx"},{l:"Integral 2",k:"\\iint"},
-    {l:"Sigma",k:"\\sum_{i=1}^{n} x_i"},{l:"Produk",k:"\\prod_{i=1}^{n}"},
-    {l:"Limit",k:"\\lim_{x \\to 0}"},{l:"d/dx",k:"\\frac{d}{dx}"},
-    {l:"∂/∂x",k:"\\frac{\\partial f}{\\partial x}"},{l:"∇",k:"\\nabla"},
-    {l:"Δ",k:"\\Delta"},{l:"∮",k:"\\oint"},
-  ],
-  "Huruf Yunani": [
-    {l:"α",k:"\\alpha"},{l:"β",k:"\\beta"},{l:"γ",k:"\\gamma"},{l:"δ",k:"\\delta"},
-    {l:"ε",k:"\\epsilon"},{l:"θ",k:"\\theta"},{l:"λ",k:"\\lambda"},{l:"μ",k:"\\mu"},
-    {l:"π",k:"\\pi"},{l:"σ",k:"\\sigma"},{l:"τ",k:"\\tau"},{l:"φ",k:"\\phi"},
-    {l:"ω",k:"\\omega"},{l:"Δ",k:"\\Delta"},{l:"Σ",k:"\\Sigma"},{l:"Ω",k:"\\Omega"},
-    {l:"Π",k:"\\Pi"},{l:"Γ",k:"\\Gamma"},{l:"Λ",k:"\\Lambda"},{l:"Θ",k:"\\Theta"},
-  ],
-  "Himpunan & Logika": [
-    {l:"∈",k:"\\in"},{l:"∉",k:"\\notin"},{l:"⊂",k:"\\subset"},{l:"⊆",k:"\\subseteq"},
-    {l:"∪",k:"\\cup"},{l:"∩",k:"\\cap"},{l:"∅",k:"\\emptyset"},{l:"∀",k:"\\forall"},
-    {l:"∃",k:"\\exists"},{l:"¬",k:"\\neg"},{l:"∧",k:"\\wedge"},{l:"∨",k:"\\vee"},
-    {l:"→",k:"\\rightarrow"},{l:"⟺",k:"\\Leftrightarrow"},
-  ],
-  "Geometri": [
-    {l:"°",k:"^{\\circ}"},{l:"∠",k:"\\angle"},{l:"△",k:"\\triangle"},
-    {l:"⊥",k:"\\perp"},{l:"∥",k:"\\parallel"},{l:"≅",k:"\\cong"},{l:"∼",k:"\\sim"},
-    {l:"Vektor",k:"\\vec{v}"},{l:"Topi",k:"\\hat{u}"},{l:"|v|",k:"\\left|\\vec{v}\\right|"},
-    {l:"Busur",k:"\\overset{\\frown}{AB}"},
-  ],
-  "Fisika": [
-    {l:"F=ma",k:"F = ma"},{l:"E=mc²",k:"E = mc^2"},{l:"½mv²",k:"\\frac{1}{2}mv^2"},
-    {l:"Grav",k:"F = G\\frac{m_1 m_2}{r^2}"},{l:"Ohm",k:"V = IR"},
-    {l:"λ=v/f",k:"\\lambda = \\frac{v}{f}"},{l:"ρ",k:"\\rho"},{l:"ℏ",k:"\\hbar"},
-    {l:"E=hf",k:"E = hf"},{l:"μ₀",k:"\\mu_0"},{l:"ε₀",k:"\\varepsilon_0"},
-    {l:"∇×B",k:"\\nabla \\times \\vec{B}"},{l:"τ=r×F",k:"\\tau = \\vec{r} \\times \\vec{F}"},
-    {l:"Impuls",k:"J = F\\Delta t"},{l:"∮",k:"\\oint"},
-  ],
-  "Matriks": [
-    {l:"2×2",k:"\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}"},
-    {l:"Det",k:"\\begin{vmatrix} a & b \\\\ c & d \\end{vmatrix}"},
-    {l:"3×3",k:"\\begin{pmatrix} a & b & c \\\\ d & e & f \\\\ g & h & i \\end{pmatrix}"},
-    {l:"Identitas",k:"I = \\begin{pmatrix} 1 & 0 \\\\ 0 & 1 \\end{pmatrix}"},
-    {l:"Transpose",k:"A^{T}"},{l:"Invers",k:"A^{-1}"},
-  ],
-};
-
-const CHEM_SNIPPETS = [
-  {l:"→ Reaksi",k:"\\ce{A -> B}"},{l:"⇌ Setimbang",k:"\\ce{A <=> B}"},
-  {l:"H₂O",k:"\\ce{H2O}"},{l:"CO₂",k:"\\ce{CO2}"},{l:"H₂SO₄",k:"\\ce{H2SO4}"},
-  {l:"NaOH",k:"\\ce{NaOH}"},{l:"NH₃",k:"\\ce{NH3}"},{l:"HCl",k:"\\ce{HCl}"},
-  {l:"Ion+",k:"\\ce{Na+}"},{l:"Ion-",k:"\\ce{Cl-}"},{l:"Elektron",k:"\\ce{e-}"},
-  {l:"Endapan↓",k:"\\ce{BaSO4 v}"},{l:"Gas↑",k:"\\ce{H2 ^}"},
-  {l:"Pembakaran",k:"\\ce{CH4 + 2O2 -> CO2 + 2H2O}"},
-  {l:"Asam-Basa",k:"\\ce{HCl + NaOH -> NaCl + H2O}"},
-  {l:"Redoks",k:"\\ce{Zn + CuSO4 -> ZnSO4 + Cu}"},
-  {l:"Fotosintesis",k:"\\ce{6CO2 + 6H2O ->[$h\\nu$] C6H12O6 + 6O2}"},
-  {l:"Respirasi",k:"\\ce{C6H12O6 + 6O2 -> 6CO2 + 6H2O + ATP}"},
-  {l:"Hidrat",k:"\\ce{CuSO4.5H2O}"},{l:"Kondisi Δ",k:"\\ce{A ->[$\\Delta$] B}"},
-];
-
-function ScienceEditorModal({ value, onInsert, onClose, geminiKey }) {
-  const [tab, setTab] = useState("equation");
-  const [latex, setLatex] = useState(value || "");
-  const [symGroup, setSymGroup] = useState("Matematika");
-  const [ocr, setOcr] = useState({ loading: false, result: "" });
-  const canvasRef = useRef(null);
-  const isDrawing = useRef(false);
-  const lastPos = useRef({x:0,y:0});
-  const textareaRef = useRef(null);
-
-  const insertToEditor = (code, wrapDollar = true) => {
-    const el = textareaRef.current;
-    const ins = wrapDollar ? ` $${code}$ ` : code;
-    if (!el) { setLatex(v => v + ins); return; }
-    const s = el.selectionStart, e = el.selectionEnd;
-    const nv = latex.slice(0,s) + ins + latex.slice(e);
-    setLatex(nv);
-    setTimeout(() => { el.focus(); el.setSelectionRange(s+ins.length, s+ins.length); }, 0);
-  };
-
-  const getPos = (e, canvas) => {
-    const r = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / r.width;
-    const scaleY = canvas.height / r.height;
-    const src = e.touches?.[0] ?? e;
-    return { x:(src.clientX - r.left)*scaleX, y:(src.clientY - r.top)*scaleY };
-  };
-  const startDraw = (e) => {
-    const c = canvasRef.current; if (!c) return;
-    isDrawing.current = true;
-    lastPos.current = getPos(e, c);
-  };
-  const draw = (e) => {
-    if (!isDrawing.current) return;
-    e.preventDefault();
-    const c = canvasRef.current; if (!c) return;
-    const pos = getPos(e, c);
-    const ctx = c.getContext("2d");
-    ctx.beginPath();
-    ctx.lineWidth = 3; ctx.lineCap = "round"; ctx.lineJoin = "round";
-    ctx.strokeStyle = "#93c5fd";
-    ctx.moveTo(lastPos.current.x, lastPos.current.y);
-    ctx.lineTo(pos.x, pos.y);
-    ctx.stroke();
-    lastPos.current = pos;
-  };
-  const stopDraw = () => { isDrawing.current = false; };
-  const clearCanvas = () => {
-    const c = canvasRef.current; if (!c) return;
-    c.getContext("2d").clearRect(0,0,c.width,c.height);
-    setOcr({ loading:false, result:"" });
-  };
-  const runOCR = async () => {
-    const c = canvasRef.current; if (!c) return;
-    if (!geminiKey) { setOcr({ loading:false, result:"⚠️ Fitur OCR memerlukan Gemini API Key. Silakan tambahkan di Pengaturan Admin → Integrasi AI, atau ketik LaTeX manual." }); return; }
-    setOcr({ loading:true, result:"" });
-    try {
-      const b64 = c.toDataURL("image/png").split(",")[1];
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`,
-        { method:"POST", headers:{"Content-Type":"application/json"},
-          body: JSON.stringify({ contents:[{ parts:[
-            { inline_data:{ mime_type:"image/png", data:b64 }},
-            { text:"Kenali tulisan tangan matematika/fisika/kimia ini. Kembalikan HANYA kode LaTeX tanpa penjelasan, tanpa tanda $ pembungkus. Contoh output: \\frac{x^2-4}{x+2} atau \\ce{H2O}" }
-          ]}]})
-        }
-      );
-      const d = await res.json();
-      const txt = d?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
-      setOcr({ loading:false, result: txt || "Tidak dikenali" });
-    } catch(err) { setOcr({ loading:false, result:"Gagal: " + err.message }); }
-  };
-
-  const TABS = [
-    {id:"equation",label:"✏️ Persamaan"},
-    {id:"symbols",label:"∑ Simbol"},
-    {id:"chemistry",label:"⚗️ Kimia"},
-    {id:"geometry",label:"📈 Geometri"},
-    {id:"ocr",label:"✋ OCR"},
-  ];
-
-  return (
-    <div className="fixed inset-0 z-[999] flex items-center justify-center p-2" style={{background:"rgba(0,0,0,0.8)"}}>
-      <div className="w-full max-w-5xl flex flex-col rounded-2xl overflow-hidden shadow-2xl" style={{background:"#0f172a",border:"1px solid rgba(99,102,241,0.4)",maxHeight:"95vh"}}>
-
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-3 shrink-0" style={{borderBottom:"1px solid rgba(99,102,241,0.2)"}}>
-          <div className="flex items-center gap-2">
-            <span className="text-xl">📐</span>
-            <h2 className="text-white font-bold text-lg">Science Editor</h2>
-            <span className="text-xs px-2 py-0.5 rounded-full" style={{background:"rgba(99,102,241,0.2)",color:"#a5b4fc"}}>KaTeX + mhchem</span>
-          </div>
-          <div className="flex gap-2">
-            <button onClick={()=>{ onInsert(latex); onClose(); }}
-              className="px-4 py-1.5 rounded-xl text-sm font-bold transition"
-              style={{background:"#4f46e5",color:"white"}}>✓ Sisipkan ke Soal</button>
-            <button onClick={onClose} className="px-3 py-1.5 rounded-xl text-sm" style={{background:"rgba(51,65,85,0.7)",color:"#94a3b8"}}>✕</button>
-          </div>
-        </div>
-
-        {/* Tabs */}
-        <div className="flex gap-0.5 px-4 pt-3 shrink-0 overflow-x-auto" style={{borderBottom:"1px solid rgba(99,102,241,0.15)"}}>
-          {TABS.map(t => (
-            <button key={t.id} onClick={()=>setTab(t.id)}
-              className="px-4 py-2 text-xs font-semibold rounded-t-xl whitespace-nowrap transition"
-              style={{
-                background: tab===t.id ? "rgba(99,102,241,0.25)" : "transparent",
-                color: tab===t.id ? "#a5b4fc" : "#64748b",
-                borderBottom: tab===t.id ? "2px solid #6366f1" : "2px solid transparent"
-              }}>{t.label}</button>
-          ))}
-        </div>
-
-        {/* Content */}
-        <div className="flex-1 overflow-hidden flex flex-col">
-
-          {/* ===== EQUATION EDITOR ===== */}
-          {tab==="equation" && (
-            <div className="flex-1 flex flex-col p-4 gap-3 overflow-auto">
-              {/* Quick inserts */}
-              <div className="flex flex-wrap gap-1.5">
-                {[
-                  {l:"\\frac{□}{□}",c:"\\frac{a}{b}"},{l:"√",c:"\\sqrt{x}"},
-                  {l:"x²",c:"x^{2}"},{l:"xᵢ",c:"x_{i}"},{l:"∫",c:"\\int_{a}^{b}"},
-                  {l:"∑",c:"\\sum_{i=1}^{n}"},{l:"lim",c:"\\lim_{x\\to 0}"},
-                  {l:"→",c:"\\rightarrow"},{l:"$…$",c:"$ $"},{l:"$$…$$",c:"$$\n\n$$"},
-                  {l:"matrix",c:"\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}"},
-                  {l:"\\vec{v}",c:"\\vec{v}"},{l:"\\hat{u}",c:"\\hat{u}"},
-                ].map(s => (
-                  <button key={s.l} onClick={()=>insertToEditor(s.c, false)}
-                    className="px-2.5 py-1 rounded-lg text-xs font-mono transition hover:scale-105"
-                    style={{background:"rgba(99,102,241,0.15)",color:"#a5b4fc",border:"1px solid rgba(99,102,241,0.25)"}}>
-                    {s.l}
-                  </button>
-                ))}
-              </div>
-
-              {/* Split editor/preview */}
-              <div className="flex gap-3 flex-1 min-h-0" style={{minHeight:220}}>
-                <div className="flex-1 flex flex-col gap-1">
-                  <label className="text-xs font-semibold" style={{color:"#64748b"}}>✏️ EDITOR LaTeX</label>
-                  <textarea ref={textareaRef} value={latex} onChange={e=>setLatex(e.target.value)}
-                    className="flex-1 p-3 rounded-xl text-white text-sm outline-none resize-none font-mono"
-                    style={{background:"rgba(15,23,42,0.95)",border:"1px solid rgba(99,102,241,0.3)",minHeight:180,lineHeight:1.7}}
-                    placeholder={"Contoh:\nHitung $\\frac{d}{dx}(x^3 - 2x)$\n\n$$\\int_0^{\\pi} \\sin(x)\\,dx = 2$$\n\n$\\ce{H2 + O2 -> H2O}$"} />
-                </div>
-                <div className="flex-1 flex flex-col gap-1">
-                  <label className="text-xs font-semibold" style={{color:"#22c55e"}}>👁 PREVIEW REAL-TIME</label>
-                  <div className="flex-1 p-3 rounded-xl text-sm overflow-auto"
-                    style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(34,197,94,0.2)",color:"#e2e8f0",minHeight:180}}>
-                    {latex
-                      ? <MathText text={latex} />
-                      : <span className="text-slate-600 italic text-xs">Preview muncul di sini saat Anda mengetik...</span>}
-                  </div>
-                </div>
-              </div>
-              <p className="text-xs" style={{color:"#475569"}}>
-                💡 <code style={{color:"#a5b4fc"}}>$…$</code> untuk inline · <code style={{color:"#a5b4fc"}}>$$…$$</code> untuk blok · <code style={{color:"#2dd4bf"}}>{"$\ce{H2O}$"}</code> untuk kimia
-              </p>
-            </div>
-          )}
-
-          {/* ===== SYMBOL PICKER ===== */}
-          {tab==="symbols" && (
-            <div className="flex flex-1 overflow-hidden">
-              <div className="w-36 shrink-0 overflow-y-auto p-2 space-y-0.5" style={{borderRight:"1px solid rgba(99,102,241,0.15)"}}>
-                {Object.keys(SCI_SYMBOLS).map(g => (
-                  <button key={g} onClick={()=>setSymGroup(g)}
-                    className="w-full text-left px-3 py-2 rounded-lg text-xs font-medium transition"
-                    style={{
-                      background: symGroup===g ? "rgba(99,102,241,0.25)" : "transparent",
-                      color: symGroup===g ? "#a5b4fc" : "#64748b"
-                    }}>{g}</button>
-                ))}
-              </div>
-              <div className="flex-1 overflow-auto p-4">
-                <p className="text-xs mb-3" style={{color:"#475569"}}>Klik simbol → masuk ke editor persamaan</p>
-                <div className="grid gap-2" style={{gridTemplateColumns:"repeat(auto-fill,minmax(90px,1fr))"}}>
-                  {SCI_SYMBOLS[symGroup]?.map(s => (
-                    <button key={s.k} onClick={()=>{ insertToEditor(s.k, true); setTab("equation"); }}
-                      className="flex flex-col items-center gap-1.5 p-2.5 rounded-xl transition hover:scale-105"
-                      style={{background:"rgba(30,41,59,0.8)",border:"1px solid rgba(99,102,241,0.2)"}}>
-                      <div style={{color:"#e2e8f0",fontSize:16}}>
-                        <MathText text={`$${s.k.length < 20 ? s.k : s.k.split(" ")[0]}$`} />
-                      </div>
-                      <span className="text-center leading-tight" style={{color:"#64748b",fontSize:10}}>{s.l}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* ===== CHEMISTRY EDITOR ===== */}
-          {tab==="chemistry" && (
-            <div className="flex-1 overflow-auto p-4">
-              <div className="flex items-center gap-2 mb-3">
-                <span className="text-xs font-semibold" style={{color:"#2dd4bf"}}>⚗️ Template Kimia</span>
-                <span className="text-xs" style={{color:"#475569"}}>— klik untuk masuk ke editor</span>
-              </div>
-              <div className="grid gap-2 mb-5" style={{gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))"}}>
-                {CHEM_SNIPPETS.map(s => (
-                  <button key={s.k} onClick={()=>{ insertToEditor(s.k, true); setTab("equation"); }}
-                    className="p-3 rounded-xl text-left transition hover:scale-[1.02]"
-                    style={{background:"rgba(20,184,166,0.08)",border:"1px solid rgba(20,184,166,0.2)"}}>
-                    <div className="text-xs font-semibold mb-1.5" style={{color:"#2dd4bf"}}>{s.l}</div>
-                    <div style={{color:"#e2e8f0",fontSize:13}}>
-                      <MathText text={`$${s.k}$`} />
-                    </div>
-                  </button>
-                ))}
-              </div>
-              <div className="p-4 rounded-xl" style={{background:"rgba(15,23,42,0.6)",border:"1px solid rgba(20,184,166,0.15)"}}>
-                <p className="text-xs font-bold mb-3" style={{color:"#2dd4bf"}}>📋 Panduan Sintaks mhchem:</p>
-                <div className="grid gap-1.5" style={{gridTemplateColumns:"1fr 1fr"}}>
-                  {[
-                    ["→ panah reaksi","\\ce{A -> B}"],["⇌ kesetimbangan","\\ce{A <=> B}"],
-                    ["subskrip H₂O","\\ce{H2O}"],["ion Ca²⁺","\\ce{Ca^2+}"],
-                    ["endapan ↓","\\ce{BaSO4 v}"],["gas ↑","\\ce{H2 ^}"],
-                    ["kondisi panas","\\ce{A ->[\\Delta] B}"],["hidrat","\\ce{CuSO4.5H2O}"],
-                    ["+ reaktan","\\ce{A + B -> C}"],["koefisien","\\ce{2H2 + O2 -> 2H2O}"],
-                  ].map(([a,b]) => (
-                    <div key={a} className="flex gap-2 p-2 rounded-lg items-start" style={{background:"rgba(15,23,42,0.5)"}}>
-                      <span className="text-xs shrink-0" style={{color:"#94a3b8"}}>{a}:</span>
-                      <code className="text-xs break-all" style={{color:"#a5b4fc"}}>{b}</code>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* ===== GEOMETRY / GRAPH ===== */}
-          {tab==="geometry" && (
-            <div className="flex-1 flex flex-col p-4 gap-3">
-              <div className="flex gap-2 flex-wrap items-center">
-                <p className="text-xs" style={{color:"#64748b"}}>Buat grafik interaktif. Screenshot hasil → upload sebagai Gambar Soal.</p>
-                <a href="https://www.desmos.com/calculator" target="_blank" rel="noreferrer"
-                  className="px-3 py-1.5 rounded-xl text-xs font-semibold"
-                  style={{background:"rgba(59,130,246,0.2)",color:"#60a5fa",border:"1px solid rgba(59,130,246,0.3)"}}>
-                  📊 Desmos Calculator
-                </a>
-                <a href="https://www.geogebra.org/graphing" target="_blank" rel="noreferrer"
-                  className="px-3 py-1.5 rounded-xl text-xs font-semibold"
-                  style={{background:"rgba(168,85,247,0.2)",color:"#c084fc",border:"1px solid rgba(168,85,247,0.2)"}}>
-                  📐 GeoGebra
-                </a>
-                <a href="https://www.desmos.com/geometry" target="_blank" rel="noreferrer"
-                  className="px-3 py-1.5 rounded-xl text-xs font-semibold"
-                  style={{background:"rgba(20,184,166,0.2)",color:"#2dd4bf",border:"1px solid rgba(20,184,166,0.2)"}}>
-                  🔺 Desmos Geometry
-                </a>
-              </div>
-              <iframe
-                src="https://www.desmos.com/calculator"
-                title="Desmos Graphing Calculator"
-                className="flex-1 rounded-xl w-full"
-                style={{border:"1px solid rgba(99,102,241,0.25)",minHeight:400}} />
-            </div>
-          )}
-
-          {/* ===== OCR HANDWRITING ===== */}
-          {tab==="ocr" && (
-            <div className="flex-1 p-4 flex flex-col gap-3">
-              <div className="flex items-start gap-3">
-                <div className="flex-1">
-                  <p className="text-sm font-semibold mb-1" style={{color:"#e2e8f0"}}>✋ OCR Tulisan Tangan</p>
-                  <p className="text-xs" style={{color:"#64748b"}}>Tulis rumus matematika, fisika, atau kimia di kanvas. Klik <strong style={{color:"#e2e8f0"}}>Kenali dengan AI</strong> — Gemini akan mengubahnya menjadi kode LaTeX.</p>
-                </div>
-                {!geminiKey && (
-                  <div className="px-3 py-2 rounded-xl text-xs" style={{background:"rgba(234,179,8,0.1)",border:"1px solid rgba(234,179,8,0.3)",color:"#fbbf24"}}>
-                    ⚠️ Perlu Gemini API Key
-                  </div>
-                )}
-              </div>
-
-              <div className="flex gap-2">
-                <button onClick={clearCanvas} className="px-3 py-1.5 rounded-xl text-xs font-medium" style={{background:"rgba(220,38,38,0.15)",color:"#f87171",border:"1px solid rgba(220,38,38,0.25)"}}>🗑 Hapus</button>
-                <button onClick={runOCR} disabled={ocr.loading || !geminiKey}
-                  className="px-4 py-1.5 rounded-xl text-xs font-bold transition"
-                  style={{background: (!geminiKey||ocr.loading) ? "rgba(51,65,85,0.5)" : "rgba(99,102,241,0.3)", color: (!geminiKey||ocr.loading) ? "#475569":"#a5b4fc", border:"1px solid rgba(99,102,241,0.3)"}}>
-                  {ocr.loading ? "⏳ AI sedang mengenali..." : "✨ Kenali dengan AI"}
-                </button>
-              </div>
-
-              <div className="relative rounded-xl overflow-hidden" style={{border:"2px solid rgba(99,102,241,0.35)"}}>
-                <div className="absolute top-2 left-2 text-xs px-2 py-0.5 rounded-lg pointer-events-none" style={{background:"rgba(15,23,42,0.8)",color:"#475569"}}>
-                  Tulis di sini ✍️
-                </div>
-                <canvas ref={canvasRef} width={800} height={250}
-                  onMouseDown={startDraw} onMouseMove={draw} onMouseUp={stopDraw} onMouseLeave={stopDraw}
-                  onTouchStart={startDraw} onTouchMove={draw} onTouchEnd={stopDraw}
-                  className="w-full cursor-crosshair touch-none block"
-                  style={{background:"rgba(15,23,42,0.95)",maxHeight:250}} />
-              </div>
-
-              {ocr.result && (
-                <div className="p-4 rounded-xl" style={{background:"rgba(99,102,241,0.08)",border:"1px solid rgba(99,102,241,0.25)"}}>
-                  <p className="text-xs font-bold mb-2" style={{color:"#a5b4fc"}}>🎯 Hasil LaTeX dari AI:</p>
-                  <div className="p-2 rounded-lg mb-2" style={{background:"rgba(15,23,42,0.7)"}}>
-                    <code className="text-sm break-all" style={{color:"#e2e8f0"}}>{ocr.result}</code>
-                  </div>
-                  <p className="text-xs mb-2" style={{color:"#64748b"}}>Preview:</p>
-                  <div className="p-2 rounded-lg mb-3" style={{background:"rgba(255,255,255,0.03)",color:"#e2e8f0"}}>
-                    <MathText text={`$${ocr.result}$`} />
-                  </div>
-                  <div className="flex gap-2">
-                    <button onClick={()=>{ insertToEditor(ocr.result, true); setTab("equation"); }}
-                      className="px-4 py-1.5 rounded-xl text-xs font-bold"
-                      style={{background:"rgba(99,102,241,0.3)",color:"#a5b4fc",border:"1px solid rgba(99,102,241,0.4)"}}>
-                      ← Sisipkan ke Editor
-                    </button>
-                    <button onClick={()=>navigator.clipboard?.writeText(ocr.result)}
-                      className="px-3 py-1.5 rounded-xl text-xs"
-                      style={{background:"rgba(51,65,85,0.5)",color:"#94a3b8"}}>
-                      📋 Copy
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// Simple LaTeX textarea with button to open Science Editor
-function LaTeXTextarea({ value, onChange, rows = 4, placeholder, geminiKey = "" }) {
-  const [showEditor, setShowEditor] = useState(false);
   return (
     <div>
-      <div className="flex items-center gap-2 mb-1.5 flex-wrap">
-        <button onClick={() => setShowEditor(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition"
-          style={{background:"linear-gradient(135deg,rgba(99,102,241,0.3),rgba(168,85,247,0.3))",color:"#a5b4fc",border:"1px solid rgba(99,102,241,0.35)"}}>
-          📐 Buka Science Editor
+      {/* Symbol Palette Toggle */}
+      <div className="flex items-center gap-2 mb-1">
+        <button type="button" onClick={() => setShowPalette(v => !v)} className="text-xs px-2 py-1 rounded-lg flex items-center gap-1 transition" style={{ background: showPalette ? "rgba(59,130,246,0.25)" : "rgba(51,65,85,0.4)", color: showPalette ? "#60a5fa" : "#94a3b8" }}>
+          <Hash size={12} />Simbol Matematika {showPalette ? "▲" : "▼"}
         </button>
-        <span className="text-xs" style={{color:"#334155"}}>atau ketik LaTeX: <code style={{color:"#a5b4fc"}}>$x^2$</code></span>
+        <span className="text-xs" style={{ color: "inherit", opacity: 0.4 }}>Alt+/ untuk pecahan</span>
       </div>
-      <textarea value={value} onChange={e => onChange(e.target.value)} rows={rows}
-        placeholder={placeholder || "Ketik soal biasa atau LaTeX: $\\frac{x}{2} = 5$"}
-        className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500 font-mono"
-        style={{background:"rgba(15,23,42,0.8)",border:"1px solid rgba(59,130,246,0.25)"}} />
-      {value?.includes("$") && (
-        <div className="mt-1.5 px-3 py-2 rounded-xl text-sm" style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(99,102,241,0.15)",color:"#e2e8f0"}}>
-          <MathText text={value} />
+      {showPalette && (
+        <div className="flex flex-wrap gap-1 mb-2 p-2 rounded-xl" style={{ background: "rgba(15,23,42,0.6)", border: "1px solid rgba(59,130,246,0.2)" }}>
+          {MATH_SYMBOLS.map(s => (
+            <button key={s.label} type="button" onClick={() => insertSymbol(s.val)} className="px-2 py-1 rounded text-sm font-mono hover:bg-blue-500/20 transition" style={{ color: "#60a5fa", border: "1px solid rgba(59,130,246,0.15)", minWidth: "2.2rem" }} title={s.val}>
+              {s.label}
+            </button>
+          ))}
+          {/* Common templates */}
+          <div className="w-full mt-1 flex flex-wrap gap-1">
+            {[
+              ["x²+bx+c", "x² + bx + c = 0"],
+              ["f(x)", "f(x) = "],
+              ["sin A", "sin A = "],
+              ["log", "log₁₀(x) = "],
+              ["lim", "lim(x→∞) "],
+              ["∫dx", "∫f(x)dx = "],
+            ].map(([label, tpl]) => (
+              <button key={label} type="button" onClick={() => insertSymbol(tpl)} className="px-2 py-0.5 rounded text-xs hover:bg-purple-500/20 transition" style={{ color: "#c084fc", border: "1px solid rgba(168,85,247,0.2)" }}>
+                {label}
+              </button>
+            ))}
+          </div>
         </div>
       )}
-      {showEditor && (
-        <ScienceEditorModal value={value} geminiKey={geminiKey}
-          onInsert={v => onChange(v)} onClose={() => setShowEditor(false)} />
-      )}
+      <textarea
+        ref={ref}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        onKeyDown={handleKeyboard}
+        rows={rows}
+        placeholder={placeholder}
+        className="w-full py-2.5 px-3 rounded-xl text-sm outline-none resize-y font-mono"
+        style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)", color: "inherit", lineHeight: "1.7" }}
+      />
     </div>
   );
 }
@@ -1867,7 +1207,6 @@ function LaTeXTextarea({ value, onChange, rows = 4, placeholder, geminiKey = "" 
 function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
   const [showModal, setShowModal] = useState(false);
   const [showImport, setShowImport] = useState(false);
-  const [showAI, setShowAI] = useState(false);
   const [editId, setEditId] = useState(null);
   const [filterSubject, setFilterSubject] = useState("all");
   const [form, setForm] = useState({ subjectId: "", type: "pilgan", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "", rubrik: "" });
@@ -1926,15 +1265,8 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
 
   const handleBulkImport = (importedQuestions) => {
     const latest = dataRef?.current || data;
-    const questions = [
-      ...(latest.questions || []),
-      ...importedQuestions.map(q => ({
-        id: genId(), ...q,
-        type: q.type || "pilgan",
-        createdBy: userId || "admin"
-      }))
-    ];
-    saveData({ ...latest, questions }, ["questions"]);
+    const questions = [...(latest.questions || []), ...importedQuestions.map(q => ({ id: genId(), ...q, type: q.type || "pilgan", createdBy: userId || "admin" }))];
+    saveData({ ...latest, questions });
     setShowImport(false);
     showToast(`${importedQuestions.length} soal berhasil diimpor`);
   };
@@ -1951,7 +1283,6 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
         <div className="flex gap-2 flex-wrap">
           {userId && <button onClick={() => setShowMineOnly(v => !v)} className="px-3 py-2 rounded-xl text-xs font-medium transition" style={{ background: showMineOnly ? "rgba(59,130,246,0.25)" : "rgba(51,65,85,0.5)", color: showMineOnly ? "#60a5fa" : "#94a3b8", border: "1px solid rgba(59,130,246,0.2)" }}>{showMineOnly ? "✓ Soal Saya" : "Semua Soal"}</button>}
           <Btn variant="secondary" onClick={() => setShowImport(true)}><Upload size={16} />Import</Btn>
-          <button onClick={() => setShowAI(true)} className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-semibold transition" style={{ background: "linear-gradient(135deg, rgba(168,85,247,0.3), rgba(59,130,246,0.3))", color: "#c084fc", border: "1px solid rgba(168,85,247,0.4)" }}>✨ Generate AI</button>
           <Btn onClick={openAdd}><Plus size={16} />Tambah Soal</Btn>
         </div>
       </div>
@@ -2000,8 +1331,6 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
 
       {showImport && <ImportSoalModal data={data} onImport={handleBulkImport} onClose={() => setShowImport(false)} showToast={showToast} />}
 
-      {showAI && <AIGenerateModal data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} userId={userId} onClose={() => setShowAI(false)} />}
-
       {showModal && (
         <Modal title={editId ? "Edit Soal" : "Tambah Soal"} onClose={() => setShowModal(false)} wide>
           <div className="space-y-4">
@@ -2019,7 +1348,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
             </div>
             <div>
               <label className="text-blue-300 text-sm font-medium mb-1 block">Teks Soal</label>
-              <LaTeXTextarea value={form.text} onChange={v => setForm({ ...form, text: v })} rows={4} placeholder="Masukkan teks soal..." geminiKey={data.meta?.geminiKey || ""} />
+              <textarea value={form.text} onChange={e => setForm({ ...form, text: e.target.value })} rows={4} placeholder="Masukkan teks soal..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
             </div>
             <div>
               <label className="text-blue-300 text-sm font-medium mb-1 block">Gambar Soal (Opsional)</label>
@@ -2063,7 +1392,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
             {(form.type === "esai" || form.type === "uraian") && (
               <div>
                 <label className="text-blue-300 text-sm font-medium mb-1 block">Kunci Jawaban / Model Jawaban</label>
-                <LaTeXTextarea value={form.explanation} onChange={v => setForm({ ...form, explanation: v })} rows={4} placeholder="Tulis kunci jawaban atau model jawaban yang diharapkan..." geminiKey={data.meta?.geminiKey || ""} />
+                <MathTextarea value={form.explanation} onChange={v => setForm({ ...form, explanation: v })} placeholder="Tulis kunci jawaban atau model jawaban..." rows={4} />
                 <div className="mt-3">
                   <label className="text-blue-300 text-sm font-medium mb-1 block">Rubrik Penilaian (Opsional)</label>
                   <textarea value={form.rubrik || ""} onChange={e => setForm({ ...form, rubrik: e.target.value })} rows={3} placeholder="Contoh: Skor 4: jawaban lengkap dan benar, Skor 3: benar tapi kurang lengkap..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
@@ -2073,7 +1402,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
             {form.type === "pilgan" && (
               <div>
                 <label className="text-blue-300 text-sm font-medium mb-1 block">Pembahasan (Opsional)</label>
-                <LaTeXTextarea value={form.explanation} onChange={v => setForm({ ...form, explanation: v })} rows={2} placeholder="Tulis pembahasan..." geminiKey={data.meta?.geminiKey || ""} />
+                <MathTextarea value={form.explanation} onChange={v => setForm({ ...form, explanation: v })} placeholder="Tulis pembahasan..." rows={2} />
               </div>
             )}
             <div className="flex justify-end gap-2 pt-2">
@@ -2399,16 +1728,69 @@ function ExamManager({ data, dataRef, saveData, showToast, isAdmin, userId }) {
 // ============= MONITOR VIEW =============
 function MonitorView({ data }) {
   const [selectedExam, setSelectedExam] = useState(null);
+  const [liveSessions, setLiveSessions] = useState({});
+  const [liveResults, setLiveResults] = useState({});
   const [, forceUpdate] = useState(0);
-  useEffect(() => { const iv = setInterval(() => forceUpdate(n => n + 1), 2000); return () => clearInterval(iv); }, []);
+
+  // Auto-refresh every 3s for live data
+  useEffect(() => {
+    const iv = setInterval(() => forceUpdate(n => n + 1), 3000);
+    return () => clearInterval(iv);
+  }, []);
+
+  // Subscribe to live sessions and results when exam selected
+  useEffect(() => {
+    if (!selectedExam) return;
+    const unsubs = [];
+
+    // Listen to sessions for this exam
+    const u1 = store.listenSessions(selectedExam, (sessions) => {
+      setLiveSessions(prev => ({ ...prev, [selectedExam]: sessions }));
+    });
+    unsubs.push(u1);
+
+    // Listen to results for this exam
+    const u2 = store.listenResults(selectedExam, (results) => {
+      setLiveResults(prev => ({ ...prev, [selectedExam]: results }));
+    });
+    unsubs.push(u2);
+
+    return () => unsubs.forEach(u => u());
+  }, [selectedExam]);
+
+  // Merge data.sessions (local) with liveSessions (Firestore)
+  const getMergedSessions = (examId) => {
+    const local = (data.sessions || []).filter(s => s.examId === examId);
+    const live = liveSessions[examId] || [];
+    // Merge: prefer live data over local (live is more up-to-date)
+    const merged = [...local];
+    live.forEach(ls => {
+      const idx = merged.findIndex(s => s.studentId === ls.studentId);
+      if (idx >= 0) { if ((ls.lastUpdate || 0) >= (merged[idx].lastUpdate || 0)) merged[idx] = ls; }
+      else merged.push(ls);
+    });
+    return merged;
+  };
+
+  const getMergedResults = (examId) => {
+    const local = (data.results || []).filter(r => r.examId === examId);
+    const live = liveResults[examId] || [];
+    const merged = [...local];
+    live.forEach(lr => {
+      const idx = merged.findIndex(r => r.studentId === lr.studentId);
+      if (idx >= 0) merged[idx] = lr;
+      else merged.push(lr);
+    });
+    return merged;
+  };
 
   const activeExams = useMemo(() => data.exams.filter(e => e.status === "active"), [data.exams]);
 
   if (selectedExam) {
     const exam = data.exams.find(e => e.id === selectedExam);
     if (!exam) return null;
-    const sessions = (data.sessions || []).filter(s => s.examId === selectedExam);
-    const examResults = (data.results || []).filter(r => r.examId === selectedExam);
+    const sessions = getMergedSessions(selectedExam);
+    const examResults = getMergedResults(selectedExam);
     const targetStudents = data.students.filter(s => exam.targetKelas?.includes(s.kelas));
     const totalQ = exam.questionIds.length;
     const getStudentStatus = (st) => {
@@ -2537,6 +1919,29 @@ function ResultsView({ data }) {
   const [selectedExam, setSelectedExam] = useState(null);
   const [printing, setPrinting] = useState(false);
   const [activeResultTab, setActiveResultTab] = useState("ranking");
+  const [firestoreResults, setFirestoreResults] = useState({});
+
+  // Load results from Firestore when exam selected (gets ALL submitted results)
+  useEffect(() => {
+    if (!selectedExam) return;
+    const unsub = store.listenResults(selectedExam, (results) => {
+      setFirestoreResults(prev => ({ ...prev, [selectedExam]: results }));
+    });
+    return () => unsub();
+  }, [selectedExam]);
+
+  const getExamResults = (examId) => {
+    const local = (data.results || []).filter(r => r.examId === examId);
+    const remote = firestoreResults[examId] || [];
+    // Merge: prefer remote (more authoritative)
+    const merged = [...local];
+    remote.forEach(rr => {
+      const idx = merged.findIndex(r => r.studentId === rr.studentId);
+      if (idx >= 0) merged[idx] = { ...merged[idx], ...rr };
+      else merged.push(rr);
+    });
+    return merged;
+  };
 
   // Show ALL exams that have at least 1 result, regardless of status
   const examsWithData = data.exams.filter(e =>
@@ -2550,7 +1955,7 @@ function ResultsView({ data }) {
   const handlePrint = (exam, results) => {
     const subjectName = (data.subjects || []).find(s => s.id === exam?.subjectId)?.name || "";
     const totalQ = exam?.questionIds?.length || 0;
-    const avg = results.length > 0 ? (results.reduce((a, r) => a + (r.score ?? 0), 0) / results.length).toFixed(1) : 0;
+    const avg = results.length > 0 ? (results.reduce((a, r) => a + r.score, 0) / results.length).toFixed(1) : 0;
 
     const printContent = `
       <!DOCTYPE html><html><head>
@@ -2591,7 +1996,7 @@ function ResultsView({ data }) {
               <td>${student?.name || "?"}</td>
               <td>${student?.kelas || "-"}</td>
               <td>${r.correct}/${totalQ}</td>
-              <td><strong>${r.score !== null && r.score !== undefined ? r.score.toFixed(1) : "Perlu Dinilai"}</strong></td>
+              <td><strong>${r.score.toFixed(1)}</strong></td>
               <td>${r.score === null ? 'Perlu Dinilai' : r.score.toFixed(1)}</td>
             </tr>`;
           }).join("")}
@@ -2601,7 +2006,7 @@ function ResultsView({ data }) {
         <strong>Rata-rata: ${avg}</strong> &nbsp;|&nbsp;
         Tertinggi: ${results.length > 0 ? Math.max(...results.map(r => r.score)).toFixed(1) : "-"} &nbsp;|&nbsp;
         Terendah: ${results.length > 0 ? Math.min(...results.map(r => r.score)).toFixed(1) : "-"} &nbsp;|&nbsp;
-        ≥75: ${results.filter(r => r.score !== null && (r.score ?? 0) >= 75).length} siswa &nbsp;|&nbsp;
+        ≥75: ${results.filter(r => r.score !== null && r.score >= 75).length} siswa &nbsp;|&nbsp;
         &lt;75: ${results.filter(r => r.score !== null && r.score < 75).length} siswa
       </div>
       </body></html>`;
@@ -2614,7 +2019,7 @@ function ResultsView({ data }) {
 
   if (selectedExam) {
     const exam = data.exams.find(e => e.id === selectedExam);
-    const results = (data.results || []).filter(r => r.examId === selectedExam);
+    const results = getExamResults(selectedExam);
     const totalQ = exam?.questionIds?.length || 0;
     const targetStudents = data.students.filter(s => exam?.targetKelas?.includes(s.kelas));
     const submittedIds = new Set(results.map(r => r.studentId));
@@ -2679,7 +2084,7 @@ function ResultsView({ data }) {
                         <span className="px-1.5 py-0.5 rounded text-xs" style={{ background: "rgba(168,85,247,0.2)", color: "#c084fc" }}>Dinilai</span>
                       ) : (
                         <span className="px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
-                          {r.score !== null && r.score !== undefined ? r.score.toFixed(1) : "Perlu Dinilai"}
+                          {r.score.toFixed(1)}
                         </span>
                       )}
                     </div>
@@ -2695,6 +2100,7 @@ function ResultsView({ data }) {
             </div>
           )}
         </Card>
+        </Card>}
 
         {notSubmitted.length > 0 && (
           <Card className="mt-4">
@@ -2740,7 +2146,7 @@ function ResultsView({ data }) {
       ${results.sort((a, b) => (b.score || 0) - (a.score || 0)).map((r, i) => {
         const st = data.students.find(s => s.id === r.studentId);
         const scoreDisplay = r.score === null ? "Belum dinilai" : r.score.toFixed(1);
-        const ket = r.score === null ? "Perlu Dinilai" : `${r.score !== null && r.score !== undefined ? r.score.toFixed(1) : "Perlu Dinilai"}`;
+        const ket = r.score === null ? "Perlu Dinilai" : `${r.score.toFixed(1)}`;
         const cls = "";
         return `<tr><td>${i+1}</td><td>${st?.name||"?"}</td><td>${st?.kelas||"-"}</td><td>${r.correct||0}/${totalQ}</td><td><strong>${scoreDisplay}</strong></td><td class="${cls}">${ket}</td></tr>`;
       }).join("")}
@@ -2762,9 +2168,9 @@ function ResultsView({ data }) {
       {examsWithData.length === 0 ? <Card><EmptyState icon={<BarChart3 size={40} className="mx-auto" />} text="Belum ada hasil ujian" /></Card> : (
         <div className="space-y-3">
           {examsWithData.map(ex => {
-            const results = (data.results || []).filter(r => r.examId === ex.id);
-            const avg = results.length > 0 ? (results.reduce((a, r) => a + (r.score ?? 0), 0) / results.length).toFixed(1) : "-";
-            const passCount = results.filter(r => (r.score ?? 0) >= 75).length;
+            const results = getExamResults(ex.id);
+            const avg = results.length > 0 ? (results.reduce((a, r) => a + r.score, 0) / results.length).toFixed(1) : "-";
+            const passCount = results.filter(r => r.score >= 75).length;
             return (
               <Card key={ex.id} className="cursor-pointer hover:border-blue-500/40 transition" onClick={() => setSelectedExam(ex.id)}>
                 <div className="flex items-center justify-between">
@@ -2788,45 +2194,7 @@ function ResultsView({ data }) {
   );
 }
 
-
-// ============= QUESTION MANAGER =============
-function GeminiKeySetting({ data, dataRef, saveData, showToast }) {
-  const [groqKey, setGroqKey] = useState(data.meta?.groqKey || "");
-  const [showGroq, setShowGroq] = useState(false);
-
-  const handleSave = () => {
-    const latest = dataRef?.current || data;
-    const newMeta = { ...(latest.meta || {}), groqKey: groqKey.trim() };
-    saveData({ ...latest, meta: newMeta }, ["meta"]);
-    showToast("Groq API Key berhasil disimpan ✓");
-  };
-
-  return (
-    <div className="space-y-3 max-w-lg">
-      <div className="p-3 rounded-xl" style={{ background: "rgba(22,163,74,0.08)", border: "1px solid rgba(22,163,74,0.2)" }}>
-        <p className="text-green-300 text-xs font-semibold mb-1">✅ Groq AI — Gratis &amp; Cepat</p>
-        <p className="text-slate-400 text-xs mb-2">
-          Daftar gratis di <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" className="text-blue-400 underline">console.groq.com</a> lalu buat API Key.
-        </p>
-        <div className="flex items-center rounded-xl px-3" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }}>
-          <input
-            type={showGroq ? "text" : "password"}
-            value={groqKey}
-            onChange={e => setGroqKey(e.target.value)}
-            placeholder="gsk_..."
-            className="flex-1 py-2 bg-transparent text-white text-sm outline-none placeholder-slate-500"
-          />
-          <button onClick={() => setShowGroq(v => !v)} className="text-slate-400 hover:text-white ml-2 p-1">
-            <Eye size={14} />
-          </button>
-        </div>
-        {groqKey && <p className="text-green-400 text-xs mt-1.5">✓ Key tersimpan ({groqKey.length} karakter)</p>}
-      </div>
-      <Btn onClick={handleSave}><Save size={14} />Simpan API Key</Btn>
-    </div>
-  );
-}
-
+// ============= SETTINGS (ADMIN) =============
 function SettingsView({ data, dataRef, saveData, showToast }) {
   const [pw, setPw] = useState({ old: "", new1: "", new2: "" });
   const handleChangePw = () => {
@@ -2854,11 +2222,7 @@ function SettingsView({ data, dataRef, saveData, showToast }) {
         </div>
       </Card>
       <Card className="mb-4">
-        <h3 className="font-bold mb-1" style={{ color: "inherit" }}>🤖 Integrasi AI — Generate Soal</h3>
-        <p className="text-xs mb-3" style={{ color: "inherit", opacity: 0.6 }}>Tambahkan API Key untuk fitur Generate Soal otomatis. Groq direkomendasikan karena gratis dan cepat.</p>
-        <GeminiKeySetting data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} />
-      </Card>
-      <Card className="mb-4">
+        <h3 className="font-bold mb-2" style={{ color: "inherit" }}>Informasi Sistem</h3>
         <div className="text-slate-300 text-sm space-y-1">
           <p>Sekolah: {SCHOOL_NAME}</p>
           <p>Kurikulum: K-13 & Merdeka Belajar</p>
@@ -3075,7 +2439,7 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
                       </div>
                       <div className="text-right">
                         <span className="px-3 py-1 rounded-full text-lg font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
-                          {r.score !== null && r.score !== undefined ? r.score.toFixed(1) : "Perlu Dinilai"}
+                          {r.score.toFixed(1)}
                         </span>
 
                       </div>
@@ -3254,7 +2618,7 @@ function TryoutTaker({ data, user, exam, onFinish, showToast }) {
 
       <Card className="mb-4">
         <div className="text-xs mb-2 text-blue-400">Soal {currentQ+1} dari {questions.length}</div>
-        <p className="text-base leading-relaxed mb-2" style={{ color: "inherit" }}><MathText text={q.text} /></p>
+        <p className="text-base leading-relaxed mb-2" style={{ color: "inherit" }}>{q.text}</p>
         {q.image && <img src={q.image} alt="" className="max-w-full rounded-xl mb-2" style={{ maxHeight: 200 }} />}
       </Card>
 
@@ -3445,61 +2809,51 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
   useEffect(() => { timeLeftRef.current = timeLeft; }, [timeLeft]);
   useEffect(() => { submittedRef.current = submitted; }, [submitted]);
 
-  // Save session every 3 seconds — uses refs so always has fresh data
+  // Per-student session save — no race condition with concurrent students
+  const sessionIdRef = useRef(existingSession?.id || genId());
+  const lastSessionSave = useRef(0);
+
+  const doSaveSession = useCallback(async (status = "active") => {
+    if (submittedRef.current && status === "active") return;
+    const now = Date.now();
+    if (status === "active" && now - lastSessionSave.current < 800) return;
+    lastSessionSave.current = now;
+    const sessionData = {
+      id: sessionIdRef.current,
+      examId: exam.id, studentId: user.id,
+      studentName: user.name, kelas: user.kelas,
+      answers: { ...answersRef.current },
+      status, violations: violationsRef.current,
+      timeLeft: timeLeftRef.current,
+      lastUpdate: now, startedAt: existingSession?.startedAt || now
+    };
+    try {
+      // Write to individual doc — no race condition
+      await store.saveSession(exam.id, user.id, sessionData);
+      // Also update local state so monitoring works
+      const currentData = dataRef?.current || data;
+      const sessions = [...(currentData.sessions || [])];
+      const idx = sessions.findIndex(s => s.studentId === user.id && s.examId === exam.id);
+      if (idx >= 0) sessions[idx] = sessionData;
+      else sessions.push(sessionData);
+      // Only update local data, don't call full saveData to avoid overwriting
+      if (dataRef.current) dataRef.current = { ...dataRef.current, sessions };
+    } catch(e) { console.error("Session save failed:", e); }
+  }, [exam.id, user.id]);
+
+  // Save every 5 seconds
   useEffect(() => {
     if (submitted) return;
-
-    const saveSession = async () => {
-      if (submittedRef.current) return;
-      // CRITICAL: always read from dataRef (latest global data) not stale closure
-      const currentData = dataRef?.current || data;
-      if (!currentData) return;
-      const sessions = [...(currentData.sessions || [])];
-      const idx = sessions.findIndex(s => s.examId === exam.id && s.studentId === user.id);
-      const sessionData = {
-        examId: exam.id, studentId: user.id,
-        answers: { ...answersRef.current },
-        status: "active",
-        violations: violationsRef.current,
-        timeLeft: timeLeftRef.current,
-        lastUpdate: Date.now()
-      };
-      if (idx >= 0) sessions[idx] = { ...sessions[idx], ...sessionData };
-      else sessions.push({ id: genId(), ...sessionData });
-
-      // Write sessions directly to avoid overwriting other data with stale state
-      const nextData = { ...currentData, sessions };
-      saveData(nextData, ["sessions"]);
-    };
-
-    saveSession(); // immediate on mount/answer change
-    const iv = setInterval(saveSession, 3000);
+    doSaveSession("active");
+    const iv = setInterval(() => doSaveSession("active"), 5000);
     return () => clearInterval(iv);
-  }, [submitted]); // only re-register when submitted changes
+  }, [submitted]);
 
-  // Also save immediately when answer changes (separate effect, uses ref)
+  // Save on answer change with debounce
   useEffect(() => {
     answersRef.current = answers;
-    // Debounced save on answer change
-    const t = setTimeout(() => {
-      if (!submittedRef.current) {
-        const currentData = dataRef?.current || data;
-        if (!currentData) return;
-        const sessions = [...(currentData.sessions || [])];
-        const idx = sessions.findIndex(s => s.examId === exam.id && s.studentId === user.id);
-        const sessionData = {
-          examId: exam.id, studentId: user.id,
-          answers: { ...answers },
-          status: "active",
-          violations: violationsRef.current,
-          timeLeft: timeLeftRef.current,
-          lastUpdate: Date.now()
-        };
-        if (idx >= 0) sessions[idx] = { ...sessions[idx], ...sessionData };
-        else sessions.push({ id: genId(), ...sessionData });
-        saveData({ ...currentData, sessions }, ["sessions"]);
-      }
-    }, 800);
+    if (submittedRef.current) return;
+    const t = setTimeout(() => doSaveSession("active"), 1000);
     return () => clearTimeout(t);
   }, [answers]);
 
@@ -3529,11 +2883,22 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
     const resultData = { id: genId(), examId: exam.id, studentId: user.id, answers: { ...finalAnswers }, correct, pilganCount, score, hasEssay, needsGrading: hasEssay, violations: finalViolations, submittedAt: Date.now() };
     setResult(resultData);
 
-    // Use dataRef to get the absolute latest data
+    // Save result to individual doc — guaranteed no race condition with other students
+    try {
+      await store.saveResult(exam.id, user.id, resultData);
+    } catch(e) {
+      console.error("Result save failed, retrying:", e);
+      setTimeout(() => store.saveResult(exam.id, user.id, resultData).catch(console.error), 2000);
+    }
+    // Mark session as submitted
+    await doSaveSession("submitted");
+    // Also update local state
     const currentData = dataRef?.current || data;
     const results = [...(currentData.results || []).filter(r => !(r.examId === exam.id && r.studentId === user.id)), resultData];
     const sessions = (currentData.sessions || []).map(s => s.examId === exam.id && s.studentId === user.id ? { ...s, status: "submitted" } : s);
-    saveData({ ...currentData, results, sessions }, ["results","sessions"]);
+    if (dataRef.current) {
+      dataRef.current = { ...dataRef.current, results, sessions };
+    }
     showToast(auto ? "Waktu habis! Jawaban dikumpulkan otomatis." : "Jawaban berhasil dikumpulkan!");
   }, [questions, exam, user, data, saveData, showToast]);
 
@@ -3618,7 +2983,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
         {existingSession && <div className="mb-3 px-3 py-2 rounded-lg text-amber-400 text-xs flex items-center gap-2" style={{ background: "rgba(217,119,6,0.1)", border: "1px solid rgba(217,119,6,0.2)" }}><RefreshCw size={12} />Melanjutkan ujian yang tersimpan</div>}
         <Card className="mb-4">
           <div className="text-blue-400 text-xs font-medium mb-2">Soal {currentQ + 1} dari {questions.length}</div>
-          <div className="text-white text-base leading-relaxed mb-3" style={{ whiteSpace: "pre-wrap" }}><MathText text={q.text} /></div>
+          <div className="text-white text-base leading-relaxed mb-3" style={{ whiteSpace: "pre-wrap" }}>{q.text}</div>
           {q.image && <img src={q.image} alt="Gambar soal" className="max-w-full rounded-xl mb-3" style={{ maxHeight: "300px" }} />}
         </Card>
         {/* Answer input based on question type */}

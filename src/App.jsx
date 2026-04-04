@@ -1084,6 +1084,8 @@ function AIGenerateModal({ data, dataRef, saveData, showToast, userId, onClose }
   const [loadingMsg, setLoadingMsg] = useState("");
 
   const geminiKey = data.meta?.geminiKey || "";
+  const groqKey = data.meta?.groqKey || "";
+  const hasAnyKey = geminiKey || groqKey;
 
   const getSubjectName = (id) => (data.subjects || []).find(s => s.id === id)?.name || "-";
 
@@ -1126,7 +1128,7 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
   };
 
   const handleGenerate = async () => {
-    if (!geminiKey) return showToast("API Key Gemini belum diatur. Minta admin untuk mengaturnya di menu Pengaturan.", "error");
+    if (!hasAnyKey) return showToast("API Key belum diatur. Minta admin mengatur Groq atau Gemini API Key di Pengaturan.", "error");
     if (!aiForm.topic.trim()) return showToast("Isi topik/materi terlebih dahulu", "error");
     if (!aiForm.subjectId) return showToast("Pilih mata pelajaran", "error");
 
@@ -1143,45 +1145,83 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
 
     try {
       const prompt = buildPrompt();
-      const models = [
-        { name: "gemini-2.0-flash-lite", ver: "v1beta" },
-        { name: "gemini-2.0-flash", ver: "v1beta" },
-        { name: "gemini-1.5-flash", ver: "v1beta" },
-        { name: "gemini-1.5-pro", ver: "v1beta" },
-      ];
+      const prompt = buildPrompt();
       let json = null;
       const errorLog = [];
-      for (const m of models) {
-        setLoadingMsg(`Mencoba ${m.name}...`);
-        try {
-          const res = await fetch(
-            `https://generativelanguage.googleapis.com/${m.ver}/models/${m.name}:generateContent?key=${geminiKey}`,
-            {
+
+      // === GROQ (primary - free, fast) ===
+      if (groqKey) {
+        const groqModels = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"];
+        for (const model of groqModels) {
+          setLoadingMsg(`Groq AI (${model.split("-")[0]})...`);
+          try {
+            const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: { "Content-Type": "application/json", "Authorization": `Bearer ${groqKey}` },
               body: JSON.stringify({
-                contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
+                model,
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.7,
+                max_tokens: 8192,
               }),
+            });
+            if (res.ok) {
+              const d = await res.json();
+              const raw = d?.choices?.[0]?.message?.content || "";
+              const cleaned = raw.replace(/```json|```/g, "").trim();
+              const s = cleaned.indexOf("["), e = cleaned.lastIndexOf("]");
+              if (s !== -1 && e !== -1) { json = { _groq: true, _text: cleaned.slice(s, e + 1) }; break; }
+            } else {
+              const err = await res.json();
+              errorLog.push(`Groq ${model}: ${(err?.error?.message || "").slice(0, 60)}`);
             }
-          );
-          if (res.ok) { json = await res.json(); break; }
-          const errBody = await res.json();
-          const msg = errBody?.error?.message || `HTTP ${res.status}`;
-          errorLog.push(`${m.name}: ${msg.slice(0, 80)}`);
-        } catch (e) {
-          errorLog.push(`${m.name}: ${e.message.slice(0, 80)}`);
+          } catch (e) { errorLog.push(`Groq ${model}: ${e.message.slice(0, 60)}`); }
         }
       }
-      clearInterval(interval);
-      if (!json) throw new Error("Semua model gagal:\n" + errorLog.join("\n"));
 
-      const raw = json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      const cleaned = raw.replace(/```json|```/g, "").trim();
-      const start = cleaned.indexOf("[");
-      const end = cleaned.lastIndexOf("]");
-      if (start === -1 || end === -1) throw new Error("Format respons AI tidak valid");
-      const parsed = JSON.parse(cleaned.slice(start, end + 1));
+      // === GEMINI (fallback) ===
+      if (!json && geminiKey) {
+        const geminiModels = [
+          { name: "gemini-2.0-flash-lite", ver: "v1beta" },
+          { name: "gemini-2.0-flash", ver: "v1beta" },
+          { name: "gemini-1.5-flash", ver: "v1" },
+          { name: "gemini-1.5-flash-8b", ver: "v1" },
+        ];
+        for (const m of geminiModels) {
+          setLoadingMsg(`Gemini ${m.name}...`);
+          try {
+            const res = await fetch(
+              `https://generativelanguage.googleapis.com/${m.ver}/models/${m.name}:generateContent?key=${geminiKey}`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  contents: [{ parts: [{ text: prompt }] }],
+                  generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
+                }),
+              }
+            );
+            if (res.ok) { json = await res.json(); break; }
+            const err = await res.json();
+            errorLog.push(`Gemini ${m.name}: ${(err?.error?.message || "").slice(0, 60)}`);
+          } catch (e) { errorLog.push(`Gemini ${m.name}: ${e.message.slice(0, 60)}`); }
+        }
+      }
+
+      clearInterval(interval);
+      if (!json) throw new Error("Semua AI gagal:\n" + errorLog.join("\n"));
+
+      let raw = "";
+      if (json._groq) {
+        raw = json._text;
+      } else {
+        raw = json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        raw = raw.replace(/```json|```/g, "").trim();
+        const s = raw.indexOf("["), e = raw.lastIndexOf("]");
+        if (s !== -1 && e !== -1) raw = raw.slice(s, e + 1);
+      }
+      if (!raw) throw new Error("Format respons AI tidak valid");
+      const parsed = JSON.parse(raw);
       if (!Array.isArray(parsed) || parsed.length === 0) throw new Error("Tidak ada soal yang dihasilkan");
       const withMeta = parsed.map((q, i) => ({
         ...q,
@@ -1216,10 +1256,10 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
 
   return (
     <Modal title="✨ Generate Soal dengan AI" onClose={onClose} wide>
-      {!geminiKey && (
+      {!hasAnyKey && (
         <div className="mb-4 p-3 rounded-xl flex items-start gap-2" style={{ background: "rgba(234,179,8,0.1)", border: "1px solid rgba(234,179,8,0.3)" }}>
           <AlertTriangle size={16} className="text-amber-400 mt-0.5 shrink-0" />
-          <p className="text-amber-300 text-sm">API Key Gemini belum diatur. Admin perlu menambahkan Gemini API Key di menu <strong>Pengaturan → Integrasi AI</strong>. Key gratis tersedia di <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" className="underline">aistudio.google.com</a></p>
+          <p className="text-amber-300 text-sm">API Key belum diatur. Admin perlu menambahkan <strong>Groq API Key</strong> (gratis, direkomendasikan) di menu <strong>Pengaturan → Integrasi AI</strong>. Key gratis di <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" className="underline">console.groq.com</a></p>
         </div>
       )}
 
@@ -2263,28 +2303,47 @@ function ResultsView({ data }) {
   );
 }
 
-// ============= GEMINI KEY SETTING =============
+// ============= AI KEY SETTING =============
 function GeminiKeySetting({ data, dataRef, saveData, showToast }) {
-  const [key, setKey] = useState(data.meta?.geminiKey || "");
-  const [show, setShow] = useState(false);
+  const [groqKey, setGroqKey] = useState(data.meta?.groqKey || "");
+  const [geminiKey, setGeminiKey] = useState(data.meta?.geminiKey || "");
+  const [showGroq, setShowGroq] = useState(false);
+  const [showGemini, setShowGemini] = useState(false);
+
   const handleSave = () => {
     const latest = dataRef?.current || data;
-    const newMeta = { ...(latest.meta || {}), geminiKey: key.trim() };
+    const newMeta = { ...(latest.meta || {}), groqKey: groqKey.trim(), geminiKey: geminiKey.trim() };
     saveData({ ...latest, meta: newMeta }, ["meta"]);
-    showToast("API Key Gemini berhasil disimpan ✓");
+    showToast("API Key berhasil disimpan ✓");
   };
+
   return (
-    <div className="flex gap-2 items-end max-w-lg">
-      <div className="flex-1">
-        <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Gemini API Key</label>
-        <div className="relative">
-          <input type={show ? "text" : "password"} value={key} onChange={e => setKey(e.target.value)} placeholder="AIzaSy..." className="w-full py-2.5 px-3 pr-10 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
-          <button onClick={() => setShow(v => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white">
-            <Eye size={15} />
-          </button>
+    <div className="space-y-3 max-w-lg">
+      <div className="p-3 rounded-xl" style={{ background: "rgba(22,163,74,0.08)", border: "1px solid rgba(22,163,74,0.2)" }}>
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-green-400 font-bold text-sm">⚡ Groq AI</span>
+          <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: "rgba(22,163,74,0.2)", color: "#4ade80" }}>DIREKOMENDASIKAN · Gratis</span>
+        </div>
+        <p className="text-xs mb-2" style={{ color: "inherit", opacity: 0.6 }}>14.400 request/hari gratis, sangat cepat. Daftar di <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" className="text-blue-400 underline">console.groq.com</a></p>
+        <div className="flex gap-2">
+          <div className="relative flex-1">
+            <input type={showGroq ? "text" : "password"} value={groqKey} onChange={e => setGroqKey(e.target.value)} placeholder="gsk_..." className="w-full py-2 px-3 pr-9 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+            <button onClick={() => setShowGroq(v => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400"><Eye size={14} /></button>
+          </div>
         </div>
       </div>
-      <Btn onClick={handleSave}><Save size={14} />Simpan</Btn>
+      <div className="p-3 rounded-xl" style={{ background: "rgba(59,130,246,0.05)", border: "1px solid rgba(59,130,246,0.15)" }}>
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-blue-400 font-bold text-sm">✦ Gemini</span>
+          <span className="text-xs text-slate-500">Fallback (opsional)</span>
+        </div>
+        <p className="text-xs mb-2" style={{ color: "inherit", opacity: 0.6 }}>Daftar di <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" className="text-blue-400 underline">aistudio.google.com/apikey</a></p>
+        <div className="relative">
+          <input type={showGemini ? "text" : "password"} value={geminiKey} onChange={e => setGeminiKey(e.target.value)} placeholder="AIzaSy..." className="w-full py-2 px-3 pr-9 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+          <button onClick={() => setShowGemini(v => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400"><Eye size={14} /></button>
+        </div>
+      </div>
+      <Btn onClick={handleSave}><Save size={14} />Simpan API Keys</Btn>
     </div>
   );
 }
@@ -2317,8 +2376,8 @@ function SettingsView({ data, dataRef, saveData, showToast }) {
         </div>
       </Card>
       <Card className="mb-4">
-        <h3 className="font-bold mb-1" style={{ color: "inherit" }}>🤖 Integrasi AI (Gemini)</h3>
-        <p className="text-xs mb-3" style={{ color: "inherit", opacity: 0.6 }}>API Key Gemini gratis untuk fitur Generate Soal AI. Dapatkan key di <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" className="text-blue-400 underline">aistudio.google.com/apikey</a></p>
+        <h3 className="font-bold mb-1" style={{ color: "inherit" }}>🤖 Integrasi AI — Generate Soal</h3>
+        <p className="text-xs mb-3" style={{ color: "inherit", opacity: 0.6 }}>Tambahkan API Key untuk fitur Generate Soal otomatis. Groq direkomendasikan karena gratis dan cepat.</p>
         <GeminiKeySetting data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} />
       </Card>
       <Card className="mb-4">

@@ -303,26 +303,30 @@ export default function ExamApp() {
   useEffect(() => { dataRef.current = data; }, [data]);
 
   const handleLogin = useCallback((credentials) => {
-    if (!data) return;
+    // Always use freshest data — critical for newly added teachers/students
+    const d = dataRef.current || data;
+    if (!d) return;
     const { role, username, password } = credentials;
     let loggedUser = null;
     let nextView = "login";
+    // Admin credentials stored in data.meta.admin (not data.admin)
+    const adminCred = d.meta?.admin || { username: "admin", password: "admin123" };
 
     if (role === "admin") {
-      if (username === data.admin.username && password === data.admin.password) {
+      if (username === adminCred.username && password === adminCred.password) {
         loggedUser = { role: "admin", name: "Administrator" };
         nextView = "admin";
         showToast("Login berhasil sebagai Admin");
       } else { showToast("Username atau password salah", "error"); return; }
     } else if (role === "guru") {
-      const guru = data.teachers.find(t => t.name.toLowerCase() === username.toLowerCase() && (t.password ? t.password === password : t.nip === password));
+      const guru = (d.teachers || []).find(t => t.name.toLowerCase() === username.toLowerCase() && (t.password ? t.password === password : t.nip === password));
       if (guru) {
         loggedUser = { role: "guru", ...guru };
         nextView = "guru";
         showToast(`Selamat datang, ${guru.name}`);
       } else { showToast("Nama atau NIP/Password salah", "error"); return; }
     } else if (role === "siswa") {
-      const siswa = data.students.find(s => s.name.toLowerCase() === username.toLowerCase() && s.nisn === password);
+      const siswa = (d.students || []).find(s => s.name.toLowerCase() === username.toLowerCase() && s.nisn === password);
       if (siswa) {
         loggedUser = { role: "siswa", ...siswa };
         nextView = "siswa";

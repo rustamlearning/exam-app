@@ -1559,7 +1559,7 @@ function ScienceEditorModal({ value, onInsert, onClose, geminiKey }) {
   };
   const runOCR = async () => {
     const c = canvasRef.current; if (!c) return;
-    if (!geminiKey) { setOcr({ loading:false, result:"⚠️ Perlu Gemini API Key di Pengaturan Admin." }); return; }
+    if (!geminiKey) { setOcr({ loading:false, result:"⚠️ Fitur OCR memerlukan Gemini API Key. Silakan tambahkan di Pengaturan Admin → Integrasi AI, atau ketik LaTeX manual." }); return; }
     setOcr({ loading:true, result:"" });
     try {
       const b64 = c.toDataURL("image/png").split(",")[1];
@@ -1662,7 +1662,7 @@ function ScienceEditorModal({ value, onInsert, onClose, geminiKey }) {
                 </div>
               </div>
               <p className="text-xs" style={{color:"#475569"}}>
-                💡 <code style={{color:"#a5b4fc"}}>$…$</code> untuk inline · <code style={{color:"#a5b4fc"}}>$$…$$</code> untuk blok · <code style={{color:"#2dd4bf"}}>$\ce{"{"H2O{"}"}$</code> untuk kimia
+                💡 <code style={{color:"#a5b4fc"}}>$…$</code> untuk inline · <code style={{color:"#a5b4fc"}}>$$…$$</code> untuk blok · <code style={{color:"#2dd4bf"}}>{"$\ce{H2O}$"}</code> untuk kimia
               </p>
             </div>
           )}

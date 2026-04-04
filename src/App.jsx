@@ -1150,6 +1150,7 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
         { name: "gemini-1.5-pro", ver: "v1beta" },
       ];
       let json = null;
+      const errorLog = [];
       for (const m of models) {
         setLoadingMsg(`Mencoba ${m.name}...`);
         try {
@@ -1166,15 +1167,14 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
           );
           if (res.ok) { json = await res.json(); break; }
           const errBody = await res.json();
-          const msg = errBody?.error?.message || "";
-          console.warn(`${m.name} failed:`, msg);
-          // continue to next model for any error
+          const msg = errBody?.error?.message || `HTTP ${res.status}`;
+          errorLog.push(`${m.name}: ${msg.slice(0, 80)}`);
         } catch (e) {
-          console.warn(`${m.name} exception:`, e.message);
+          errorLog.push(`${m.name}: ${e.message.slice(0, 80)}`);
         }
       }
       clearInterval(interval);
-      if (!json) throw new Error("Semua model Gemini gagal. Kemungkinan quota API Key habis. Coba buat API Key baru di aistudio.google.com/apikey");
+      if (!json) throw new Error("Semua model gagal:\n" + errorLog.join("\n"));
 
       const raw = json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
       const cleaned = raw.replace(/```json|```/g, "").trim();

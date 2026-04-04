@@ -744,11 +744,8 @@ function ImportDataModal({ type, onImport, onClose, showToast }) {
   const isStudent = type === "students";
   const title = isStudent ? "Import Data Siswa" : "Import Data Guru";
   const template = isStudent
-    ? "Nama Lengkap,NISN,Kelas,Peminatan
-Ahmad Fauzi,1234567890,XII-MIPA 1,MIPA
-Siti Rahayu,0987654321,XII-IPS 1,IPS"
-    : "Nama Lengkap,NIP,Email
-Budi Santoso,199001012020011001,budi@sman6.sch.id";
+    ? "Nama Lengkap,NISN,Kelas,Peminatan\nAhmad Fauzi,1234567890,XII-MIPA 1,MIPA\nSiti Rahayu,0987654321,XII-IPS 1,IPS"
+    : "Nama Lengkap,NIP,Email\nBudi Santoso,199001012020011001,budi@sman6.sch.id";
 
   const downloadTemplate = () => {
     const blob = new Blob([template], { type: "text/csv" });
@@ -1116,7 +1113,7 @@ const MATH_SYMBOLS = [
   { label: "²", val: "²" }, { label: "³", val: "³" }, { label: "π", val: "π" },
   { label: "∑", val: "∑" }, { label: "∫", val: "∫" }, { label: "∆", val: "∆" },
   { label: "α", val: "α" }, { label: "β", val: "β" }, { label: "θ", val: "θ" },
-  { label: "λ", val: "λ }, { label: "μ", val: "μ" }, { label: "σ", val: "σ" },
+  { label: "λ", val: "λ" }, { label: "μ", val: "μ" }, { label: "σ", val: "σ" },
   { label: "∈", val: "∈" }, { label: "∉", val: "∉" }, { label: "⊂", val: "⊂" },
   { label: "∪", val: "∪" }, { label: "∩", val: "∩" }, { label: "∅", val: "∅" },
   { label: "→", val: "→" }, { label: "⟹", val: "⟹" }, { label: "⟺", val: "⟺" },

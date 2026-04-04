@@ -1167,15 +1167,15 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
             });
             if (res.ok) {
               const d = await res.json();
-              const raw = d?.choices?.[0]?.message?.content || "";
-              const cleaned = raw.replace(/```json|```/g, "").trim();
-              const s = cleaned.indexOf("["), e = cleaned.lastIndexOf("]");
-              if (s !== -1 && e !== -1) { json = { _groq: true, _text: cleaned.slice(s, e + 1) }; break; }
+              const rawText = d?.choices?.[0]?.message?.content || "";
+              const cleanedText = rawText.replace(/```json|```/g, "").trim();
+              const startIdx = cleanedText.indexOf("["), endIdx = cleanedText.lastIndexOf("]");
+              if (startIdx !== -1 && endIdx !== -1) { json = { _groq: true, _text: cleanedText.slice(startIdx, endIdx + 1) }; break; }
             } else {
-              const err = await res.json();
-              errorLog.push(`Groq ${model}: ${(err?.error?.message || "").slice(0, 60)}`);
+              const errData = await res.json();
+              errorLog.push(`Groq ${model}: ${(errData?.error?.message || "").slice(0, 60)}`);
             }
-          } catch (e) { errorLog.push(`Groq ${model}: ${e.message.slice(0, 60)}`); }
+          } catch (groqErr) { errorLog.push(`Groq ${model}: ${groqErr.message.slice(0, 60)}`); }
         }
       }
 
@@ -1202,9 +1202,9 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
               }
             );
             if (res.ok) { json = await res.json(); break; }
-            const err = await res.json();
-            errorLog.push(`Gemini ${m.name}: ${(err?.error?.message || "").slice(0, 60)}`);
-          } catch (e) { errorLog.push(`Gemini ${m.name}: ${e.message.slice(0, 60)}`); }
+            const errData2 = await res.json();
+            errorLog.push(`Gemini ${m.name}: ${(errData2?.error?.message || "").slice(0, 60)}`);
+          } catch (geminiErr) { errorLog.push(`Gemini ${m.name}: ${geminiErr.message.slice(0, 60)}`); }
         }
       }
 
@@ -1217,8 +1217,8 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
       } else {
         raw = json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
         raw = raw.replace(/```json|```/g, "").trim();
-        const s = raw.indexOf("["), e = raw.lastIndexOf("]");
-        if (s !== -1 && e !== -1) raw = raw.slice(s, e + 1);
+        const si = raw.indexOf("["), ei = raw.lastIndexOf("]");
+        if (si !== -1 && ei !== -1) raw = raw.slice(si, ei + 1);
       }
       if (!raw) throw new Error("Format respons AI tidak valid");
       const parsed = JSON.parse(raw);

@@ -1359,7 +1359,7 @@ Buat tepat ${aiForm.count} soal bervariasi sesuai kurikulum K-13/Merdeka.`;
                         <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: tc.bg, color: tc.color }}>{q.type === "pilgan" ? "Pilihan Ganda" : q.type === "benar_salah" ? "Benar/Salah" : "Uraian"}</span>
                         <span className="text-xs text-slate-400">#{i + 1}</span>
                       </div>
-                      <p className="text-sm mb-2" style={{ color: "inherit" }}>{q.text}</p>
+                      <p className="text-sm mb-2" style={{ color: "inherit" }}><MathText text={q.text} /></p>
                       {q.type === "pilgan" && q.options?.length > 0 && (
                         <div className="space-y-0.5 mb-1">
                           {q.options.map((opt, oi) => (
@@ -1386,6 +1386,480 @@ Buat tepat ${aiForm.count} soal bervariasi sesuai kurikulum K-13/Merdeka.`;
         </div>
       )}
     </Modal>
+  );
+}
+
+// ============================================================
+// ============= SCIENCE EDITOR SYSTEM ========================
+// ============================================================
+let _katexLoaded = false;
+function loadKaTeX() {
+  if (_katexLoaded) return Promise.resolve();
+  return new Promise(resolve => {
+    if (document.getElementById("katex-css")) { _katexLoaded = true; resolve(); return; }
+    const link = document.createElement("link");
+    link.id = "katex-css"; link.rel = "stylesheet";
+    link.href = "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css";
+    document.head.appendChild(link);
+    const s = document.createElement("script");
+    s.src = "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js";
+    s.onload = () => {
+      const s2 = document.createElement("script");
+      s2.src = "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/mhchem.min.js";
+      s2.onload = () => { _katexLoaded = true; resolve(); };
+      s2.onerror = () => { _katexLoaded = true; resolve(); };
+      document.head.appendChild(s2);
+    };
+    document.head.appendChild(s);
+  });
+}
+
+function MathText({ text, className = "" }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!ref.current || !text) return;
+    loadKaTeX().then(() => {
+      if (!ref.current || !window.katex) return;
+      try {
+        let html = text.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+        html = html.replace(/\$\$(.+?)\$\$/gs, (_, e) => {
+          try { return window.katex.renderToString(e.trim(), { displayMode:true, throwOnError:false, trust:true }); }
+          catch { return `<code style="color:#f87171">$$${e}$$</code>`; }
+        });
+        html = html.replace(/\$(.+?)\$/g, (_, e) => {
+          try { return window.katex.renderToString(e.trim(), { displayMode:false, throwOnError:false, trust:true }); }
+          catch { return `<code style="color:#f87171">$${e}$</code>`; }
+        });
+        html = html.replace(/\n/g,"<br/>");
+        ref.current.innerHTML = html;
+      } catch { ref.current.textContent = text; }
+    });
+  }, [text]);
+  return <span ref={ref} className={className}>{text}</span>;
+}
+
+// Symbol groups
+const SCI_SYMBOLS = {
+  "Matematika": [
+    {l:"Pecahan",k:"\\frac{a}{b}"},{l:"Akar",k:"\\sqrt{x}"},{l:"Akar n",k:"\\sqrt[n]{x}"},
+    {l:"Pangkat",k:"x^{2}"},{l:"Indeks",k:"x_{i}"},{l:"±",k:"\\pm"},{l:"×",k:"\\times"},
+    {l:"÷",k:"\\div"},{l:"≠",k:"\\neq"},{l:"≈",k:"\\approx"},{l:"≡",k:"\\equiv"},
+    {l:"≤",k:"\\leq"},{l:"≥",k:"\\geq"},{l:"∞",k:"\\infty"},{l:"∝",k:"\\propto"},
+    {l:"sin",k:"\\sin(x)"},{l:"cos",k:"\\cos(x)"},{l:"tan",k:"\\tan(x)"},
+    {l:"log",k:"\\log_{a}(x)"},{l:"ln",k:"\\ln(x)"},{l:"|x|",k:"\\left|x\\right|"},
+  ],
+  "Kalkulus": [
+    {l:"Integral",k:"\\int_{a}^{b} f(x)\\,dx"},{l:"Integral 2",k:"\\iint"},
+    {l:"Sigma",k:"\\sum_{i=1}^{n} x_i"},{l:"Produk",k:"\\prod_{i=1}^{n}"},
+    {l:"Limit",k:"\\lim_{x \\to 0}"},{l:"d/dx",k:"\\frac{d}{dx}"},
+    {l:"∂/∂x",k:"\\frac{\\partial f}{\\partial x}"},{l:"∇",k:"\\nabla"},
+    {l:"Δ",k:"\\Delta"},{l:"∮",k:"\\oint"},
+  ],
+  "Huruf Yunani": [
+    {l:"α",k:"\\alpha"},{l:"β",k:"\\beta"},{l:"γ",k:"\\gamma"},{l:"δ",k:"\\delta"},
+    {l:"ε",k:"\\epsilon"},{l:"θ",k:"\\theta"},{l:"λ",k:"\\lambda"},{l:"μ",k:"\\mu"},
+    {l:"π",k:"\\pi"},{l:"σ",k:"\\sigma"},{l:"τ",k:"\\tau"},{l:"φ",k:"\\phi"},
+    {l:"ω",k:"\\omega"},{l:"Δ",k:"\\Delta"},{l:"Σ",k:"\\Sigma"},{l:"Ω",k:"\\Omega"},
+    {l:"Π",k:"\\Pi"},{l:"Γ",k:"\\Gamma"},{l:"Λ",k:"\\Lambda"},{l:"Θ",k:"\\Theta"},
+  ],
+  "Himpunan & Logika": [
+    {l:"∈",k:"\\in"},{l:"∉",k:"\\notin"},{l:"⊂",k:"\\subset"},{l:"⊆",k:"\\subseteq"},
+    {l:"∪",k:"\\cup"},{l:"∩",k:"\\cap"},{l:"∅",k:"\\emptyset"},{l:"∀",k:"\\forall"},
+    {l:"∃",k:"\\exists"},{l:"¬",k:"\\neg"},{l:"∧",k:"\\wedge"},{l:"∨",k:"\\vee"},
+    {l:"→",k:"\\rightarrow"},{l:"⟺",k:"\\Leftrightarrow"},
+  ],
+  "Geometri": [
+    {l:"°",k:"^{\\circ}"},{l:"∠",k:"\\angle"},{l:"△",k:"\\triangle"},
+    {l:"⊥",k:"\\perp"},{l:"∥",k:"\\parallel"},{l:"≅",k:"\\cong"},{l:"∼",k:"\\sim"},
+    {l:"Vektor",k:"\\vec{v}"},{l:"Topi",k:"\\hat{u}"},{l:"|v|",k:"\\left|\\vec{v}\\right|"},
+    {l:"Busur",k:"\\overset{\\frown}{AB}"},
+  ],
+  "Fisika": [
+    {l:"F=ma",k:"F = ma"},{l:"E=mc²",k:"E = mc^2"},{l:"½mv²",k:"\\frac{1}{2}mv^2"},
+    {l:"Grav",k:"F = G\\frac{m_1 m_2}{r^2}"},{l:"Ohm",k:"V = IR"},
+    {l:"λ=v/f",k:"\\lambda = \\frac{v}{f}"},{l:"ρ",k:"\\rho"},{l:"ℏ",k:"\\hbar"},
+    {l:"E=hf",k:"E = hf"},{l:"μ₀",k:"\\mu_0"},{l:"ε₀",k:"\\varepsilon_0"},
+    {l:"∇×B",k:"\\nabla \\times \\vec{B}"},{l:"τ=r×F",k:"\\tau = \\vec{r} \\times \\vec{F}"},
+    {l:"Impuls",k:"J = F\\Delta t"},{l:"∮",k:"\\oint"},
+  ],
+  "Matriks": [
+    {l:"2×2",k:"\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}"},
+    {l:"Det",k:"\\begin{vmatrix} a & b \\\\ c & d \\end{vmatrix}"},
+    {l:"3×3",k:"\\begin{pmatrix} a & b & c \\\\ d & e & f \\\\ g & h & i \\end{pmatrix}"},
+    {l:"Identitas",k:"I = \\begin{pmatrix} 1 & 0 \\\\ 0 & 1 \\end{pmatrix}"},
+    {l:"Transpose",k:"A^{T}"},{l:"Invers",k:"A^{-1}"},
+  ],
+};
+
+const CHEM_SNIPPETS = [
+  {l:"→ Reaksi",k:"\\ce{A -> B}"},{l:"⇌ Setimbang",k:"\\ce{A <=> B}"},
+  {l:"H₂O",k:"\\ce{H2O}"},{l:"CO₂",k:"\\ce{CO2}"},{l:"H₂SO₄",k:"\\ce{H2SO4}"},
+  {l:"NaOH",k:"\\ce{NaOH}"},{l:"NH₃",k:"\\ce{NH3}"},{l:"HCl",k:"\\ce{HCl}"},
+  {l:"Ion+",k:"\\ce{Na+}"},{l:"Ion-",k:"\\ce{Cl-}"},{l:"Elektron",k:"\\ce{e-}"},
+  {l:"Endapan↓",k:"\\ce{BaSO4 v}"},{l:"Gas↑",k:"\\ce{H2 ^}"},
+  {l:"Pembakaran",k:"\\ce{CH4 + 2O2 -> CO2 + 2H2O}"},
+  {l:"Asam-Basa",k:"\\ce{HCl + NaOH -> NaCl + H2O}"},
+  {l:"Redoks",k:"\\ce{Zn + CuSO4 -> ZnSO4 + Cu}"},
+  {l:"Fotosintesis",k:"\\ce{6CO2 + 6H2O ->[$h\\nu$] C6H12O6 + 6O2}"},
+  {l:"Respirasi",k:"\\ce{C6H12O6 + 6O2 -> 6CO2 + 6H2O + ATP}"},
+  {l:"Hidrat",k:"\\ce{CuSO4.5H2O}"},{l:"Kondisi Δ",k:"\\ce{A ->[$\\Delta$] B}"},
+];
+
+function ScienceEditorModal({ value, onInsert, onClose, geminiKey }) {
+  const [tab, setTab] = useState("equation");
+  const [latex, setLatex] = useState(value || "");
+  const [symGroup, setSymGroup] = useState("Matematika");
+  const [ocr, setOcr] = useState({ loading: false, result: "" });
+  const canvasRef = useRef(null);
+  const isDrawing = useRef(false);
+  const lastPos = useRef({x:0,y:0});
+  const textareaRef = useRef(null);
+
+  const insertToEditor = (code, wrapDollar = true) => {
+    const el = textareaRef.current;
+    const ins = wrapDollar ? ` $${code}$ ` : code;
+    if (!el) { setLatex(v => v + ins); return; }
+    const s = el.selectionStart, e = el.selectionEnd;
+    const nv = latex.slice(0,s) + ins + latex.slice(e);
+    setLatex(nv);
+    setTimeout(() => { el.focus(); el.setSelectionRange(s+ins.length, s+ins.length); }, 0);
+  };
+
+  const getPos = (e, canvas) => {
+    const r = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / r.width;
+    const scaleY = canvas.height / r.height;
+    const src = e.touches?.[0] ?? e;
+    return { x:(src.clientX - r.left)*scaleX, y:(src.clientY - r.top)*scaleY };
+  };
+  const startDraw = (e) => {
+    const c = canvasRef.current; if (!c) return;
+    isDrawing.current = true;
+    lastPos.current = getPos(e, c);
+  };
+  const draw = (e) => {
+    if (!isDrawing.current) return;
+    e.preventDefault();
+    const c = canvasRef.current; if (!c) return;
+    const pos = getPos(e, c);
+    const ctx = c.getContext("2d");
+    ctx.beginPath();
+    ctx.lineWidth = 3; ctx.lineCap = "round"; ctx.lineJoin = "round";
+    ctx.strokeStyle = "#93c5fd";
+    ctx.moveTo(lastPos.current.x, lastPos.current.y);
+    ctx.lineTo(pos.x, pos.y);
+    ctx.stroke();
+    lastPos.current = pos;
+  };
+  const stopDraw = () => { isDrawing.current = false; };
+  const clearCanvas = () => {
+    const c = canvasRef.current; if (!c) return;
+    c.getContext("2d").clearRect(0,0,c.width,c.height);
+    setOcr({ loading:false, result:"" });
+  };
+  const runOCR = async () => {
+    const c = canvasRef.current; if (!c) return;
+    if (!geminiKey) { setOcr({ loading:false, result:"⚠️ Perlu Gemini API Key di Pengaturan Admin." }); return; }
+    setOcr({ loading:true, result:"" });
+    try {
+      const b64 = c.toDataURL("image/png").split(",")[1];
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`,
+        { method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({ contents:[{ parts:[
+            { inline_data:{ mime_type:"image/png", data:b64 }},
+            { text:"Kenali tulisan tangan matematika/fisika/kimia ini. Kembalikan HANYA kode LaTeX tanpa penjelasan, tanpa tanda $ pembungkus. Contoh output: \\frac{x^2-4}{x+2} atau \\ce{H2O}" }
+          ]}]})
+        }
+      );
+      const d = await res.json();
+      const txt = d?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+      setOcr({ loading:false, result: txt || "Tidak dikenali" });
+    } catch(err) { setOcr({ loading:false, result:"Gagal: " + err.message }); }
+  };
+
+  const TABS = [
+    {id:"equation",label:"✏️ Persamaan"},
+    {id:"symbols",label:"∑ Simbol"},
+    {id:"chemistry",label:"⚗️ Kimia"},
+    {id:"geometry",label:"📈 Geometri"},
+    {id:"ocr",label:"✋ OCR"},
+  ];
+
+  return (
+    <div className="fixed inset-0 z-[999] flex items-center justify-center p-2" style={{background:"rgba(0,0,0,0.8)"}}>
+      <div className="w-full max-w-5xl flex flex-col rounded-2xl overflow-hidden shadow-2xl" style={{background:"#0f172a",border:"1px solid rgba(99,102,241,0.4)",maxHeight:"95vh"}}>
+
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-3 shrink-0" style={{borderBottom:"1px solid rgba(99,102,241,0.2)"}}>
+          <div className="flex items-center gap-2">
+            <span className="text-xl">📐</span>
+            <h2 className="text-white font-bold text-lg">Science Editor</h2>
+            <span className="text-xs px-2 py-0.5 rounded-full" style={{background:"rgba(99,102,241,0.2)",color:"#a5b4fc"}}>KaTeX + mhchem</span>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={()=>{ onInsert(latex); onClose(); }}
+              className="px-4 py-1.5 rounded-xl text-sm font-bold transition"
+              style={{background:"#4f46e5",color:"white"}}>✓ Sisipkan ke Soal</button>
+            <button onClick={onClose} className="px-3 py-1.5 rounded-xl text-sm" style={{background:"rgba(51,65,85,0.7)",color:"#94a3b8"}}>✕</button>
+          </div>
+        </div>
+
+        {/* Tabs */}
+        <div className="flex gap-0.5 px-4 pt-3 shrink-0 overflow-x-auto" style={{borderBottom:"1px solid rgba(99,102,241,0.15)"}}>
+          {TABS.map(t => (
+            <button key={t.id} onClick={()=>setTab(t.id)}
+              className="px-4 py-2 text-xs font-semibold rounded-t-xl whitespace-nowrap transition"
+              style={{
+                background: tab===t.id ? "rgba(99,102,241,0.25)" : "transparent",
+                color: tab===t.id ? "#a5b4fc" : "#64748b",
+                borderBottom: tab===t.id ? "2px solid #6366f1" : "2px solid transparent"
+              }}>{t.label}</button>
+          ))}
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-hidden flex flex-col">
+
+          {/* ===== EQUATION EDITOR ===== */}
+          {tab==="equation" && (
+            <div className="flex-1 flex flex-col p-4 gap-3 overflow-auto">
+              {/* Quick inserts */}
+              <div className="flex flex-wrap gap-1.5">
+                {[
+                  {l:"\\frac{□}{□}",c:"\\frac{a}{b}"},{l:"√",c:"\\sqrt{x}"},
+                  {l:"x²",c:"x^{2}"},{l:"xᵢ",c:"x_{i}"},{l:"∫",c:"\\int_{a}^{b}"},
+                  {l:"∑",c:"\\sum_{i=1}^{n}"},{l:"lim",c:"\\lim_{x\\to 0}"},
+                  {l:"→",c:"\\rightarrow"},{l:"$…$",c:"$ $"},{l:"$$…$$",c:"$$\n\n$$"},
+                  {l:"matrix",c:"\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}"},
+                  {l:"\\vec{v}",c:"\\vec{v}"},{l:"\\hat{u}",c:"\\hat{u}"},
+                ].map(s => (
+                  <button key={s.l} onClick={()=>insertToEditor(s.c, false)}
+                    className="px-2.5 py-1 rounded-lg text-xs font-mono transition hover:scale-105"
+                    style={{background:"rgba(99,102,241,0.15)",color:"#a5b4fc",border:"1px solid rgba(99,102,241,0.25)"}}>
+                    {s.l}
+                  </button>
+                ))}
+              </div>
+
+              {/* Split editor/preview */}
+              <div className="flex gap-3 flex-1 min-h-0" style={{minHeight:220}}>
+                <div className="flex-1 flex flex-col gap-1">
+                  <label className="text-xs font-semibold" style={{color:"#64748b"}}>✏️ EDITOR LaTeX</label>
+                  <textarea ref={textareaRef} value={latex} onChange={e=>setLatex(e.target.value)}
+                    className="flex-1 p-3 rounded-xl text-white text-sm outline-none resize-none font-mono"
+                    style={{background:"rgba(15,23,42,0.95)",border:"1px solid rgba(99,102,241,0.3)",minHeight:180,lineHeight:1.7}}
+                    placeholder={"Contoh:\nHitung $\\frac{d}{dx}(x^3 - 2x)$\n\n$$\\int_0^{\\pi} \\sin(x)\\,dx = 2$$\n\n$\\ce{H2 + O2 -> H2O}$"} />
+                </div>
+                <div className="flex-1 flex flex-col gap-1">
+                  <label className="text-xs font-semibold" style={{color:"#22c55e"}}>👁 PREVIEW REAL-TIME</label>
+                  <div className="flex-1 p-3 rounded-xl text-sm overflow-auto"
+                    style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(34,197,94,0.2)",color:"#e2e8f0",minHeight:180}}>
+                    {latex
+                      ? <MathText text={latex} />
+                      : <span className="text-slate-600 italic text-xs">Preview muncul di sini saat Anda mengetik...</span>}
+                  </div>
+                </div>
+              </div>
+              <p className="text-xs" style={{color:"#475569"}}>
+                💡 <code style={{color:"#a5b4fc"}}>$…$</code> untuk inline · <code style={{color:"#a5b4fc"}}>$$…$$</code> untuk blok · <code style={{color:"#2dd4bf"}}>$\ce{"{"H2O{"}"}$</code> untuk kimia
+              </p>
+            </div>
+          )}
+
+          {/* ===== SYMBOL PICKER ===== */}
+          {tab==="symbols" && (
+            <div className="flex flex-1 overflow-hidden">
+              <div className="w-36 shrink-0 overflow-y-auto p-2 space-y-0.5" style={{borderRight:"1px solid rgba(99,102,241,0.15)"}}>
+                {Object.keys(SCI_SYMBOLS).map(g => (
+                  <button key={g} onClick={()=>setSymGroup(g)}
+                    className="w-full text-left px-3 py-2 rounded-lg text-xs font-medium transition"
+                    style={{
+                      background: symGroup===g ? "rgba(99,102,241,0.25)" : "transparent",
+                      color: symGroup===g ? "#a5b4fc" : "#64748b"
+                    }}>{g}</button>
+                ))}
+              </div>
+              <div className="flex-1 overflow-auto p-4">
+                <p className="text-xs mb-3" style={{color:"#475569"}}>Klik simbol → masuk ke editor persamaan</p>
+                <div className="grid gap-2" style={{gridTemplateColumns:"repeat(auto-fill,minmax(90px,1fr))"}}>
+                  {SCI_SYMBOLS[symGroup]?.map(s => (
+                    <button key={s.k} onClick={()=>{ insertToEditor(s.k, true); setTab("equation"); }}
+                      className="flex flex-col items-center gap-1.5 p-2.5 rounded-xl transition hover:scale-105"
+                      style={{background:"rgba(30,41,59,0.8)",border:"1px solid rgba(99,102,241,0.2)"}}>
+                      <div style={{color:"#e2e8f0",fontSize:16}}>
+                        <MathText text={`$${s.k.length < 20 ? s.k : s.k.split(" ")[0]}$`} />
+                      </div>
+                      <span className="text-center leading-tight" style={{color:"#64748b",fontSize:10}}>{s.l}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ===== CHEMISTRY EDITOR ===== */}
+          {tab==="chemistry" && (
+            <div className="flex-1 overflow-auto p-4">
+              <div className="flex items-center gap-2 mb-3">
+                <span className="text-xs font-semibold" style={{color:"#2dd4bf"}}>⚗️ Template Kimia</span>
+                <span className="text-xs" style={{color:"#475569"}}>— klik untuk masuk ke editor</span>
+              </div>
+              <div className="grid gap-2 mb-5" style={{gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))"}}>
+                {CHEM_SNIPPETS.map(s => (
+                  <button key={s.k} onClick={()=>{ insertToEditor(s.k, true); setTab("equation"); }}
+                    className="p-3 rounded-xl text-left transition hover:scale-[1.02]"
+                    style={{background:"rgba(20,184,166,0.08)",border:"1px solid rgba(20,184,166,0.2)"}}>
+                    <div className="text-xs font-semibold mb-1.5" style={{color:"#2dd4bf"}}>{s.l}</div>
+                    <div style={{color:"#e2e8f0",fontSize:13}}>
+                      <MathText text={`$${s.k}$`} />
+                    </div>
+                  </button>
+                ))}
+              </div>
+              <div className="p-4 rounded-xl" style={{background:"rgba(15,23,42,0.6)",border:"1px solid rgba(20,184,166,0.15)"}}>
+                <p className="text-xs font-bold mb-3" style={{color:"#2dd4bf"}}>📋 Panduan Sintaks mhchem:</p>
+                <div className="grid gap-1.5" style={{gridTemplateColumns:"1fr 1fr"}}>
+                  {[
+                    ["→ panah reaksi","\\ce{A -> B}"],["⇌ kesetimbangan","\\ce{A <=> B}"],
+                    ["subskrip H₂O","\\ce{H2O}"],["ion Ca²⁺","\\ce{Ca^2+}"],
+                    ["endapan ↓","\\ce{BaSO4 v}"],["gas ↑","\\ce{H2 ^}"],
+                    ["kondisi panas","\\ce{A ->[\\Delta] B}"],["hidrat","\\ce{CuSO4.5H2O}"],
+                    ["+ reaktan","\\ce{A + B -> C}"],["koefisien","\\ce{2H2 + O2 -> 2H2O}"],
+                  ].map(([a,b]) => (
+                    <div key={a} className="flex gap-2 p-2 rounded-lg items-start" style={{background:"rgba(15,23,42,0.5)"}}>
+                      <span className="text-xs shrink-0" style={{color:"#94a3b8"}}>{a}:</span>
+                      <code className="text-xs break-all" style={{color:"#a5b4fc"}}>{b}</code>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ===== GEOMETRY / GRAPH ===== */}
+          {tab==="geometry" && (
+            <div className="flex-1 flex flex-col p-4 gap-3">
+              <div className="flex gap-2 flex-wrap items-center">
+                <p className="text-xs" style={{color:"#64748b"}}>Buat grafik interaktif. Screenshot hasil → upload sebagai Gambar Soal.</p>
+                <a href="https://www.desmos.com/calculator" target="_blank" rel="noreferrer"
+                  className="px-3 py-1.5 rounded-xl text-xs font-semibold"
+                  style={{background:"rgba(59,130,246,0.2)",color:"#60a5fa",border:"1px solid rgba(59,130,246,0.3)"}}>
+                  📊 Desmos Calculator
+                </a>
+                <a href="https://www.geogebra.org/graphing" target="_blank" rel="noreferrer"
+                  className="px-3 py-1.5 rounded-xl text-xs font-semibold"
+                  style={{background:"rgba(168,85,247,0.2)",color:"#c084fc",border:"1px solid rgba(168,85,247,0.2)"}}>
+                  📐 GeoGebra
+                </a>
+                <a href="https://www.desmos.com/geometry" target="_blank" rel="noreferrer"
+                  className="px-3 py-1.5 rounded-xl text-xs font-semibold"
+                  style={{background:"rgba(20,184,166,0.2)",color:"#2dd4bf",border:"1px solid rgba(20,184,166,0.2)"}}>
+                  🔺 Desmos Geometry
+                </a>
+              </div>
+              <iframe
+                src="https://www.desmos.com/calculator"
+                title="Desmos Graphing Calculator"
+                className="flex-1 rounded-xl w-full"
+                style={{border:"1px solid rgba(99,102,241,0.25)",minHeight:400}} />
+            </div>
+          )}
+
+          {/* ===== OCR HANDWRITING ===== */}
+          {tab==="ocr" && (
+            <div className="flex-1 p-4 flex flex-col gap-3">
+              <div className="flex items-start gap-3">
+                <div className="flex-1">
+                  <p className="text-sm font-semibold mb-1" style={{color:"#e2e8f0"}}>✋ OCR Tulisan Tangan</p>
+                  <p className="text-xs" style={{color:"#64748b"}}>Tulis rumus matematika, fisika, atau kimia di kanvas. Klik <strong style={{color:"#e2e8f0"}}>Kenali dengan AI</strong> — Gemini akan mengubahnya menjadi kode LaTeX.</p>
+                </div>
+                {!geminiKey && (
+                  <div className="px-3 py-2 rounded-xl text-xs" style={{background:"rgba(234,179,8,0.1)",border:"1px solid rgba(234,179,8,0.3)",color:"#fbbf24"}}>
+                    ⚠️ Perlu Gemini API Key
+                  </div>
+                )}
+              </div>
+
+              <div className="flex gap-2">
+                <button onClick={clearCanvas} className="px-3 py-1.5 rounded-xl text-xs font-medium" style={{background:"rgba(220,38,38,0.15)",color:"#f87171",border:"1px solid rgba(220,38,38,0.25)"}}>🗑 Hapus</button>
+                <button onClick={runOCR} disabled={ocr.loading || !geminiKey}
+                  className="px-4 py-1.5 rounded-xl text-xs font-bold transition"
+                  style={{background: (!geminiKey||ocr.loading) ? "rgba(51,65,85,0.5)" : "rgba(99,102,241,0.3)", color: (!geminiKey||ocr.loading) ? "#475569":"#a5b4fc", border:"1px solid rgba(99,102,241,0.3)"}}>
+                  {ocr.loading ? "⏳ AI sedang mengenali..." : "✨ Kenali dengan AI"}
+                </button>
+              </div>
+
+              <div className="relative rounded-xl overflow-hidden" style={{border:"2px solid rgba(99,102,241,0.35)"}}>
+                <div className="absolute top-2 left-2 text-xs px-2 py-0.5 rounded-lg pointer-events-none" style={{background:"rgba(15,23,42,0.8)",color:"#475569"}}>
+                  Tulis di sini ✍️
+                </div>
+                <canvas ref={canvasRef} width={800} height={250}
+                  onMouseDown={startDraw} onMouseMove={draw} onMouseUp={stopDraw} onMouseLeave={stopDraw}
+                  onTouchStart={startDraw} onTouchMove={draw} onTouchEnd={stopDraw}
+                  className="w-full cursor-crosshair touch-none block"
+                  style={{background:"rgba(15,23,42,0.95)",maxHeight:250}} />
+              </div>
+
+              {ocr.result && (
+                <div className="p-4 rounded-xl" style={{background:"rgba(99,102,241,0.08)",border:"1px solid rgba(99,102,241,0.25)"}}>
+                  <p className="text-xs font-bold mb-2" style={{color:"#a5b4fc"}}>🎯 Hasil LaTeX dari AI:</p>
+                  <div className="p-2 rounded-lg mb-2" style={{background:"rgba(15,23,42,0.7)"}}>
+                    <code className="text-sm break-all" style={{color:"#e2e8f0"}}>{ocr.result}</code>
+                  </div>
+                  <p className="text-xs mb-2" style={{color:"#64748b"}}>Preview:</p>
+                  <div className="p-2 rounded-lg mb-3" style={{background:"rgba(255,255,255,0.03)",color:"#e2e8f0"}}>
+                    <MathText text={`$${ocr.result}$`} />
+                  </div>
+                  <div className="flex gap-2">
+                    <button onClick={()=>{ insertToEditor(ocr.result, true); setTab("equation"); }}
+                      className="px-4 py-1.5 rounded-xl text-xs font-bold"
+                      style={{background:"rgba(99,102,241,0.3)",color:"#a5b4fc",border:"1px solid rgba(99,102,241,0.4)"}}>
+                      ← Sisipkan ke Editor
+                    </button>
+                    <button onClick={()=>navigator.clipboard?.writeText(ocr.result)}
+                      className="px-3 py-1.5 rounded-xl text-xs"
+                      style={{background:"rgba(51,65,85,0.5)",color:"#94a3b8"}}>
+                      📋 Copy
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Simple LaTeX textarea with button to open Science Editor
+function LaTeXTextarea({ value, onChange, rows = 4, placeholder, geminiKey = "" }) {
+  const [showEditor, setShowEditor] = useState(false);
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+        <button onClick={() => setShowEditor(true)}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition"
+          style={{background:"linear-gradient(135deg,rgba(99,102,241,0.3),rgba(168,85,247,0.3))",color:"#a5b4fc",border:"1px solid rgba(99,102,241,0.35)"}}>
+          📐 Buka Science Editor
+        </button>
+        <span className="text-xs" style={{color:"#334155"}}>atau ketik LaTeX: <code style={{color:"#a5b4fc"}}>$x^2$</code></span>
+      </div>
+      <textarea value={value} onChange={e => onChange(e.target.value)} rows={rows}
+        placeholder={placeholder || "Ketik soal biasa atau LaTeX: $\\frac{x}{2} = 5$"}
+        className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500 font-mono"
+        style={{background:"rgba(15,23,42,0.8)",border:"1px solid rgba(59,130,246,0.25)"}} />
+      {value?.includes("$") && (
+        <div className="mt-1.5 px-3 py-2 rounded-xl text-sm" style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(99,102,241,0.15)",color:"#e2e8f0"}}>
+          <MathText text={value} />
+        </div>
+      )}
+      {showEditor && (
+        <ScienceEditorModal value={value} geminiKey={geminiKey}
+          onInsert={v => onChange(v)} onClose={() => setShowEditor(false)} />
+      )}
+    </div>
   );
 }
 
@@ -1545,7 +2019,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
             </div>
             <div>
               <label className="text-blue-300 text-sm font-medium mb-1 block">Teks Soal</label>
-              <textarea value={form.text} onChange={e => setForm({ ...form, text: e.target.value })} rows={4} placeholder="Masukkan teks soal..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+              <LaTeXTextarea value={form.text} onChange={v => setForm({ ...form, text: v })} rows={4} placeholder="Masukkan teks soal..." geminiKey={data.meta?.geminiKey || ""} />
             </div>
             <div>
               <label className="text-blue-300 text-sm font-medium mb-1 block">Gambar Soal (Opsional)</label>
@@ -1589,7 +2063,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
             {(form.type === "esai" || form.type === "uraian") && (
               <div>
                 <label className="text-blue-300 text-sm font-medium mb-1 block">Kunci Jawaban / Model Jawaban</label>
-                <textarea value={form.explanation} onChange={e => setForm({ ...form, explanation: e.target.value })} rows={4} placeholder="Tulis kunci jawaban atau model jawaban yang diharapkan..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+                <LaTeXTextarea value={form.explanation} onChange={v => setForm({ ...form, explanation: v })} rows={4} placeholder="Tulis kunci jawaban atau model jawaban yang diharapkan..." geminiKey={data.meta?.geminiKey || ""} />
                 <div className="mt-3">
                   <label className="text-blue-300 text-sm font-medium mb-1 block">Rubrik Penilaian (Opsional)</label>
                   <textarea value={form.rubrik || ""} onChange={e => setForm({ ...form, rubrik: e.target.value })} rows={3} placeholder="Contoh: Skor 4: jawaban lengkap dan benar, Skor 3: benar tapi kurang lengkap..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
@@ -1599,7 +2073,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
             {form.type === "pilgan" && (
               <div>
                 <label className="text-blue-300 text-sm font-medium mb-1 block">Pembahasan (Opsional)</label>
-                <textarea value={form.explanation} onChange={e => setForm({ ...form, explanation: e.target.value })} rows={2} placeholder="Tulis pembahasan..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+                <LaTeXTextarea value={form.explanation} onChange={v => setForm({ ...form, explanation: v })} rows={2} placeholder="Tulis pembahasan..." geminiKey={data.meta?.geminiKey || ""} />
               </div>
             )}
             <div className="flex justify-end gap-2 pt-2">
@@ -2780,7 +3254,7 @@ function TryoutTaker({ data, user, exam, onFinish, showToast }) {
 
       <Card className="mb-4">
         <div className="text-xs mb-2 text-blue-400">Soal {currentQ+1} dari {questions.length}</div>
-        <p className="text-base leading-relaxed mb-2" style={{ color: "inherit" }}>{q.text}</p>
+        <p className="text-base leading-relaxed mb-2" style={{ color: "inherit" }}><MathText text={q.text} /></p>
         {q.image && <img src={q.image} alt="" className="max-w-full rounded-xl mb-2" style={{ maxHeight: 200 }} />}
       </Card>
 
@@ -3144,7 +3618,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
         {existingSession && <div className="mb-3 px-3 py-2 rounded-lg text-amber-400 text-xs flex items-center gap-2" style={{ background: "rgba(217,119,6,0.1)", border: "1px solid rgba(217,119,6,0.2)" }}><RefreshCw size={12} />Melanjutkan ujian yang tersimpan</div>}
         <Card className="mb-4">
           <div className="text-blue-400 text-xs font-medium mb-2">Soal {currentQ + 1} dari {questions.length}</div>
-          <div className="text-white text-base leading-relaxed mb-3" style={{ whiteSpace: "pre-wrap" }}>{q.text}</div>
+          <div className="text-white text-base leading-relaxed mb-3" style={{ whiteSpace: "pre-wrap" }}><MathText text={q.text} /></div>
           {q.image && <img src={q.image} alt="Gambar soal" className="max-w-full rounded-xl mb-3" style={{ maxHeight: "300px" }} />}
         </Card>
         {/* Answer input based on question type */}

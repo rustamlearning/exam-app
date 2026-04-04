@@ -2095,7 +2095,6 @@ function ResultsView({ data }) {
               </div>
             </div>
           )}
-        </Card>
         </Card>}
 
         {notSubmitted.length > 0 && (

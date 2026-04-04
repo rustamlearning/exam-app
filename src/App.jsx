@@ -228,6 +228,13 @@ export default function ExamApp() {
           if (Date.now() - (writeTimesRef.current[col] || 0) < 1500) return;
           setData(prev => {
             if (!prev) return prev;
+            // Safety: never overwrite a non-empty array with empty array from Firebase
+            // (can happen transiently during writes, causing data loss appearance)
+            const prevVal = prev[col];
+            if (Array.isArray(prevVal) && prevVal.length > 0 && Array.isArray(val) && val.length === 0) {
+              console.warn("Listener: blocked empty array overwrite for", col);
+              return prev;
+            }
             const next = { ...prev, [col]: val };
             ls.set(CACHE_KEY, next);
             return next;
@@ -239,13 +246,29 @@ export default function ExamApp() {
     return () => { unsubsRef.current.forEach(u => u()); };
   }, []);
 
+  // CRITICAL: declare dataRef BEFORE saveData
+  const dataRef = useRef(null);
+  useEffect(() => { dataRef.current = data; }, [data]);
+
   const saveData = useCallback(async (newData, hints) => {
     if (!newData) return;
+    const prev = dataRef.current;
+    // Safety guard: never accidentally wipe non-empty questions/teachers/students
+    if (prev) {
+      if (prev.questions?.length > 0 && newData.questions !== undefined && newData.questions.length === 0 && !(hints || []).includes("questions")) {
+        console.warn("saveData: blocked accidental questions wipe"); return;
+      }
+      if (prev.teachers?.length > 0 && newData.teachers !== undefined && newData.teachers.length === 0 && !(hints || []).includes("teachers")) {
+        console.warn("saveData: blocked accidental teachers wipe"); return;
+      }
+      if (prev.students?.length > 0 && newData.students !== undefined && newData.students.length === 0 && !(hints || []).includes("students")) {
+        console.warn("saveData: blocked accidental students wipe"); return;
+      }
+    }
     setData(newData);
     ls.set(CACHE_KEY, newData);
     ls.set(BACKUP_KEY, newData);
     const toSave = hints || COLS.filter(col => {
-      const prev = dataRef.current;
       return newData[col] !== undefined && (!prev || JSON.stringify(newData[col]) !== JSON.stringify(prev[col]));
     });
     await Promise.all(toSave.map(async col => {
@@ -259,33 +282,30 @@ export default function ExamApp() {
     }));
   }, []);
 
-
-  // Expose dataRef so ExamTaker can always access latest data
-  const dataRef = useRef(null);
-  useEffect(() => { dataRef.current = data; }, [data]);
-
   const handleLogin = useCallback((credentials) => {
-    if (!data) return;
+    // Always use the freshest data available - important for newly added users
+    const currentData = dataRef.current || data;
+    if (!currentData) return;
     const { role, username, password } = credentials;
     let loggedUser = null;
     let nextView = "login";
+    const adminCred = currentData.meta?.admin || { username: "admin", password: "admin123" };
 
     if (role === "admin") {
-      const adminCred = data.meta?.admin || { username: "admin", password: "admin123" };
       if (username === adminCred.username && password === adminCred.password) {
         loggedUser = { role: "admin", name: "Administrator" };
         nextView = "admin";
         showToast("Login berhasil sebagai Admin");
       } else { showToast("Username atau password salah", "error"); return; }
     } else if (role === "guru") {
-      const guru = data.teachers.find(t => t.name.toLowerCase() === username.toLowerCase() && (t.password ? t.password === password : t.nip === password));
+      const guru = (currentData.teachers || []).find(t => t.name.toLowerCase() === username.toLowerCase() && (t.password ? t.password === password : t.nip === password));
       if (guru) {
         loggedUser = { role: "guru", ...guru };
         nextView = "guru";
         showToast(`Selamat datang, ${guru.name}`);
       } else { showToast("Nama atau NIP/Password salah", "error"); return; }
     } else if (role === "siswa") {
-      const siswa = data.students.find(s => s.name.toLowerCase() === username.toLowerCase() && s.nisn === password);
+      const siswa = (currentData.students || []).find(s => s.name.toLowerCase() === username.toLowerCase() && s.nisn === password);
       if (siswa) {
         loggedUser = { role: "siswa", ...siswa };
         nextView = "siswa";
@@ -1304,7 +1324,7 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
           </div>
           <div className="flex justify-end gap-2">
             <Btn variant="secondary" onClick={onClose}>Batal</Btn>
-            <Btn onClick={handleGenerate} disabled={!geminiKey}>
+            <Btn onClick={handleGenerate} disabled={!hasAnyKey}>
               <span>✨</span> Generate {aiForm.count} Soal
             </Btn>
           </div>
@@ -1448,7 +1468,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
   const handleBulkImport = (importedQuestions) => {
     const latest = dataRef?.current || data;
     const questions = [...(latest.questions || []), ...importedQuestions.map(q => ({ id: genId(), ...q, type: q.type || "pilgan", createdBy: userId || "admin" }))];
-    saveData({ ...latest, questions });
+    saveData({ ...latest, questions }, ["questions"]);
     setShowImport(false);
     showToast(`${importedQuestions.length} soal berhasil diimpor`);
   };
@@ -2105,7 +2125,7 @@ function ResultsView({ data }) {
               <td>${student?.name || "?"}</td>
               <td>${student?.kelas || "-"}</td>
               <td>${r.correct}/${totalQ}</td>
-              <td><strong>${r.score.toFixed(1)}</strong></td>
+              <td><strong>${r.score !== null && r.score !== undefined ? r.score.toFixed(1) : "Perlu Dinilai"}</strong></td>
               <td>${r.score === null ? 'Perlu Dinilai' : r.score.toFixed(1)}</td>
             </tr>`;
           }).join("")}
@@ -2192,8 +2212,8 @@ function ResultsView({ data }) {
                       {scoreNull ? (
                         <span className="px-1.5 py-0.5 rounded text-xs" style={{ background: "rgba(168,85,247,0.2)", color: "#c084fc" }}>Dinilai</span>
                       ) : (
-                        <span className="px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
-                          {r.score.toFixed(1)}
+                        <span className="px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: (r.score??0) >= 75 ? "rgba(22,163,74,0.2)" : (r.score??0) >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: (r.score??0) >= 75 ? "#4ade80" : (r.score??0) >= 50 ? "#fbbf24" : "#f87171" }}>
+                          {r.score !== null && r.score !== undefined ? r.score.toFixed(1) : "Perlu Dinilai"}
                         </span>
                       )}
                     </div>
@@ -2277,7 +2297,7 @@ function ResultsView({ data }) {
         <div className="space-y-3">
           {examsWithData.map(ex => {
             const results = (data.results || []).filter(r => r.examId === ex.id);
-            const avg = results.length > 0 ? (results.reduce((a, r) => a + r.score, 0) / results.length).toFixed(1) : "-";
+            const avg = results.length > 0 ? (results.reduce((a, r) => a + (r.score ?? 0), 0) / results.length).toFixed(1) : "-";
             const passCount = results.filter(r => r.score >= 75).length;
             return (
               <Card key={ex.id} className="cursor-pointer hover:border-blue-500/40 transition" onClick={() => setSelectedExam(ex.id)}>
@@ -2595,8 +2615,8 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
                         {r.submittedAt && <div className="text-slate-500 text-xs mt-0.5">{new Date(r.submittedAt).toLocaleString("id-ID")}</div>}
                       </div>
                       <div className="text-right">
-                        <span className="px-3 py-1 rounded-full text-lg font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
-                          {r.score.toFixed(1)}
+                        <span className="px-3 py-1 rounded-full text-lg font-bold" style={{ background: (r.score??0) >= 75 ? "rgba(22,163,74,0.2)" : (r.score??0) >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: (r.score??0) >= 75 ? "#4ade80" : (r.score??0) >= 50 ? "#fbbf24" : "#f87171" }}>
+                          {r.score !== null && r.score !== undefined ? r.score.toFixed(1) : "Perlu Dinilai"}
                         </span>
 
                       </div>

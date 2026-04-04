@@ -102,6 +102,7 @@ const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 
 // ============= GRANULAR STORE =============
+// Each collection is its own Firestore document → no race conditions
 const COLS = ["meta","teachers","students","subjects","questions","exams","sessions","results"];
 
 const store = {
@@ -111,10 +112,16 @@ const store = {
       return snap.exists() ? snap.data().value : null;
     } catch(e) { console.error("getCol", col, e); return null; }
   },
+  // setCol: NEVER writes undefined/null; retries once on failure
   async setCol(col, val) {
-    if (val === undefined) return;
+    if (val === undefined || val === null) return;
     try { await setDoc(doc(db, "examapp2", col), { value: val, ts: Date.now() }); }
-    catch(e) { console.error("setCol", col, e); throw e; }
+    catch(e) {
+      console.error("setCol err, retry:", col, e);
+      await new Promise(r => setTimeout(r, 2000));
+      try { await setDoc(doc(db, "examapp2", col), { value: val, ts: Date.now() }); }
+      catch(e2) { console.error("setCol retry failed:", col, e2); }
+    }
   },
   listenCol(col, cb) {
     return onSnapshot(
@@ -164,43 +171,56 @@ export default function ExamApp() {
     navText: isDark ? "#60a5fa" : "#1d4ed8",
     badge: isDark ? "rgba(51,65,85,0.8)" : "rgba(226,232,240,0.9)",
   };
-  const lastSaveRef = useRef(0);
-  const isWritingRef = useRef(false);
 
   const showToast = useCallback((msg, type = "success") => {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 3500);
   }, []);
 
-  const unsubsRef = useRef([]);
-  const writeTimesRef = useRef({});
+  // ── refs ────────────────────────────────────────────────────────────────────
+  // dataRef: always holds the latest data so closures never go stale
+  const dataRef = useRef(null);
+  useEffect(() => { dataRef.current = data; }, [data]);
 
+  const unsubsRef = useRef([]);
+  const writeTimesRef = useRef({}); // col → timestamp of last local write
+
+  // ── load + listeners ────────────────────────────────────────────────────────
   useEffect(() => {
+    let cancelled = false;
     (async () => {
-      // 1. Instant cache load
+      // 1. Instant paint from localStorage cache
       const cached = ls.get(CACHE_KEY);
-      if (cached && (cached.teachers || cached.questions || cached.exams)) {
-        setData({ ...DEFAULT_DATA, ...cached });
+      if (cached && Object.keys(cached).length > 2) {
+        const merged = { ...DEFAULT_DATA, ...cached };
+        setData(merged);
+        dataRef.current = merged;
         setLoading(false);
       }
 
-      // 2. Load all collections in parallel
+      // 2. Load all collections from Firestore in parallel
       try {
         const vals = await Promise.all(COLS.map(col => store.getCol(col)));
+        if (cancelled) return;
+        // Merge: prefer Firebase value; fall back to cache; never replace
+        // non-empty array with empty array (protects against transient nulls)
+        const cached2 = ls.get(CACHE_KEY) || {};
         const d = {
-          meta: vals[0] || DEFAULT_DATA.meta,
-          teachers: vals[1] || [],
-          students: vals[2] || [],
-          subjects: vals[3]?.length ? vals[3] : MAPEL_K13,
-          questions: vals[4] || [],
-          exams: vals[5] || [],
-          sessions: vals[6] || [],
-          results: vals[7] || [],
+          meta:      vals[0] || cached2.meta     || DEFAULT_DATA.meta,
+          teachers:  (vals[1]?.length  ? vals[1]  : null) ?? cached2.teachers  ?? [],
+          students:  (vals[2]?.length  ? vals[2]  : null) ?? cached2.students  ?? [],
+          subjects:  (vals[3]?.length  ? vals[3]  : null) ?? cached2.subjects  ?? MAPEL_K13,
+          questions: (vals[4]?.length  ? vals[4]  : null) ?? cached2.questions ?? [],
+          exams:     (vals[5]?.length  ? vals[5]  : null) ?? cached2.exams     ?? [],
+          sessions:  (vals[6]?.length  ? vals[6]  : null) ?? cached2.sessions  ?? [],
+          results:   (vals[7]?.length  ? vals[7]  : null) ?? cached2.results   ?? [],
         };
         setData(d);
+        dataRef.current = d;
         setLoading(false);
         ls.set(CACHE_KEY, d);
         ls.set(BACKUP_KEY, d);
+        // Initialise missing collections in Firestore
         COLS.forEach((col, i) => {
           if (vals[i] === null) {
             const def = col === "subjects" ? MAPEL_K13 : col === "meta" ? DEFAULT_DATA.meta : [];
@@ -209,32 +229,31 @@ export default function ExamApp() {
         });
       } catch(e) {
         console.error("Load error:", e);
+        if (cancelled) return;
         const backup = ls.get(BACKUP_KEY) || ls.get(CACHE_KEY);
-        if (backup) setData({ ...DEFAULT_DATA, ...backup });
+        if (backup) { setData({ ...DEFAULT_DATA, ...backup }); dataRef.current = { ...DEFAULT_DATA, ...backup }; }
         setLoading(false);
       }
 
-      // 3. Restore session
+      // 3. Restore login session
       const sess = ls.get(SESSION_KEY);
       if (sess?.user && sess?.view && sess.view !== "login") {
         setUser(sess.user); setView(sess.view);
       }
 
-      // 4. Per-collection realtime listeners
+      // 4. Realtime listeners — one per collection
       COLS.forEach(col => {
         const u = store.listenCol(col, (val, meta) => {
           if (val === null || val === undefined) return;
+          // Skip if we just wrote this collection ourselves (avoid echo)
           if (meta.hasPendingWrites) return;
-          if (Date.now() - (writeTimesRef.current[col] || 0) < 1500) return;
+          if (Date.now() - (writeTimesRef.current[col] || 0) < 2000) return;
           setData(prev => {
             if (!prev) return prev;
-            // Safety: never overwrite a non-empty array with empty array from Firebase
-            // (can happen transiently during writes, causing data loss appearance)
             const prevVal = prev[col];
-            if (Array.isArray(prevVal) && prevVal.length > 0 && Array.isArray(val) && val.length === 0) {
-              console.warn("Listener: blocked empty array overwrite for", col);
-              return prev;
-            }
+            // SAFETY: never replace a non-empty array with an empty one from server
+            if (Array.isArray(prevVal) && prevVal.length > 0 &&
+                Array.isArray(val) && val.length === 0) return prev;
             const next = { ...prev, [col]: val };
             ls.set(CACHE_KEY, next);
             return next;
@@ -243,53 +262,71 @@ export default function ExamApp() {
         unsubsRef.current.push(u);
       });
     })();
-    return () => { unsubsRef.current.forEach(u => u()); };
+    return () => {
+      cancelled = true;
+      unsubsRef.current.forEach(u => u());
+      unsubsRef.current = [];
+    };
   }, []);
 
-  // CRITICAL: declare dataRef BEFORE saveData
-  const dataRef = useRef(null);
-  useEffect(() => { dataRef.current = data; }, [data]);
-
+  // ── saveData ─────────────────────────────────────────────────────────────────
+  // hints: array of collection names that actually changed (e.g. ["questions"])
+  // ALWAYS pass hints when you know what changed — it prevents full-data saves.
   const saveData = useCallback(async (newData, hints) => {
     if (!newData) return;
+
+    // ── Safety guards: never wipe existing non-empty collections ──────────────
     const prev = dataRef.current;
-    // Safety guard: never accidentally wipe non-empty questions/teachers/students
     if (prev) {
-      if (prev.questions?.length > 0 && newData.questions !== undefined && newData.questions.length === 0 && !(hints || []).includes("questions")) {
-        console.warn("saveData: blocked accidental questions wipe"); return;
+      const safeNewData = { ...newData };
+      const protectedCols = ["questions","teachers","students","exams","results","subjects"];
+      for (const col of protectedCols) {
+        if (
+          Array.isArray(prev[col]) && prev[col].length > 0 &&
+          safeNewData[col] !== undefined &&
+          Array.isArray(safeNewData[col]) && safeNewData[col].length === 0 &&
+          !(hints || []).includes(col)
+        ) {
+          // Caller didn't explicitly say this col changed — restore from prev
+          console.warn("saveData: safety restored", col, "from prev");
+          safeNewData[col] = prev[col];
+        }
       }
-      if (prev.teachers?.length > 0 && newData.teachers !== undefined && newData.teachers.length === 0 && !(hints || []).includes("teachers")) {
-        console.warn("saveData: blocked accidental teachers wipe"); return;
-      }
-      if (prev.students?.length > 0 && newData.students !== undefined && newData.students.length === 0 && !(hints || []).includes("students")) {
-        console.warn("saveData: blocked accidental students wipe"); return;
-      }
+      // Update newData reference to safe version
+      newData = safeNewData;
     }
+
+    // Optimistic local update first (instant UI)
     setData(newData);
+    dataRef.current = newData;
     ls.set(CACHE_KEY, newData);
     ls.set(BACKUP_KEY, newData);
-    const toSave = hints || COLS.filter(col => {
-      return newData[col] !== undefined && (!prev || JSON.stringify(newData[col]) !== JSON.stringify(prev[col]));
-    });
+
+    // Determine which collections to persist
+    const toSave = hints
+      ? hints.filter(col => newData[col] !== undefined)
+      : COLS.filter(col => {
+          if (newData[col] === undefined) return false;
+          if (!prev) return true;
+          return JSON.stringify(newData[col]) !== JSON.stringify(prev[col]);
+        });
+
+    // Write each changed collection independently
     await Promise.all(toSave.map(async col => {
-      if (newData[col] === undefined) return;
+      if (newData[col] === undefined || newData[col] === null) return;
       writeTimesRef.current[col] = Date.now();
-      try { await store.setCol(col, newData[col]); }
-      catch(e) {
-        await new Promise(r => setTimeout(r, 1500));
-        store.setCol(col, newData[col]).catch(console.error);
-      }
+      await store.setCol(col, newData[col]);
     }));
   }, []);
 
   const handleLogin = useCallback((credentials) => {
-    // Always use the freshest data available - important for newly added users
-    const currentData = dataRef.current || data;
-    if (!currentData) return;
+    // Always use freshest data — critical for newly added teachers/students
+    const d = dataRef.current || data;
+    if (!d) return;
     const { role, username, password } = credentials;
     let loggedUser = null;
     let nextView = "login";
-    const adminCred = currentData.meta?.admin || { username: "admin", password: "admin123" };
+    const adminCred = d.meta?.admin || { username: "admin", password: "admin123" };
 
     if (role === "admin") {
       if (username === adminCred.username && password === adminCred.password) {
@@ -298,14 +335,17 @@ export default function ExamApp() {
         showToast("Login berhasil sebagai Admin");
       } else { showToast("Username atau password salah", "error"); return; }
     } else if (role === "guru") {
-      const guru = (currentData.teachers || []).find(t => t.name.toLowerCase() === username.toLowerCase() && (t.password ? t.password === password : t.nip === password));
+      const guru = (d.teachers || []).find(t =>
+        t.name.toLowerCase() === username.toLowerCase() &&
+        (t.password ? t.password === password : t.nip === password));
       if (guru) {
         loggedUser = { role: "guru", ...guru };
         nextView = "guru";
         showToast(`Selamat datang, ${guru.name}`);
       } else { showToast("Nama atau NIP/Password salah", "error"); return; }
     } else if (role === "siswa") {
-      const siswa = (currentData.students || []).find(s => s.name.toLowerCase() === username.toLowerCase() && s.nisn === password);
+      const siswa = (d.students || []).find(s =>
+        s.name.toLowerCase() === username.toLowerCase() && s.nisn === password);
       if (siswa) {
         loggedUser = { role: "siswa", ...siswa };
         nextView = "siswa";
@@ -1088,9 +1128,9 @@ function SubjectManager({ data, saveData, showToast }) {
   );
 }
 
-// ============= AI GENERATE MODAL =============
+// ============= AI GENERATE MODAL (Groq only) =============
 function AIGenerateModal({ data, dataRef, saveData, showToast, userId, onClose }) {
-  const [step, setStep] = useState("form"); // form | loading | preview
+  const [step, setStep] = useState("form");
   const [aiForm, setAiForm] = useState({
     subjectId: (data.subjects || [])[0]?.id || "",
     topic: "",
@@ -1103,61 +1143,43 @@ function AIGenerateModal({ data, dataRef, saveData, showToast, userId, onClose }
   const [selected, setSelected] = useState([]);
   const [loadingMsg, setLoadingMsg] = useState("");
 
-  const geminiKey = data.meta?.geminiKey || "";
   const groqKey = data.meta?.groqKey || "";
-  const hasAnyKey = geminiKey || groqKey;
 
   const getSubjectName = (id) => (data.subjects || []).find(s => s.id === id)?.name || "-";
 
   const buildPrompt = () => {
     const subjectName = getSubjectName(aiForm.subjectId);
-    const typeLabel = aiForm.type === "pilgan" ? "pilihan ganda (5 opsi A-E)" : aiForm.type === "benar_salah" ? "benar/salah" : "uraian singkat";
-    const diffLabel = { mudah: "mudah (tingkat SMA kelas X)", sedang: "sedang (tingkat SMA kelas XI)", sulit: "sulit (tingkat SMA kelas XII / HOTS)" }[aiForm.difficulty];
-    return `Kamu adalah guru SMA yang berpengalaman. Buat ${aiForm.count} soal ${typeLabel} mata pelajaran ${subjectName} materi "${aiForm.topic}" tingkat kesulitan ${diffLabel}.${aiForm.extra ? " Catatan tambahan: " + aiForm.extra : ""}
+    const typeLabel = aiForm.type === "pilgan" ? "pilihan ganda (5 opsi A-E)"
+      : aiForm.type === "benar_salah" ? "benar/salah"
+      : "uraian singkat";
+    const diffLabel = {
+      mudah: "mudah (tingkat SMA kelas X)",
+      sedang: "sedang (tingkat SMA kelas XI)",
+      sulit: "sulit (tingkat SMA kelas XII / HOTS)"
+    }[aiForm.difficulty];
+    return `Kamu adalah guru SMA berpengalaman. Buat ${aiForm.count} soal ${typeLabel} mata pelajaran ${subjectName} materi "${aiForm.topic}" tingkat ${diffLabel}.${aiForm.extra ? " Catatan: " + aiForm.extra : ""}
 
-WAJIB kembalikan HANYA array JSON valid, tanpa teks lain, tanpa markdown, tanpa komentar.
+Kembalikan HANYA array JSON valid, tanpa teks lain, tanpa markdown.
 
-Format JSON:
-${aiForm.type === "pilgan" ? `[
-  {
-    "text": "Pertanyaan soal di sini?",
-    "type": "pilgan",
-    "options": ["Opsi A", "Opsi B", "Opsi C", "Opsi D", "Opsi E"],
-    "correctAnswer": 0,
-    "explanation": "Pembahasan lengkap mengapa jawaban A benar."
-  }
-]` : aiForm.type === "benar_salah" ? `[
-  {
-    "text": "Pernyataan yang harus dinilai benar atau salah.",
-    "type": "benar_salah",
-    "options": ["Benar", "Salah"],
-    "correctAnswer": 0,
-    "explanation": "Pembahasan mengapa pernyataan ini Benar."
-  }
-]` : `[
-  {
-    "text": "Pertanyaan uraian di sini?",
-    "type": "uraian",
-    "options": [],
-    "correctAnswer": 0,
-    "explanation": "Kunci jawaban dan pembahasan lengkap."
-  }
-]`}
+Format:
+${aiForm.type === "pilgan" ? `[{"text":"Pertanyaan?","type":"pilgan","options":["A","B","C","D","E"],"correctAnswer":0,"explanation":"Pembahasan."}]`
+: aiForm.type === "benar_salah" ? `[{"text":"Pernyataan.","type":"benar_salah","options":["Benar","Salah"],"correctAnswer":0,"explanation":"Pembahasan."}]`
+: `[{"text":"Pertanyaan uraian?","type":"uraian","options":[],"correctAnswer":0,"explanation":"Kunci jawaban."}]`}
 
-Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan sesuai kurikulum K-13/Merdeka.`;
+Buat tepat ${aiForm.count} soal bervariasi sesuai kurikulum K-13/Merdeka.`;
   };
 
   const handleGenerate = async () => {
-    if (!hasAnyKey) return showToast("API Key belum diatur. Minta admin mengatur Groq atau Gemini API Key di Pengaturan.", "error");
+    if (!groqKey) return showToast("API Key Groq belum diatur. Minta admin mengatur di Pengaturan → Integrasi AI.", "error");
     if (!aiForm.topic.trim()) return showToast("Isi topik/materi terlebih dahulu", "error");
     if (!aiForm.subjectId) return showToast("Pilih mata pelajaran", "error");
 
     setStep("loading");
     const msgs = [
-      "Menghubungi Gemini AI...",
+      "Menghubungi Groq AI...",
       "Menganalisis materi " + aiForm.topic + "...",
       "Menyusun soal dan kunci jawaban...",
-      "Memvalidasi pembahasan...",
+      "Memvalidasi hasil...",
     ];
     let mi = 0;
     setLoadingMsg(msgs[0]);
@@ -1165,83 +1187,42 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
 
     try {
       const prompt = buildPrompt();
-      let json = null;
+      const groqModels = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"];
+      let raw = null;
       const errorLog = [];
 
-      // === GROQ (primary - free, fast) ===
-      if (groqKey) {
-        const groqModels = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"];
-        for (const model of groqModels) {
-          setLoadingMsg(`Groq AI (${model.split("-")[0]})...`);
-          try {
-            const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-              method: "POST",
-              headers: { "Content-Type": "application/json", "Authorization": `Bearer ${groqKey}` },
-              body: JSON.stringify({
-                model,
-                messages: [{ role: "user", content: prompt }],
-                temperature: 0.7,
-                max_tokens: 8192,
-              }),
-            });
-            if (res.ok) {
-              const d = await res.json();
-              const rawText = d?.choices?.[0]?.message?.content || "";
-              const cleanedText = rawText.replace(/```json|```/g, "").trim();
-              const startIdx = cleanedText.indexOf("["), endIdx = cleanedText.lastIndexOf("]");
-              if (startIdx !== -1 && endIdx !== -1) { json = { _groq: true, _text: cleanedText.slice(startIdx, endIdx + 1) }; break; }
-            } else {
-              const errData = await res.json();
-              errorLog.push(`Groq ${model}: ${(errData?.error?.message || "").slice(0, 60)}`);
-            }
-          } catch (groqErr) { errorLog.push(`Groq ${model}: ${groqErr.message.slice(0, 60)}`); }
-        }
-      }
-
-      // === GEMINI (fallback) ===
-      if (!json && geminiKey) {
-        const geminiModels = [
-          { name: "gemini-2.0-flash-lite", ver: "v1beta" },
-          { name: "gemini-2.0-flash", ver: "v1beta" },
-          { name: "gemini-1.5-flash", ver: "v1" },
-          { name: "gemini-1.5-flash-8b", ver: "v1" },
-        ];
-        for (const m of geminiModels) {
-          setLoadingMsg(`Gemini ${m.name}...`);
-          try {
-            const res = await fetch(
-              `https://generativelanguage.googleapis.com/${m.ver}/models/${m.name}:generateContent?key=${geminiKey}`,
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  contents: [{ parts: [{ text: prompt }] }],
-                  generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
-                }),
-              }
-            );
-            if (res.ok) { json = await res.json(); break; }
-            const errData2 = await res.json();
-            errorLog.push(`Gemini ${m.name}: ${(errData2?.error?.message || "").slice(0, 60)}`);
-          } catch (geminiErr) { errorLog.push(`Gemini ${m.name}: ${geminiErr.message.slice(0, 60)}`); }
-        }
+      for (const model of groqModels) {
+        setLoadingMsg(`Groq AI (${model.split("-")[0]})...`);
+        try {
+          const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${groqKey}` },
+            body: JSON.stringify({
+              model,
+              messages: [{ role: "user", content: prompt }],
+              temperature: 0.7,
+              max_tokens: 8192,
+            }),
+          });
+          if (res.ok) {
+            const d = await res.json();
+            const text = d?.choices?.[0]?.message?.content || "";
+            const clean = text.replace(/```json|```/g, "").trim();
+            const si = clean.indexOf("["), ei = clean.lastIndexOf("]");
+            if (si !== -1 && ei !== -1) { raw = clean.slice(si, ei + 1); break; }
+          } else {
+            const err = await res.json();
+            errorLog.push(`${model}: ${(err?.error?.message || "").slice(0, 80)}`);
+          }
+        } catch (e) { errorLog.push(`${model}: ${e.message.slice(0, 80)}`); }
       }
 
       clearInterval(interval);
-      if (!json) throw new Error("Semua AI gagal:\n" + errorLog.join("\n"));
+      if (!raw) throw new Error("Semua model Groq gagal:\n" + errorLog.join("\n"));
 
-      let raw = "";
-      if (json._groq) {
-        raw = json._text;
-      } else {
-        raw = json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-        raw = raw.replace(/```json|```/g, "").trim();
-        const si = raw.indexOf("["), ei = raw.lastIndexOf("]");
-        if (si !== -1 && ei !== -1) raw = raw.slice(si, ei + 1);
-      }
-      if (!raw) throw new Error("Format respons AI tidak valid");
       const parsed = JSON.parse(raw);
       if (!Array.isArray(parsed) || parsed.length === 0) throw new Error("Tidak ada soal yang dihasilkan");
+
       const withMeta = parsed.map((q, i) => ({
         ...q,
         subjectId: aiForm.subjectId,
@@ -1256,7 +1237,7 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
       setStep("preview");
     } catch (e) {
       clearInterval(interval);
-      showToast("Gagal: " + e.message, "error");
+      showToast("Gagal generate soal: " + e.message, "error");
       setStep("form");
     }
   };
@@ -1265,20 +1246,32 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
     const toSave = generated.filter(q => selected.includes(q._tempId));
     if (!toSave.length) return showToast("Pilih minimal 1 soal", "error");
     const latest = dataRef?.current || data;
-    const clean = toSave.map(({ _tempId, ...q }) => ({ id: "q" + Date.now() + Math.random().toString(36).slice(2, 6), ...q, createdBy: userId || "admin" }));
+    const clean = toSave.map(({ _tempId, ...q }) => ({
+      id: "q" + Date.now() + Math.random().toString(36).slice(2, 6),
+      ...q,
+      createdBy: userId || "admin"
+    }));
     saveData({ ...latest, questions: [...(latest.questions || []), ...clean] }, ["questions"]);
-    showToast(`${clean.length} soal berhasil ditambahkan ke bank soal! 🎉`);
+    showToast(`${clean.length} soal berhasil ditambahkan ke bank soal!`);
     onClose();
   };
 
-  const typeColors = { pilgan: { bg: "rgba(59,130,246,0.2)", color: "#60a5fa" }, benar_salah: { bg: "rgba(234,179,8,0.2)", color: "#fbbf24" }, uraian: { bg: "rgba(20,184,166,0.2)", color: "#2dd4bf" }, esai: { bg: "rgba(168,85,247,0.2)", color: "#c084fc" } };
+  const typeColors = {
+    pilgan: { bg: "rgba(59,130,246,0.2)", color: "#60a5fa" },
+    benar_salah: { bg: "rgba(234,179,8,0.2)", color: "#fbbf24" },
+    uraian: { bg: "rgba(20,184,166,0.2)", color: "#2dd4bf" },
+  };
 
   return (
-    <Modal title="✨ Generate Soal dengan AI" onClose={onClose} wide>
-      {!hasAnyKey && (
+    <Modal title="✨ Generate Soal dengan AI (Groq)" onClose={onClose} wide>
+      {!groqKey && (
         <div className="mb-4 p-3 rounded-xl flex items-start gap-2" style={{ background: "rgba(234,179,8,0.1)", border: "1px solid rgba(234,179,8,0.3)" }}>
           <AlertTriangle size={16} className="text-amber-400 mt-0.5 shrink-0" />
-          <p className="text-amber-300 text-sm">API Key belum diatur. Admin perlu menambahkan <strong>Groq API Key</strong> (gratis, direkomendasikan) di menu <strong>Pengaturan → Integrasi AI</strong>. Key gratis di <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" className="underline">console.groq.com</a></p>
+          <p className="text-amber-300 text-sm">
+            Groq API Key belum diatur. Admin perlu menambahkan key gratis di menu{" "}
+            <strong>Pengaturan → Integrasi AI</strong>. Daftar gratis di{" "}
+            <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" className="underline">console.groq.com</a>
+          </p>
         </div>
       )}
 
@@ -1316,15 +1309,15 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
           </div>
           <div>
             <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Topik / Materi <span className="text-red-400">*</span></label>
-            <input value={aiForm.topic} onChange={e => setAiForm({ ...aiForm, topic: e.target.value })} placeholder="Contoh: Sel dan Organel, Hukum Newton, Teks Narasi..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+            <input value={aiForm.topic} onChange={e => setAiForm({ ...aiForm, topic: e.target.value })} onKeyDown={e => e.key === "Enter" && handleGenerate()} placeholder="Contoh: Sel dan Organel, Hukum Newton, Teks Narasi..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
           </div>
           <div>
             <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Instruksi Tambahan (opsional)</label>
-            <textarea value={aiForm.extra} onChange={e => setAiForm({ ...aiForm, extra: e.target.value })} rows={2} placeholder="Contoh: Fokus pada aspek aplikasi, sertakan konteks Indonesia, hindari soal menghafal..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+            <textarea value={aiForm.extra} onChange={e => setAiForm({ ...aiForm, extra: e.target.value })} rows={2} placeholder="Contoh: Fokus pada aplikasi, konteks Indonesia..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
           </div>
           <div className="flex justify-end gap-2">
             <Btn variant="secondary" onClick={onClose}>Batal</Btn>
-            <Btn onClick={handleGenerate} disabled={!hasAnyKey}>
+            <Btn onClick={handleGenerate} disabled={!groqKey}>
               <span>✨</span> Generate {aiForm.count} Soal
             </Btn>
           </div>
@@ -1333,16 +1326,19 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
 
       {step === "loading" && (
         <div className="flex flex-col items-center justify-center py-12 gap-4">
-          <div className="w-12 h-12 rounded-full border-4 border-blue-500 border-t-transparent animate-spin" />
+          <div className="w-12 h-12 rounded-full border-4 border-blue-500 border-t-transparent" style={{ animation: "spin 1s linear infinite" }} />
           <p className="text-blue-300 text-sm font-medium">{loadingMsg}</p>
-          <p className="text-slate-500 text-xs">Gemini AI sedang menyusun soal berkualitas...</p>
+          <p className="text-slate-500 text-xs">Groq AI sedang menyusun soal...</p>
+          <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
         </div>
       )}
 
       {step === "preview" && (
         <div>
           <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-            <p className="text-sm" style={{ color: "inherit", opacity: 0.8 }}><span className="text-green-400 font-bold">{generated.length} soal</span> berhasil digenerate. Pilih yang ingin disimpan:</p>
+            <p className="text-sm" style={{ color: "inherit", opacity: 0.8 }}>
+              <span className="text-green-400 font-bold">{generated.length} soal</span> berhasil digenerate. Pilih yang ingin disimpan:
+            </p>
             <div className="flex gap-2">
               <button onClick={() => setSelected(generated.map(q => q._tempId))} className="text-xs text-blue-400 underline">Pilih Semua</button>
               <button onClick={() => setSelected([])} className="text-xs text-slate-400 underline">Batal Semua</button>
@@ -1361,42 +1357,31 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
                     <div className="flex-1">
                       <div className="flex gap-2 mb-1 flex-wrap">
                         <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: tc.bg, color: tc.color }}>{q.type === "pilgan" ? "Pilihan Ganda" : q.type === "benar_salah" ? "Benar/Salah" : "Uraian"}</span>
-                        <span className="text-xs text-slate-400">Soal {i + 1}</span>
+                        <span className="text-xs text-slate-400">#{i + 1}</span>
                       </div>
                       <p className="text-sm mb-2" style={{ color: "inherit" }}>{q.text}</p>
                       {q.type === "pilgan" && q.options?.length > 0 && (
-                        <div className="space-y-0.5 mb-2">
+                        <div className="space-y-0.5 mb-1">
                           {q.options.map((opt, oi) => (
                             <div key={oi} className="flex items-center gap-1.5 text-xs" style={{ color: oi === q.correctAnswer ? "#4ade80" : "#94a3b8" }}>
-                              <span className="font-bold">{String.fromCharCode(65 + oi)}.</span>
-                              <span>{opt}</span>
-                              {oi === q.correctAnswer && <CheckCircle size={10} />}
+                              <span>{oi === q.correctAnswer ? "✓" : "○"}</span>
+                              <span>{String.fromCharCode(65+oi)}. {opt}</span>
                             </div>
                           ))}
                         </div>
                       )}
-                      {q.type === "benar_salah" && (
-                        <p className="text-xs text-green-400 mb-1">✓ Jawaban: {q.options?.[q.correctAnswer] || "Benar"}</p>
-                      )}
-                      {q.explanation && (
-                        <div className="p-2 rounded-lg mt-1" style={{ background: "rgba(59,130,246,0.08)" }}>
-                          <p className="text-xs" style={{ color: "inherit", opacity: 0.75 }}><span className="text-blue-400 font-semibold">Pembahasan:</span> {q.explanation}</p>
-                        </div>
-                      )}
+                      {q.explanation && <p className="text-xs text-blue-300 mt-1">💡 {q.explanation.substring(0,120)}</p>}
                     </div>
                   </div>
                 </div>
               );
             })}
           </div>
-          <div className="flex justify-between items-center gap-2 flex-wrap">
-            <button onClick={() => { setStep("form"); setGenerated([]); setSelected([]); }} className="text-sm text-slate-400 underline">← Generate Ulang</button>
-            <div className="flex gap-2">
-              <Btn variant="secondary" onClick={onClose}>Batal</Btn>
-              <Btn onClick={handleSave} disabled={selected.length === 0}>
-                <Save size={14} /> Simpan {selected.length} Soal
-              </Btn>
-            </div>
+          <div className="flex justify-end gap-2">
+            <Btn variant="secondary" onClick={() => setStep("form")}><ArrowLeft size={14} />Kembali</Btn>
+            <Btn variant="success" onClick={handleSave} disabled={selected.length === 0}>
+              <Save size={14} />Simpan {selected.length} Soal ke Bank Soal
+            </Btn>
           </div>
         </div>
       )}
@@ -1467,7 +1452,14 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
 
   const handleBulkImport = (importedQuestions) => {
     const latest = dataRef?.current || data;
-    const questions = [...(latest.questions || []), ...importedQuestions.map(q => ({ id: genId(), ...q, type: q.type || "pilgan", createdBy: userId || "admin" }))];
+    const questions = [
+      ...(latest.questions || []),
+      ...importedQuestions.map(q => ({
+        id: genId(), ...q,
+        type: q.type || "pilgan",
+        createdBy: userId || "admin"
+      }))
+    ];
     saveData({ ...latest, questions }, ["questions"]);
     setShowImport(false);
     showToast(`${importedQuestions.length} soal berhasil diimpor`);
@@ -2084,7 +2076,7 @@ function ResultsView({ data }) {
   const handlePrint = (exam, results) => {
     const subjectName = (data.subjects || []).find(s => s.id === exam?.subjectId)?.name || "";
     const totalQ = exam?.questionIds?.length || 0;
-    const avg = results.length > 0 ? (results.reduce((a, r) => a + r.score, 0) / results.length).toFixed(1) : 0;
+    const avg = results.length > 0 ? (results.reduce((a, r) => a + (r.score ?? 0), 0) / results.length).toFixed(1) : 0;
 
     const printContent = `
       <!DOCTYPE html><html><head>
@@ -2135,7 +2127,7 @@ function ResultsView({ data }) {
         <strong>Rata-rata: ${avg}</strong> &nbsp;|&nbsp;
         Tertinggi: ${results.length > 0 ? Math.max(...results.map(r => r.score)).toFixed(1) : "-"} &nbsp;|&nbsp;
         Terendah: ${results.length > 0 ? Math.min(...results.map(r => r.score)).toFixed(1) : "-"} &nbsp;|&nbsp;
-        ≥75: ${results.filter(r => r.score !== null && r.score >= 75).length} siswa &nbsp;|&nbsp;
+        ≥75: ${results.filter(r => r.score !== null && (r.score ?? 0) >= 75).length} siswa &nbsp;|&nbsp;
         &lt;75: ${results.filter(r => r.score !== null && r.score < 75).length} siswa
       </div>
       </body></html>`;
@@ -2212,7 +2204,7 @@ function ResultsView({ data }) {
                       {scoreNull ? (
                         <span className="px-1.5 py-0.5 rounded text-xs" style={{ background: "rgba(168,85,247,0.2)", color: "#c084fc" }}>Dinilai</span>
                       ) : (
-                        <span className="px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: (r.score??0) >= 75 ? "rgba(22,163,74,0.2)" : (r.score??0) >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: (r.score??0) >= 75 ? "#4ade80" : (r.score??0) >= 50 ? "#fbbf24" : "#f87171" }}>
+                        <span className="px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
                           {r.score !== null && r.score !== undefined ? r.score.toFixed(1) : "Perlu Dinilai"}
                         </span>
                       )}
@@ -2274,7 +2266,7 @@ function ResultsView({ data }) {
       ${results.sort((a, b) => (b.score || 0) - (a.score || 0)).map((r, i) => {
         const st = data.students.find(s => s.id === r.studentId);
         const scoreDisplay = r.score === null ? "Belum dinilai" : r.score.toFixed(1);
-        const ket = r.score === null ? "Perlu Dinilai" : `${r.score.toFixed(1)}`;
+        const ket = r.score === null ? "Perlu Dinilai" : `${r.score !== null && r.score !== undefined ? r.score.toFixed(1) : "Perlu Dinilai"}`;
         const cls = "";
         return `<tr><td>${i+1}</td><td>${st?.name||"?"}</td><td>${st?.kelas||"-"}</td><td>${r.correct||0}/${totalQ}</td><td><strong>${scoreDisplay}</strong></td><td class="${cls}">${ket}</td></tr>`;
       }).join("")}
@@ -2298,7 +2290,933 @@ function ResultsView({ data }) {
           {examsWithData.map(ex => {
             const results = (data.results || []).filter(r => r.examId === ex.id);
             const avg = results.length > 0 ? (results.reduce((a, r) => a + (r.score ?? 0), 0) / results.length).toFixed(1) : "-";
-            const passCount = results.filter(r => r.score >= 75).length;
+            const passCount = results.filter(r => (r.score ?? 0) >= 75).length;
+            return (
+              <Card key={ex.id} className="cursor-pointer hover:border-blue-500/40 transition" onClick={() => setSelectedExam(ex.id)}>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="font-bold" style={{ color: "inherit" }}>{ex.title}</h3>
+                    <div className="text-sm" style={{ color: "inherit", opacity: 0.7 }}>{(data.subjects || []).find(s => s.id === ex.subjectId)?.name}</div>
+                    <div className="flex gap-4 mt-1">
+                      <span className="text-blue-400 text-xs">{results.length} peserta</span>
+                      <span className="text-white text-xs">Rata-rata: <strong>{avg}</strong></span>
+                      {results.length > 0 && <span className="text-blue-400 text-xs">≥75: {passCount}/{results.length}</span>}
+                    </div>
+                  </div>
+                  <ChevronRight size={20} className="text-slate-400" />
+                </div>
+              </Card>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ============= QUESTION MANAGER =============
+function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
+  const [showModal, setShowModal] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  const [showAI, setShowAI] = useState(false);
+  const [editId, setEditId] = useState(null);
+  const [filterSubject, setFilterSubject] = useState("all");
+  const [form, setForm] = useState({ subjectId: "", type: "pilgan", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "", rubrik: "" });
+  const [filterType, setFilterType] = useState("all");
+
+  const [showMineOnly, setShowMineOnly] = useState(false);
+  // Show all questions (not just createdBy this user) - prevents visibility issues
+  // from real-time sync delay. User can filter to "mine only".
+  const allQ = data.questions || [];
+  const baseQ = (userId && showMineOnly) ? allQ.filter(q => q.createdBy === userId) : allQ;
+  const filtered = baseQ.filter(q => {
+    if (filterSubject !== "all" && q.subjectId !== filterSubject) return false;
+    if (filterType !== "all" && (q.type || "pilgan") !== filterType) return false;
+    return true;
+  });
+  const myCount = userId ? allQ.filter(q => q.createdBy === userId).length : allQ.length;
+
+  const openAdd = () => { setEditId(null); setForm({ subjectId: (data.subjects || [])[0]?.id || "", type: "pilgan", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "", rubrik: "" }); setShowModal(true); };
+  const openEdit = (q) => { setEditId(q.id); setForm({ subjectId: q.subjectId, type: q.type || "pilgan", text: q.text, image: q.image || "", options: q.options?.length ? [...q.options, "", "", ""].slice(0, 5) : ["", "", "", "", ""], correctAnswer: q.correctAnswer || 0, explanation: q.explanation || "", rubrik: q.rubrik || "" }); setShowModal(true); };
+
+  const handleImageUpload = (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    if (file.size > 5 * 1024 * 1024) return showToast("Ukuran file maksimal 5MB", "error");
+    const reader = new FileReader();
+    reader.onload = ev => setForm(f => ({ ...f, image: ev.target.result }));
+    reader.readAsDataURL(file);
+  };
+
+  const handleSave = () => {
+    if (!form.subjectId || !form.text.trim()) return showToast("Mapel dan teks soal wajib diisi", "error");
+    if (form.type === "pilgan") {
+      const validOpts = form.options.filter(o => o.trim());
+      if (validOpts.length < 2) return showToast("Minimal 2 pilihan jawaban", "error");
+    }
+    const latest = dataRef?.current || data;
+    let questions = [...(latest.questions || [])];
+    const qData = {
+      ...form,
+      options: form.type === "pilgan" ? form.options.filter(o => o.trim()) : [],
+      createdBy: userId || "admin",
+      type: form.type || "pilgan"
+    };
+    if (editId) questions = questions.map(q => q.id === editId ? { ...q, ...qData } : q);
+    else questions.push({ id: genId(), ...qData });
+    saveData({ ...latest, questions }, ["questions"]);
+    setShowModal(false);
+    showToast(editId ? "Soal diperbarui" : "Soal berhasil ditambahkan");
+  };
+
+  const handleDelete = (id) => {
+    if (!confirm("Hapus soal ini?")) return;
+    const latest = dataRef?.current || data;
+    saveData({ ...latest, questions: (latest.questions || []).filter(q => q.id !== id) }, ["questions"]);
+    showToast("Soal dihapus");
+  };
+
+  const handleBulkImport = (importedQuestions) => {
+    const latest = dataRef?.current || data;
+    const questions = [
+      ...(latest.questions || []),
+      ...importedQuestions.map(q => ({
+        id: genId(), ...q,
+        type: q.type || "pilgan",
+        createdBy: userId || "admin"
+      }))
+    ];
+    saveData({ ...latest, questions }, ["questions"]);
+    setShowImport(false);
+    showToast(`${importedQuestions.length} soal berhasil diimpor`);
+  };
+
+  const getSubjectName = (sid) => (data.subjects || []).find(s => s.id === sid)?.name || "-";
+
+  return (
+    <div>
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
+        <div>
+          <h2 className="text-2xl font-bold" style={{ color: "inherit" }}>Bank Soal</h2>
+          {userId && <p className="text-xs mt-0.5" style={{ color: "inherit", opacity: 0.6 }}>Soal saya: {myCount} | Total: {allQ.length}</p>}
+        </div>
+        <div className="flex gap-2 flex-wrap">
+          {userId && <button onClick={() => setShowMineOnly(v => !v)} className="px-3 py-2 rounded-xl text-xs font-medium transition" style={{ background: showMineOnly ? "rgba(59,130,246,0.25)" : "rgba(51,65,85,0.5)", color: showMineOnly ? "#60a5fa" : "#94a3b8", border: "1px solid rgba(59,130,246,0.2)" }}>{showMineOnly ? "✓ Soal Saya" : "Semua Soal"}</button>}
+          <Btn variant="secondary" onClick={() => setShowImport(true)}><Upload size={16} />Import</Btn>
+          <button onClick={() => setShowAI(true)} className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-semibold transition" style={{ background: "linear-gradient(135deg, rgba(168,85,247,0.3), rgba(59,130,246,0.3))", color: "#c084fc", border: "1px solid rgba(168,85,247,0.4)" }}>✨ Generate AI</button>
+          <Btn onClick={openAdd}><Plus size={16} />Tambah Soal</Btn>
+        </div>
+      </div>
+      <Card>
+        <div className="mb-4 flex flex-wrap gap-2">
+          <select value={filterSubject} onChange={e => setFilterSubject(e.target.value)} className="py-2 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.2)" }}>
+            <option value="all">Semua Mata Pelajaran</option>
+            {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+          <select value={filterType} onChange={e => setFilterType(e.target.value)} className="py-2 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.2)" }}>
+            <option value="all">Semua Tipe</option>
+            <option value="pilgan">Pilihan Ganda</option>
+            <option value="esai">Esai</option>
+            <option value="uraian">Uraian</option>
+            <option value="benar_salah">Benar/Salah</option>
+          </select>
+        </div>
+        <div className="text-xs mb-3" style={{ color: "inherit", opacity: 0.65 }}>{filtered.length} soal</div>
+        {filtered.length === 0 ? <EmptyState icon={<FileText size={40} className="mx-auto" />} text="Belum ada soal" /> : (
+          <div className="space-y-3 max-h-[60vh] overflow-y-auto">
+            {filtered.map((q, i) => (
+              <div key={q.id} className="p-3 rounded-xl" style={{ background: "rgba(15,23,42,0.5)" }}>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 mb-1 flex-wrap"><span className="text-blue-400 text-xs">{getSubjectName(q.subjectId)}</span>{userId && q.createdBy !== userId && <span className="px-1.5 py-0.5 rounded text-xs" style={{ background: "rgba(168,85,247,0.15)", color: "#c084fc" }}>dari guru lain</span>}<span className="px-1.5 py-0.5 rounded text-xs" style={{ background: q.type === "esai" ? "rgba(168,85,247,0.2)" : q.type === "uraian" ? "rgba(20,184,166,0.2)" : q.type === "benar_salah" ? "rgba(234,179,8,0.2)" : "rgba(59,130,246,0.2)", color: q.type === "esai" ? "#c084fc" : q.type === "uraian" ? "#2dd4bf" : q.type === "benar_salah" ? "#fbbf24" : "#60a5fa" }}>{q.type === "esai" ? "Esai" : q.type === "uraian" ? "Uraian" : q.type === "benar_salah" ? "Benar/Salah" : "Pilihan Ganda"}</span></div>
+                    <div className="text-white text-sm mb-2">{i + 1}. {q.text.substring(0, 150)}{q.text.length > 150 ? "..." : ""}</div>
+                    {q.image && <img src={q.image} alt="" className="max-h-24 rounded-lg mb-2" />}
+                    <div className="flex flex-wrap gap-1">
+                      {q.options.map((o, oi) => (
+                        <span key={oi} className="px-2 py-0.5 rounded text-xs" style={{ background: oi === q.correctAnswer ? "rgba(22,163,74,0.2)" : "rgba(51,65,85,0.5)", color: oi === q.correctAnswer ? "#4ade80" : "#94a3b8" }}>
+                          {String.fromCharCode(65 + oi)}. {o.substring(0, 30)}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="flex gap-1">
+                    <button onClick={() => openEdit(q)} className="p-1.5 rounded-lg text-blue-400 hover:bg-blue-500/10"><Edit size={14} /></button>
+                    <button onClick={() => handleDelete(q.id)} className="p-1.5 rounded-lg text-red-400 hover:bg-red-500/10"><Trash2 size={14} /></button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      {showImport && <ImportSoalModal data={data} onImport={handleBulkImport} onClose={() => setShowImport(false)} showToast={showToast} />}
+
+      {showAI && <AIGenerateModal data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} userId={userId} onClose={() => setShowAI(false)} />}
+
+      {showModal && (
+        <Modal title={editId ? "Edit Soal" : "Tambah Soal"} onClose={() => setShowModal(false)} wide>
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <Select label="Mata Pelajaran" value={form.subjectId} onChange={e => setForm({ ...form, subjectId: e.target.value })}>
+                <option value="">-- Pilih Mapel --</option>
+                {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </Select>
+              <Select label="Tipe Soal" value={form.type} onChange={e => setForm({ ...form, type: e.target.value })}>
+                <option value="pilgan">Pilihan Ganda</option>
+                <option value="esai">Esai</option>
+                <option value="uraian">Uraian</option>
+                <option value="benar_salah">Benar / Salah</option>
+              </Select>
+            </div>
+            <div>
+              <label className="text-blue-300 text-sm font-medium mb-1 block">Teks Soal</label>
+              <textarea value={form.text} onChange={e => setForm({ ...form, text: e.target.value })} rows={4} placeholder="Masukkan teks soal..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+            </div>
+            <div>
+              <label className="text-blue-300 text-sm font-medium mb-1 block">Gambar Soal (Opsional)</label>
+              <div className="flex items-center gap-3">
+                <label className="cursor-pointer px-4 py-2 rounded-xl text-sm font-medium flex items-center gap-2 text-blue-400 hover:bg-blue-500/10 transition" style={{ border: "1px dashed rgba(59,130,246,0.4)" }}>
+                  <Upload size={16} />Pilih Gambar
+                  <input type="file" accept="image/jpeg,image/png" onChange={handleImageUpload} className="hidden" />
+                </label>
+                {form.image && (
+                  <div className="relative">
+                    <img src={form.image} alt="" className="h-16 rounded-lg" />
+                    <button onClick={() => setForm(f => ({ ...f, image: "" }))} className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 rounded-full flex items-center justify-center"><X size={10} color="white" /></button>
+                  </div>
+                )}
+              </div>
+            </div>
+            {(form.type === "pilgan") && (
+              <div>
+                <label className="text-blue-300 text-sm font-medium mb-2 block">Pilihan Jawaban</label>
+                {form.options.map((o, i) => (
+                  <div key={i} className="flex items-center gap-2 mb-2">
+                    <button onClick={() => setForm(f => ({ ...f, correctAnswer: i }))} className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold shrink-0 transition" style={{ background: form.correctAnswer === i ? "#16a34a" : "rgba(51,65,85,0.5)", color: "white" }}>
+                      {String.fromCharCode(65 + i)}
+                    </button>
+                    <input value={o} onChange={e => { const opts = [...form.options]; opts[i] = e.target.value; setForm({ ...form, options: opts }); }} placeholder={`Pilihan ${String.fromCharCode(65 + i)}`} className="flex-1 py-2 px-3 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: `1px solid ${form.correctAnswer === i ? "rgba(22,163,74,0.5)" : "rgba(59,130,246,0.25)"}` }} />
+                  </div>
+                ))}
+                <p className="text-slate-500 text-xs mt-1">Klik huruf untuk menandai jawaban benar (hijau)</p>
+              </div>
+            )}
+            {form.type === "benar_salah" && (
+              <div>
+                <label className="text-blue-300 text-sm font-medium mb-2 block">Jawaban Benar</label>
+                <div className="flex gap-3">
+                  {["Benar", "Salah"].map((opt, i) => (
+                    <button key={opt} onClick={() => setForm(f => ({ ...f, correctAnswer: i, options: ["Benar", "Salah"] }))} className="px-6 py-2 rounded-xl text-sm font-bold transition" style={{ background: form.correctAnswer === i ? "#16a34a" : "rgba(51,65,85,0.5)", color: "white" }}>{opt}</button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {(form.type === "esai" || form.type === "uraian") && (
+              <div>
+                <label className="text-blue-300 text-sm font-medium mb-1 block">Kunci Jawaban / Model Jawaban</label>
+                <textarea value={form.explanation} onChange={e => setForm({ ...form, explanation: e.target.value })} rows={4} placeholder="Tulis kunci jawaban atau model jawaban yang diharapkan..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+                <div className="mt-3">
+                  <label className="text-blue-300 text-sm font-medium mb-1 block">Rubrik Penilaian (Opsional)</label>
+                  <textarea value={form.rubrik || ""} onChange={e => setForm({ ...form, rubrik: e.target.value })} rows={3} placeholder="Contoh: Skor 4: jawaban lengkap dan benar, Skor 3: benar tapi kurang lengkap..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+                </div>
+              </div>
+            )}
+            {form.type === "pilgan" && (
+              <div>
+                <label className="text-blue-300 text-sm font-medium mb-1 block">Pembahasan (Opsional)</label>
+                <textarea value={form.explanation} onChange={e => setForm({ ...form, explanation: e.target.value })} rows={2} placeholder="Tulis pembahasan..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+              </div>
+            )}
+            <div className="flex justify-end gap-2 pt-2">
+              <Btn variant="secondary" onClick={() => setShowModal(false)}>Batal</Btn>
+              <Btn onClick={handleSave}><Save size={14} />{editId ? "Perbarui" : "Simpan"}</Btn>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ============= IMPORT SOAL MODAL (Word/PDF) =============
+function ImportSoalModal({ data, onImport, onClose, showToast }) {
+  const [step, setStep] = useState("upload"); // upload | preview | done
+  const [subjectId, setSubjectId] = useState((data.subjects || [])[0]?.id || "");
+  const [rawText, setRawText] = useState("");
+  const [parsed, setParsed] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [answerText, setAnswerText] = useState("");
+
+  const loadMammoth = async () => {
+    if (window.mammoth) return window.mammoth;
+    return new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js";
+      s.onload = () => resolve(window.mammoth);
+      s.onerror = () => reject(new Error("Gagal memuat mammoth.js"));
+      document.head.appendChild(s);
+    });
+  };
+
+  const handleFile = async (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    setLoading(true);
+    try {
+      if (file.name.endsWith(".docx")) {
+        const mammoth = await loadMammoth();
+        const ab = await file.arrayBuffer();
+        const result = await mammoth.extractRawText({ arrayBuffer: ab });
+        setRawText(result.value);
+      } else if (file.name.endsWith(".txt")) {
+        const text = await file.text();
+        setRawText(text);
+      } else {
+        showToast("Format tidak didukung. Gunakan .docx atau .txt", "error");
+      }
+    } catch (err) {
+      showToast("Gagal membaca file: " + err.message, "error");
+    }
+    setLoading(false);
+  };
+
+  const parseQuestions = () => {
+    if (!rawText.trim()) return showToast("Tidak ada teks untuk diparse", "error");
+    const lines = rawText.split("\n").map(l => l.trim()).filter(Boolean);
+    const questions = [];
+    let current = null;
+
+    // Parse answer key from answerText
+    const answerMap = {};
+    if (answerText.trim()) {
+      const ansLines = answerText.split("\n").map(l => l.trim()).filter(Boolean);
+      ansLines.forEach(l => {
+        const m = l.match(/(\d+)\s*[.)\-:\s]\s*([A-Ea-e])/);
+        if (m) answerMap[parseInt(m[1])] = m[2].toUpperCase().charCodeAt(0) - 65;
+      });
+    }
+
+    let qNum = 0;
+    lines.forEach(line => {
+      // Detect question: starts with number. or number)
+      const qMatch = line.match(/^(\d+)[.)]\s+(.+)/);
+      if (qMatch) {
+        if (current && current.options.length >= 2) questions.push(current);
+        qNum = parseInt(qMatch[1]);
+        current = { subjectId, text: qMatch[2], options: [], correctAnswer: answerMap[qNum] ?? 0, explanation: "" };
+        return;
+      }
+      // Detect option: A. or A) or (A)
+      const optMatch = line.match(/^[(\s]*([A-Ea-e])[.)]\s+(.+)/);
+      if (optMatch && current) {
+        current.options.push(optMatch[2]);
+        return;
+      }
+      // Continue question text
+      if (current && current.options.length === 0) {
+        current.text += " " + line;
+      }
+    });
+    if (current && current.options.length >= 2) questions.push(current);
+
+    if (questions.length === 0) return showToast("Tidak ada soal yang terdeteksi. Pastikan format: '1. Pertanyaan' dan 'A. Pilihan'", "error");
+    setParsed(questions);
+    setStep("preview");
+  };
+
+  return (
+    <Modal title="Import Soal dari Dokumen" onClose={onClose} wide>
+      {step === "upload" && (
+        <div className="space-y-4">
+          <Select label="Mata Pelajaran" value={subjectId} onChange={e => setSubjectId(e.target.value)}>
+            {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </Select>
+          <div>
+            <label className="text-blue-300 text-sm font-medium mb-1 block">File Soal (.docx atau .txt)</label>
+            <label className="cursor-pointer flex flex-col items-center justify-center gap-2 p-8 rounded-xl transition" style={{ border: "2px dashed rgba(59,130,246,0.4)", background: "rgba(15,23,42,0.5)" }}>
+              <Upload size={32} className="text-blue-400" />
+              <span className="text-blue-300 font-medium">{loading ? "Membaca file..." : "Klik untuk pilih file"}</span>
+              <span className="text-slate-500 text-xs">Format: .docx, .txt</span>
+              <input type="file" accept=".docx,.txt" onChange={handleFile} className="hidden" disabled={loading} />
+            </label>
+          </div>
+          {rawText && (
+            <div>
+              <label className="text-blue-300 text-sm font-medium mb-1 block">Preview teks ({rawText.length} karakter)</label>
+              <div className="p-3 rounded-xl text-slate-300 text-xs overflow-y-auto max-h-32" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.2)", whiteSpace: "pre-wrap" }}>
+                {rawText.substring(0, 500)}...
+              </div>
+            </div>
+          )}
+          <div>
+            <label className="text-blue-300 text-sm font-medium mb-1 block">Kunci Jawaban (opsional, format: "1. A", "2. B", ...)</label>
+            <textarea value={answerText} onChange={e => setAnswerText(e.target.value)} rows={4} placeholder={"1. A\n2. C\n3. B\n4. E\n..."} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+          </div>
+          <div className="flex justify-end gap-2">
+            <Btn variant="secondary" onClick={onClose}>Batal</Btn>
+            <Btn onClick={parseQuestions} disabled={!rawText || loading}><CheckCircle size={14} />Parse Soal Otomatis</Btn>
+          </div>
+        </div>
+      )}
+
+      {step === "preview" && (
+        <div>
+          <div className="flex items-center justify-between mb-4">
+            <div className="text-green-400 font-semibold">{parsed.length} soal terdeteksi</div>
+            <Btn variant="secondary" onClick={() => setStep("upload")}><ArrowLeft size={14} />Kembali</Btn>
+          </div>
+          <div className="space-y-3 max-h-[50vh] overflow-y-auto mb-4">
+            {parsed.map((q, i) => (
+              <div key={i} className="p-3 rounded-xl" style={{ background: "rgba(15,23,42,0.5)" }}>
+                <div className="text-white text-sm font-medium mb-1">{i+1}. {q.text.substring(0, 100)}</div>
+                <div className="flex flex-wrap gap-1">
+                  {q.options.map((o, oi) => (
+                    <span key={oi} className="px-2 py-0.5 rounded text-xs" style={{ background: oi === q.correctAnswer ? "rgba(22,163,74,0.2)" : "rgba(51,65,85,0.5)", color: oi === q.correctAnswer ? "#4ade80" : "#94a3b8" }}>
+                      {String.fromCharCode(65+oi)}. {o.substring(0,30)}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="flex justify-end gap-2">
+            <Btn variant="secondary" onClick={() => setStep("upload")}><ArrowLeft size={14} />Edit</Btn>
+            <Btn variant="success" onClick={() => onImport(parsed)}><Download size={14} />Import {parsed.length} Soal</Btn>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+// ============= EXAM MANAGER =============
+function ExamManager({ data, dataRef, saveData, showToast, isAdmin, userId }) {
+  const [showModal, setShowModal] = useState(false);
+  const [editId, setEditId] = useState(null);
+  const [form, setForm] = useState({ title: "", subjectId: "", targetKelas: [], duration: 90, startTime: "", endTime: "", shuffleQuestions: true, shuffleOptions: false, showResult: true, questionIds: [] });
+
+  const openAdd = () => {
+    setEditId(null);
+    const now = new Date(); const later = new Date(now.getTime() + 2 * 3600000);
+    setForm({ title: "", subjectId: (data.subjects || [])[0]?.id || "", targetKelas: [], duration: 90, startTime: now.toISOString().slice(0, 16), endTime: later.toISOString().slice(0, 16), shuffleQuestions: true, shuffleOptions: false, showResult: true, questionIds: [] });
+    setShowModal(true);
+  };
+  const openEdit = (ex) => { setEditId(ex.id); setForm({ ...ex }); setShowModal(true); };
+
+  const availableQuestions = useMemo(() => {
+    if (!form.subjectId) return [];
+    return data.questions.filter(q => q.subjectId === form.subjectId);
+  }, [form.subjectId, data.questions]);
+
+  const toggleQuestion = (qid) => setForm(f => ({ ...f, questionIds: f.questionIds.includes(qid) ? f.questionIds.filter(x => x !== qid) : [...f.questionIds, qid] }));
+  const toggleKelas = (k) => setForm(f => ({ ...f, targetKelas: f.targetKelas.includes(k) ? f.targetKelas.filter(x => x !== k) : [...f.targetKelas, k] }));
+
+  const handleSave = () => {
+    if (!form.title.trim() || !form.subjectId) return showToast("Judul dan mapel wajib diisi", "error");
+    if (form.questionIds.length === 0) return showToast("Pilih minimal 1 soal", "error");
+    if (form.targetKelas.length === 0) return showToast("Pilih minimal 1 kelas", "error");
+    const latest = dataRef?.current || data;
+    let exams = [...(latest.exams || [])];
+    const examData = { ...form, status: editId ? (exams.find(e => e.id === editId)?.status || "draft") : "draft", createdBy: userId || "admin" };
+    if (editId) exams = exams.map(e => e.id === editId ? { ...e, ...examData } : e);
+    else exams.push({ id: genId(), ...examData });
+    saveData({ ...latest, exams }, ["exams"]);
+    setShowModal(false);
+    showToast(editId ? "Ujian diperbarui" : "Ujian berhasil dibuat");
+  };
+
+  const toggleStatus = (examId, newStatus) => {
+    const latest = dataRef?.current || data;
+    const exams = latest.exams.map(e => e.id === examId ? { ...e, status: newStatus } : e);
+    saveData({ ...latest, exams }, ["exams"]);
+    showToast(`Ujian ${newStatus === "active" ? "diaktifkan" : newStatus === "ended" ? "diakhiri" : "di-draft-kan"}`);
+  };
+
+  const handleDelete = (id) => {
+    if (!confirm("Hapus ujian ini?")) return;
+    const latest = dataRef?.current || data;
+    const exams = latest.exams.filter(e => e.id !== id);
+    saveData({ ...latest, exams }, ["exams"]);
+    showToast("Ujian dihapus");
+  };
+
+  const getSubjectName = (sid) => (data.subjects || []).find(s => s.id === sid)?.name || "-";
+  const myExams = isAdmin ? data.exams : data.exams.filter(e => e.createdBy === userId);
+  const statusColors = { draft: { bg: "rgba(100,116,139,0.2)", text: "#94a3b8" }, active: { bg: "rgba(22,163,74,0.2)", text: "#4ade80" }, ended: { bg: "rgba(220,38,38,0.2)", text: "#f87171" } };
+  const statusLabels = { draft: "Draft", active: "Aktif", ended: "Selesai" };
+
+  return (
+    <div>
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
+        <h2 className="text-white text-2xl font-bold">Kelola Ujian</h2>
+        <Btn onClick={openAdd}><Plus size={16} />Buat Ujian</Btn>
+      </div>
+      {myExams.length === 0 ? <Card><EmptyState icon={<FileText size={40} className="mx-auto" />} text="Belum ada ujian" /></Card> : (
+        <div className="space-y-3">
+          {myExams.map(ex => {
+            const sessions = (data.sessions || []).filter(s => s.examId === ex.id);
+            const active = sessions.filter(s => s.status === "active").length;
+            const done = sessions.filter(s => s.status === "submitted").length;
+            return (
+              <Card key={ex.id}>
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1 flex-wrap">
+                      <h3 className="font-bold text-base" style={{ color: "inherit" }}>{ex.title}</h3>
+                      <span className="px-2 py-0.5 rounded-full text-xs font-medium" style={{ background: statusColors[ex.status]?.bg, color: statusColors[ex.status]?.text }}>{statusLabels[ex.status]}</span>
+                    </div>
+                    <div className="text-sm space-y-0.5" style={{ color: "inherit", opacity: 0.7 }}>
+                      <div>{getSubjectName(ex.subjectId)} • {ex.questionIds.length} soal • {ex.duration} menit</div>
+                      <div>Kelas: {ex.targetKelas?.join(", ") || "-"}</div>
+                      <div>Mulai: {new Date(ex.startTime).toLocaleString("id-ID")} — Selesai: {new Date(ex.endTime).toLocaleString("id-ID")}</div>
+                      {ex.status === "active" && <div className="text-blue-400 text-xs">{active} mengerjakan • {done} selesai</div>}
+                    </div>
+                  </div>
+                  <div className="flex gap-2 flex-wrap">
+                    {ex.status === "draft" && <Btn variant="success" onClick={() => toggleStatus(ex.id, "active")}><Play size={14} />Aktifkan</Btn>}
+                    {ex.status === "active" && <Btn variant="danger" onClick={() => toggleStatus(ex.id, "ended")}><Square size={14} />Akhiri</Btn>}
+                    {ex.status === "ended" && <Btn variant="secondary" onClick={() => toggleStatus(ex.id, "draft")}><RefreshCw size={14} />Draft</Btn>}
+                    <button onClick={() => openEdit(ex)} className="p-2 rounded-lg text-blue-400 hover:bg-blue-500/10"><Edit size={16} /></button>
+                    <button onClick={() => handleDelete(ex.id)} className="p-2 rounded-lg text-red-400 hover:bg-red-500/10"><Trash2 size={16} /></button>
+                  </div>
+                </div>
+              </Card>
+            );
+          })}
+        </div>
+      )}
+      {showModal && (
+        <Modal title={editId ? "Edit Ujian" : "Buat Ujian Baru"} onClose={() => setShowModal(false)} wide>
+          <div className="space-y-4">
+            <Input label="Judul Ujian" value={form.title} onChange={e => setForm({ ...form, title: e.target.value })} placeholder="cth: Ujian Akhir Semester Matematika" />
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <Select label="Mata Pelajaran" value={form.subjectId} onChange={e => setForm({ ...form, subjectId: e.target.value, questionIds: [] })}>
+                {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </Select>
+              <Input label="Durasi (menit)" type="number" value={form.duration} onChange={e => setForm({ ...form, duration: parseInt(e.target.value) || 0 })} />
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <Input label="Waktu Mulai" type="datetime-local" value={form.startTime} onChange={e => setForm({ ...form, startTime: e.target.value })} />
+              <Input label="Waktu Selesai" type="datetime-local" value={form.endTime} onChange={e => setForm({ ...form, endTime: e.target.value })} />
+            </div>
+            <div>
+              <label className="text-blue-300 text-sm font-medium mb-2 block">Kelas Peserta</label>
+              <div className="flex flex-wrap gap-1">
+                {KELAS_OPTIONS.map(k => (
+                  <button key={k} onClick={() => toggleKelas(k)} className="px-3 py-1 rounded-lg text-xs font-medium transition" style={{ background: form.targetKelas.includes(k) ? "rgba(59,130,246,0.3)" : "rgba(51,65,85,0.3)", color: form.targetKelas.includes(k) ? "#60a5fa" : "#94a3b8", border: `1px solid ${form.targetKelas.includes(k) ? "rgba(59,130,246,0.4)" : "transparent"}` }}>
+                    {k}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <label className="text-blue-300 text-sm font-medium mb-2 block">Pilih Soal ({form.questionIds.length} dipilih dari {availableQuestions.length} tersedia)</label>
+              {availableQuestions.length === 0 ? (
+                <p className="text-slate-500 text-sm">Belum ada soal untuk mapel ini.</p>
+              ) : (
+                <div className="space-y-1 max-h-48 overflow-y-auto pr-1">
+                  <button onClick={() => setForm(f => ({ ...f, questionIds: f.questionIds.length === availableQuestions.length ? [] : availableQuestions.map(q => q.id) }))} className="text-blue-400 text-xs hover:underline mb-1">
+                    {form.questionIds.length === availableQuestions.length ? "Batalkan Semua" : "Pilih Semua"}
+                  </button>
+                  {availableQuestions.map((q, i) => (
+                    <button key={q.id} onClick={() => toggleQuestion(q.id)} className="w-full text-left flex items-start gap-2 px-3 py-2 rounded-lg transition text-sm" style={{ background: form.questionIds.includes(q.id) ? "rgba(59,130,246,0.15)" : "rgba(15,23,42,0.4)" }}>
+                      <div className="w-5 h-5 rounded border flex items-center justify-center shrink-0 mt-0.5" style={{ borderColor: form.questionIds.includes(q.id) ? "#3b82f6" : "#475569", background: form.questionIds.includes(q.id) ? "#3b82f6" : "transparent" }}>
+                        {form.questionIds.includes(q.id) && <CheckCircle size={12} color="white" />}
+                      </div>
+                      <span className="" style={{ color: "inherit" }}>{i + 1}. {q.text.substring(0, 80)}{q.text.length > 80 ? "..." : ""}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-4">
+              {[["shuffleQuestions", "Acak urutan soal"], ["shuffleOptions", "Acak pilihan jawaban"], ["showResult", "Tampilkan hasil ke siswa"], ["isTryout", "Jadikan sebagai Tryout/Latihan (siswa bisa akses kapan saja)"]].map(([k, label]) => (
+                <label key={k} className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" checked={form[k]} onChange={e => setForm({ ...form, [k]: e.target.checked })} className="w-4 h-4 rounded" />
+                  <span className="text-slate-300 text-sm">{label}</span>
+                </label>
+              ))}
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <Btn variant="secondary" onClick={() => setShowModal(false)}>Batal</Btn>
+              <Btn onClick={handleSave}><Save size={14} />{editId ? "Perbarui" : "Buat Ujian"}</Btn>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ============= MONITOR VIEW =============
+function MonitorView({ data }) {
+  const [selectedExam, setSelectedExam] = useState(null);
+  const [, forceUpdate] = useState(0);
+  useEffect(() => { const iv = setInterval(() => forceUpdate(n => n + 1), 2000); return () => clearInterval(iv); }, []);
+
+  const activeExams = useMemo(() => data.exams.filter(e => e.status === "active"), [data.exams]);
+
+  if (selectedExam) {
+    const exam = data.exams.find(e => e.id === selectedExam);
+    if (!exam) return null;
+    const sessions = (data.sessions || []).filter(s => s.examId === selectedExam);
+    const examResults = (data.results || []).filter(r => r.examId === selectedExam);
+    const targetStudents = data.students.filter(s => exam.targetKelas?.includes(s.kelas));
+    const totalQ = exam.questionIds.length;
+    const getStudentStatus = (st) => {
+      const session = sessions.find(s => s.studentId === st.id);
+      const result = examResults.find(r => r.studentId === st.id);
+      if (result) return { status: "submitted", session, result };
+      if (session) return { status: session.status, session, result: null };
+      return { status: "belum", session: null, result: null };
+    };
+    const countActive = targetStudents.filter(s => getStudentStatus(s).status === "active").length;
+    const countDone = targetStudents.filter(s => getStudentStatus(s).status === "submitted").length;
+    const countPending = targetStudents.filter(s => getStudentStatus(s).status === "belum").length;
+
+    return (
+      <div>
+        <button onClick={() => setSelectedExam(null)} className="flex items-center gap-2 text-blue-400 mb-4 hover:underline"><ArrowLeft size={16} />Kembali</button>
+        <div className="flex items-center gap-3 mb-2">
+          <h2 className="text-white text-2xl font-bold">{exam.title}</h2>
+          <div className="flex items-center gap-2 px-3 py-1 rounded-full" style={{ background: "rgba(22,163,74,0.15)" }}><div className="w-2 h-2 rounded-full bg-green-400" style={{ animation: "pulse 1.5s infinite" }} /><span className="text-green-400 text-xs font-medium">LIVE</span></div>
+        </div>
+        <p className="text-sm mb-4" style={{ color: "inherit", opacity: 0.7 }}>Update otomatis setiap 2 detik</p>
+        <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 mb-4">
+          <StatCard icon={<Users size={20} className="text-blue-400" />} label="Total Peserta" value={targetStudents.length} />
+          <StatCard icon={<Play size={20} className="text-green-400" />} label="Mengerjakan" value={countActive} color="#16a34a" />
+          <StatCard icon={<CheckCircle size={20} className="text-amber-400" />} label="Selesai" value={countDone} color="#d97706" />
+          <StatCard icon={<AlertTriangle size={20} className="text-red-400" />} label="Belum Mulai" value={countPending} color="#dc2626" />
+        </div>
+        <Card>
+          <h3 className="font-bold mb-3" style={{ color: "inherit" }}>Status Peserta Real-time</h3>
+          <div className="space-y-2 max-h-[55vh] overflow-y-auto">
+            {[...targetStudents].sort((a, b) => {
+              const order = { active: 0, submitted: 1, belum: 2 };
+              return (order[getStudentStatus(a).status] ?? 2) - (order[getStudentStatus(b).status] ?? 2);
+            }).map(st => {
+              const { status, session, result } = getStudentStatus(st);
+              const answered = result ? Object.keys(result.answers || {}).length : Object.keys(session?.answers || {}).length;
+              let statusText = "Belum mulai", statusColor = "#64748b", bgColor = "rgba(15,23,42,0.3)";
+              if (status === "active") { statusText = "Mengerjakan (" + answered + "/" + totalQ + ")"; statusColor = "#3b82f6"; bgColor = "rgba(59,130,246,0.07)"; }
+              else if (status === "submitted") {
+                const score = result?.score;
+                statusText = (score !== null && score !== undefined) ? "Selesai — Nilai: " + score.toFixed(1) : "Selesai";
+                statusColor = "#16a34a"; bgColor = "rgba(22,163,74,0.07)";
+              }
+              const violations = result?.violations || session?.violations || 0;
+              const lastUpdate = session?.lastUpdate ? Math.round((Date.now() - session.lastUpdate) / 1000) : null;
+              return (
+                <div key={st.id} className="flex items-center justify-between px-3 py-2.5 rounded-xl" style={{ background: bgColor }}>
+                  <div className="flex items-center gap-3">
+                    <div className="w-3 h-3 rounded-full shrink-0" style={{ background: statusColor }} />
+                    <div>
+                      <div className="text-sm font-medium" style={{ color: "inherit" }}>{st.name}</div>
+                      <div className="text-xs" style={{ color: "inherit", opacity: 0.65 }}>{st.kelas} • NISN: {st.nisn}</div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3 text-right flex-wrap justify-end">
+                    <div>
+                      <div className="text-xs font-medium" style={{ color: statusColor }}>{statusText}</div>
+                      {status === "active" && lastUpdate !== null && (
+                        <div className="text-xs" style={{ opacity: 0.5 }}>{lastUpdate < 60 ? lastUpdate + "s lalu" : Math.round(lastUpdate/60) + "m lalu"}</div>
+                      )}
+                    </div>
+                    {violations > 0 && <div className="flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-lg" style={{ background: "rgba(220,38,38,0.2)", color: "#f87171" }}><AlertTriangle size={12} />⚠️ {violations}x</div>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+        {/* Progress bar */}
+        <Card className="mt-4">
+          <h3 className="font-bold mb-3" style={{ color: "inherit" }}>Progress Keseluruhan</h3>
+          <div className="space-y-2">
+            {[
+              { label: "Selesai", count: countDone, color: "#16a34a", bg: "#16a34a" },
+              { label: "Sedang mengerjakan", count: countActive, color: "#3b82f6", bg: "#3b82f6" },
+              { label: "Belum mulai", count: countPending, color: "#64748b", bg: "#64748b" },
+            ].map(item => (
+              <div key={item.label}>
+                <div className="flex justify-between text-xs text-slate-400 mb-1">
+                  <span>{item.label}</span><span>{item.count} siswa ({targetStudents.length > 0 ? Math.round(item.count/targetStudents.length*100) : 0}%)</span>
+                </div>
+                <div className="h-2 rounded-full overflow-hidden" style={{ background: "rgba(51,65,85,0.5)" }}>
+                  <div className="h-full rounded-full transition-all" style={{ width: `${targetStudents.length > 0 ? (item.count/targetStudents.length*100) : 0}%`, background: item.bg }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <h2 className="text-2xl font-bold mb-5" style={{ color: "inherit" }}>Monitoring Real-time</h2>
+      {activeExams.length === 0 ? <Card><EmptyState icon={<Monitor size={40} className="mx-auto" />} text="Tidak ada ujian aktif" /></Card> : (
+        <div className="space-y-3">
+          {activeExams.map(ex => {
+            const sessions = (data.sessions || []).filter(s => s.examId === ex.id);
+            const targetCount = data.students.filter(s => ex.targetKelas?.includes(s.kelas)).length;
+            return (
+              <Card key={ex.id} className="cursor-pointer hover:border-blue-500/40 transition" onClick={() => setSelectedExam(ex.id)}>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="font-bold" style={{ color: "inherit" }}>{ex.title}</h3>
+                    <div className="text-sm" style={{ color: "inherit", opacity: 0.7 }}>{(data.subjects || []).find(s => s.id === ex.subjectId)?.name} • {ex.questionIds.length} soal • {ex.duration} menit</div>
+                    <div className="flex gap-4 mt-2">
+                      <span className="text-green-400 text-xs font-medium">{sessions.filter(s => s.status === "active").length} mengerjakan</span>
+                      <span className="text-amber-400 text-xs font-medium">{sessions.filter(s => s.status === "submitted").length} selesai</span>
+                      <span className="text-xs" style={{ color: "inherit", opacity: 0.65 }}>{targetCount} total peserta</span>
+                    </div>
+                  </div>
+                  <ChevronRight size={20} className="text-slate-400" />
+                </div>
+              </Card>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============= RESULTS VIEW =============
+function ResultsView({ data }) {
+  const [selectedExam, setSelectedExam] = useState(null);
+  const [printing, setPrinting] = useState(false);
+  const [activeResultTab, setActiveResultTab] = useState("ranking");
+
+  // Show ALL exams that have at least 1 result, regardless of status
+  const examsWithData = data.exams.filter(e =>
+    (data.results || []).some(r => r.examId === e.id) || e.status === "ended"
+  ).sort((a, b) => {
+    const ra = (data.results || []).filter(r => r.examId === a.id).length;
+    const rb = (data.results || []).filter(r => r.examId === b.id).length;
+    return rb - ra;
+  });
+
+  const handlePrint = (exam, results) => {
+    const subjectName = (data.subjects || []).find(s => s.id === exam?.subjectId)?.name || "";
+    const totalQ = exam?.questionIds?.length || 0;
+    const avg = results.length > 0 ? (results.reduce((a, r) => a + (r.score ?? 0), 0) / results.length).toFixed(1) : 0;
+
+    const printContent = `
+      <!DOCTYPE html><html><head>
+      <title>Laporan Hasil Ujian - ${exam?.title}</title>
+      <style>
+        body { font-family: Arial, sans-serif; margin: 20px; color: #000; }
+        h1 { text-align: center; font-size: 16px; margin-bottom: 2px; }
+        h2 { text-align: center; font-size: 14px; color: #333; margin-bottom: 16px; }
+        .info { margin-bottom: 16px; font-size: 12px; }
+        .info table { border-collapse: collapse; width: 100%; max-width: 400px; }
+        .info td { padding: 3px 8px; }
+        .info td:first-child { font-weight: bold; width: 160px; }
+        table.results { width: 100%; border-collapse: collapse; font-size: 12px; }
+        table.results th { background: #1e3a5f; color: white; padding: 6px 8px; text-align: left; }
+        table.results td { padding: 5px 8px; border-bottom: 1px solid #ddd; }
+        table.results tr:nth-child(even) { background: #f5f5f5; }
+        .pass { color: green; font-weight: bold; }
+        .fail { color: red; font-weight: bold; }
+        .summary { margin-top: 16px; font-size: 12px; border-top: 2px solid #333; padding-top: 8px; }
+        @media print { body { margin: 10px; } }
+      </style></head><body>
+      <h1>${SCHOOL_NAME}</h1>
+      <h2>Laporan Hasil Ujian</h2>
+      <div class="info"><table>
+        <tr><td>Mata Ujian</td><td>: ${exam?.title}</td></tr>
+        <tr><td>Mata Pelajaran</td><td>: ${subjectName}</td></tr>
+        <tr><td>Jumlah Soal</td><td>: ${totalQ} soal</td></tr>
+        <tr><td>Jumlah Peserta</td><td>: ${results.length} siswa</td></tr>
+        <tr><td>Tanggal Cetak</td><td>: ${new Date().toLocaleDateString("id-ID", { weekday:"long", year:"numeric", month:"long", day:"numeric" })}</td></tr>
+      </table></div>
+      <table class="results">
+        <thead><tr><th>No</th><th>Nama Siswa</th><th>Kelas</th><th>Benar</th><th>Nilai</th><th>Ket.</th></tr></thead>
+        <tbody>
+          ${results.sort((a, b) => b.score - a.score).map((r, i) => {
+            const student = data.students.find(s => s.id === r.studentId);
+            return `<tr>
+              <td>${i+1}</td>
+              <td>${student?.name || "?"}</td>
+              <td>${student?.kelas || "-"}</td>
+              <td>${r.correct}/${totalQ}</td>
+              <td><strong>${r.score !== null && r.score !== undefined ? r.score.toFixed(1) : "Perlu Dinilai"}</strong></td>
+              <td>${r.score === null ? 'Perlu Dinilai' : r.score.toFixed(1)}</td>
+            </tr>`;
+          }).join("")}
+        </tbody>
+      </table>
+      <div class="summary">
+        <strong>Rata-rata: ${avg}</strong> &nbsp;|&nbsp;
+        Tertinggi: ${results.length > 0 ? Math.max(...results.map(r => r.score)).toFixed(1) : "-"} &nbsp;|&nbsp;
+        Terendah: ${results.length > 0 ? Math.min(...results.map(r => r.score)).toFixed(1) : "-"} &nbsp;|&nbsp;
+        ≥75: ${results.filter(r => r.score !== null && (r.score ?? 0) >= 75).length} siswa &nbsp;|&nbsp;
+        &lt;75: ${results.filter(r => r.score !== null && r.score < 75).length} siswa
+      </div>
+      </body></html>`;
+
+    const w = window.open("", "_blank");
+    w.document.write(printContent);
+    w.document.close();
+    w.onload = () => { w.print(); };
+  };
+
+  if (selectedExam) {
+    const exam = data.exams.find(e => e.id === selectedExam);
+    const results = (data.results || []).filter(r => r.examId === selectedExam);
+    const totalQ = exam?.questionIds?.length || 0;
+    const targetStudents = data.students.filter(s => exam?.targetKelas?.includes(s.kelas));
+    const submittedIds = new Set(results.map(r => r.studentId));
+    const notSubmitted = targetStudents.filter(s => !submittedIds.has(s.id));
+    const scoredResults = results.filter(r => r.score !== null && r.score !== undefined);
+    const avg = scoredResults.length > 0 ? (scoredResults.reduce((a, r) => a + r.score, 0) / scoredResults.length).toFixed(1) : "-";
+    const highest = scoredResults.length > 0 ? Math.max(...scoredResults.map(r => r.score)).toFixed(1) : "-";
+    const lowest = scoredResults.length > 0 ? Math.min(...scoredResults.map(r => r.score)).toFixed(1) : "-";
+    const rankedResults = [...results].sort((a, b) => (b.score||0) - (a.score||0));
+    // Per-question analysis
+    const questionAnalysis = exam?.questionIds?.map((qid, qi) => {
+      const q = data.questions.find(x => x.id === qid);
+      const answered = results.filter(r => r.answers && r.answers[qi] !== undefined && r.answers[qi] !== "");
+      const correct = results.filter(r => r.answers && r.answers[qi] === q?.correctAnswer);
+      const pct = answered.length > 0 ? Math.round(correct.length / answered.length * 100) : 0;
+      return { qi, q, answered: answered.length, correct: correct.length, pct };
+    }) || [];
+    // Score distribution
+    const dist = [0,0,0,0,0]; // 0-20,21-40,41-60,61-80,81-100
+    scoredResults.forEach(r => {
+      const idx = Math.min(4, Math.floor(r.score / 20));
+      dist[idx]++;
+    });
+    const maxDist = Math.max(...dist, 1);
+
+    return (
+      <div>
+        <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+          <button onClick={() => { setSelectedExam(null); setActiveResultTab("ranking"); }} className="flex items-center gap-2 text-blue-400 hover:underline"><ArrowLeft size={16} />Kembali</button>
+          <Btn variant="secondary" onClick={() => handlePrint(exam, results)}><Printer size={16} />Cetak Laporan PDF</Btn>
+        </div>
+        <h2 className="text-2xl font-bold mb-1" style={{ color: "inherit" }}>{exam?.title} — Hasil</h2>
+        <p className="text-sm mb-4" style={{ color: "inherit", opacity: 0.7 }}>{(data.subjects || []).find(s => s.id === exam?.subjectId)?.name} • {results.length} peserta</p>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+          <StatCard icon={<Users size={20} className="text-blue-400" />} label="Total Peserta" value={targetStudents.length} />
+          <StatCard icon={<Award size={20} className="text-green-400" />} label="Rata-rata" value={avg} color="#16a34a" />
+          <StatCard icon={<BarChart3 size={20} className="text-purple-400" />} label="Tertinggi" value={highest} color="#9333ea" />
+          <StatCard icon={<BarChart3 size={20} className="text-amber-400" />} label="Terendah" value={lowest} color="#d97706" />
+        </div>
+        <Card>
+          {results.length === 0 ? <EmptyState icon={<BarChart3 size={40} className="mx-auto" />} text="Belum ada hasil" /> : (
+            <div>
+              <div className="grid grid-cols-12 gap-2 px-3 py-2 text-xs text-slate-400 font-semibold uppercase">
+                <div className="col-span-1">No</div>
+                <div className="col-span-4">Nama</div>
+                <div className="col-span-2">Kelas</div>
+                <div className="col-span-2">Benar</div>
+                <div className="col-span-3">Nilai</div>
+              </div>
+              {rankedResults.map((r, i) => {
+                const student = data.students.find(s => s.id === r.studentId);
+                const scoreNull = r.score === null || r.score === undefined;
+                const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : String(i+1);
+                return (
+                  <div key={r.id} className="grid grid-cols-12 gap-2 px-3 py-2.5 rounded-lg items-center mb-0.5" style={{ background: i % 2 === 0 ? "rgba(15,23,42,0.3)" : "transparent" }}>
+                    <div className="col-span-1 text-sm font-bold text-center">{medal}</div>
+                    <div className="col-span-4 text-sm font-medium" style={{ color: "inherit" }}>{student?.name || "?"}</div>
+                    <div className="col-span-2 text-sm text-center" style={{ color: "inherit", opacity: 0.65 }}>{student?.kelas || "-"}</div>
+                    <div className="col-span-2 text-sm text-center" style={{ color: "inherit", opacity: 0.8 }}>{r.correct||0}/{totalQ}</div>
+                    <div className="col-span-3 text-center">
+                      {scoreNull ? (
+                        <span className="px-1.5 py-0.5 rounded text-xs" style={{ background: "rgba(168,85,247,0.2)", color: "#c084fc" }}>Dinilai</span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
+                          {r.score !== null && r.score !== undefined ? r.score.toFixed(1) : "Perlu Dinilai"}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+              <div className="mt-3 pt-3 px-3 flex flex-wrap gap-4" style={{ borderTop: "1px solid rgba(59,130,246,0.15)" }}>
+                <span className="text-xs" style={{ color: "inherit", opacity: 0.7 }}>Rata-rata: <strong>{avg}</strong></span>
+                <span className="text-xs text-green-400">Tertinggi: <strong>{highest}</strong></span>
+                <span className="text-xs text-red-400">Terendah: <strong>{lowest}</strong></span>
+                <span className="text-xs text-blue-400">Mengumpulkan: <strong>{results.length}/{targetStudents.length}</strong></span>
+              </div>
+            </div>
+          )}
+        </Card>
+
+        {notSubmitted.length > 0 && (
+          <Card className="mt-4">
+            <h3 className="font-bold mb-3" style={{ color: "inherit" }}>Belum Mengumpulkan ({notSubmitted.length} siswa)</h3>
+            <div className="space-y-1">
+              {notSubmitted.map(s => (
+                <div key={s.id} className="flex items-center justify-between px-3 py-2 rounded-lg" style={{ background: "rgba(220,38,38,0.06)" }}>
+                  <span className="text-sm" style={{ color: "inherit" }}>{s.name}</span>
+                  <span className="text-xs" style={{ color: "inherit", opacity: 0.6 }}>{s.kelas} • NISN: {s.nisn}</span>
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
+      </div>
+    );
+  }
+
+  const handleDownloadAllPDF = () => {
+    const allRows = examsWithData.map(ex => {
+      const results = (data.results || []).filter(r => r.examId === ex.id);
+      const avg = results.length > 0 ? (results.reduce((a, r) => a + (r.score || 0), 0) / results.length).toFixed(1) : "-";
+      return { ex, results, avg };
+    });
+    const printContent = `<!DOCTYPE html><html><head><title>Rekap Semua Hasil Ujian</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 20px; color: #000; font-size: 12px; }
+      h1 { text-align: center; font-size: 16px; } h2 { font-size: 13px; margin-top: 20px; border-bottom: 2px solid #333; padding-bottom: 4px; }
+      table { width: 100%; border-collapse: collapse; margin-bottom: 16px; font-size: 11px; }
+      th { background: #1e3a5f; color: white; padding: 5px 6px; text-align: left; }
+      td { padding: 4px 6px; border-bottom: 1px solid #ddd; }
+      tr:nth-child(even) { background: #f5f5f5; }
+      .pass { color: green; font-weight: bold; } .fail { color: red; font-weight: bold; }
+      @media print { body { margin: 8px; } }
+    </style></head><body>
+    <h1>${SCHOOL_NAME}</h1>
+    <p style="text-align:center;margin-bottom:16px">Rekap Hasil Ujian — Dicetak: ${new Date().toLocaleDateString("id-ID",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}</p>
+    ${allRows.map(({ ex, results, avg }) => {
+      const subj = (data.subjects || []).find(s => s.id === ex.subjectId)?.name || "";
+      const totalQ = ex.questionIds?.length || 0;
+      return `<h2>${ex.title} <span style="font-weight:normal;font-size:11px;color:#666">(${subj} • ${results.length} peserta • Rata-rata: ${avg})</span></h2>
+      <table><thead><tr><th>No</th><th>Nama Siswa</th><th>Kelas</th><th>Benar</th><th>Nilai</th><th>Ket.</th></tr></thead><tbody>
+      ${results.sort((a, b) => (b.score || 0) - (a.score || 0)).map((r, i) => {
+        const st = data.students.find(s => s.id === r.studentId);
+        const scoreDisplay = r.score === null ? "Belum dinilai" : r.score.toFixed(1);
+        const ket = r.score === null ? "Perlu Dinilai" : `${r.score !== null && r.score !== undefined ? r.score.toFixed(1) : "Perlu Dinilai"}`;
+        const cls = "";
+        return `<tr><td>${i+1}</td><td>${st?.name||"?"}</td><td>${st?.kelas||"-"}</td><td>${r.correct||0}/${totalQ}</td><td><strong>${scoreDisplay}</strong></td><td class="${cls}">${ket}</td></tr>`;
+      }).join("")}
+      </tbody></table>`;
+    }).join("")}
+    </body></html>`;
+    const w = window.open("", "_blank");
+    w.document.write(printContent);
+    w.document.close();
+    w.onload = () => w.print();
+  };
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-5 flex-wrap gap-3">
+        <h2 className="text-white text-2xl font-bold">Hasil Ujian</h2>
+        {examsWithData.length > 0 && <Btn variant="secondary" onClick={handleDownloadAllPDF}><Download size={16} />Download Semua PDF</Btn>}
+      </div>
+      {examsWithData.length === 0 ? <Card><EmptyState icon={<BarChart3 size={40} className="mx-auto" />} text="Belum ada hasil ujian" /></Card> : (
+        <div className="space-y-3">
+          {examsWithData.map(ex => {
+            const results = (data.results || []).filter(r => r.examId === ex.id);
+            const avg = results.length > 0 ? (results.reduce((a, r) => a + (r.score ?? 0), 0) / results.length).toFixed(1) : "-";
+            const passCount = results.filter(r => (r.score ?? 0) >= 75).length;
             return (
               <Card key={ex.id} className="cursor-pointer hover:border-blue-500/40 transition" onClick={() => setSelectedExam(ex.id)}>
                 <div className="flex items-center justify-between">
@@ -2325,49 +3243,41 @@ function ResultsView({ data }) {
 // ============= AI KEY SETTING =============
 function GeminiKeySetting({ data, dataRef, saveData, showToast }) {
   const [groqKey, setGroqKey] = useState(data.meta?.groqKey || "");
-  const [geminiKey, setGeminiKey] = useState(data.meta?.geminiKey || "");
   const [showGroq, setShowGroq] = useState(false);
-  const [showGemini, setShowGemini] = useState(false);
 
   const handleSave = () => {
     const latest = dataRef?.current || data;
-    const newMeta = { ...(latest.meta || {}), groqKey: groqKey.trim(), geminiKey: geminiKey.trim() };
+    const newMeta = { ...(latest.meta || {}), groqKey: groqKey.trim() };
     saveData({ ...latest, meta: newMeta }, ["meta"]);
-    showToast("API Key berhasil disimpan ✓");
+    showToast("Groq API Key berhasil disimpan ✓");
   };
 
   return (
     <div className="space-y-3 max-w-lg">
       <div className="p-3 rounded-xl" style={{ background: "rgba(22,163,74,0.08)", border: "1px solid rgba(22,163,74,0.2)" }}>
-        <div className="flex items-center gap-2 mb-1">
-          <span className="text-green-400 font-bold text-sm">⚡ Groq AI</span>
-          <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: "rgba(22,163,74,0.2)", color: "#4ade80" }}>DIREKOMENDASIKAN · Gratis</span>
+        <p className="text-green-300 text-xs font-semibold mb-1">✅ Groq AI — Gratis &amp; Cepat</p>
+        <p className="text-slate-400 text-xs mb-2">
+          Daftar gratis di <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" className="text-blue-400 underline">console.groq.com</a> lalu buat API Key.
+        </p>
+        <div className="flex items-center rounded-xl px-3" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }}>
+          <input
+            type={showGroq ? "text" : "password"}
+            value={groqKey}
+            onChange={e => setGroqKey(e.target.value)}
+            placeholder="gsk_..."
+            className="flex-1 py-2 bg-transparent text-white text-sm outline-none placeholder-slate-500"
+          />
+          <button onClick={() => setShowGroq(v => !v)} className="text-slate-400 hover:text-white ml-2 p-1">
+            <Eye size={14} />
+          </button>
         </div>
-        <p className="text-xs mb-2" style={{ color: "inherit", opacity: 0.6 }}>14.400 request/hari gratis, sangat cepat. Daftar di <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" className="text-blue-400 underline">console.groq.com</a></p>
-        <div className="flex gap-2">
-          <div className="relative flex-1">
-            <input type={showGroq ? "text" : "password"} value={groqKey} onChange={e => setGroqKey(e.target.value)} placeholder="gsk_..." className="w-full py-2 px-3 pr-9 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
-            <button onClick={() => setShowGroq(v => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400"><Eye size={14} /></button>
-          </div>
-        </div>
+        {groqKey && <p className="text-green-400 text-xs mt-1.5">✓ Key tersimpan ({groqKey.length} karakter)</p>}
       </div>
-      <div className="p-3 rounded-xl" style={{ background: "rgba(59,130,246,0.05)", border: "1px solid rgba(59,130,246,0.15)" }}>
-        <div className="flex items-center gap-2 mb-1">
-          <span className="text-blue-400 font-bold text-sm">✦ Gemini</span>
-          <span className="text-xs text-slate-500">Fallback (opsional)</span>
-        </div>
-        <p className="text-xs mb-2" style={{ color: "inherit", opacity: 0.6 }}>Daftar di <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" className="text-blue-400 underline">aistudio.google.com/apikey</a></p>
-        <div className="relative">
-          <input type={showGemini ? "text" : "password"} value={geminiKey} onChange={e => setGeminiKey(e.target.value)} placeholder="AIzaSy..." className="w-full py-2 px-3 pr-9 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
-          <button onClick={() => setShowGemini(v => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400"><Eye size={14} /></button>
-        </div>
-      </div>
-      <Btn onClick={handleSave}><Save size={14} />Simpan API Keys</Btn>
+      <Btn onClick={handleSave}><Save size={14} />Simpan API Key</Btn>
     </div>
   );
 }
 
-// ============= SETTINGS (ADMIN) =============
 function SettingsView({ data, dataRef, saveData, showToast }) {
   const [pw, setPw] = useState({ old: "", new1: "", new2: "" });
   const handleChangePw = () => {
@@ -2615,7 +3525,7 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
                         {r.submittedAt && <div className="text-slate-500 text-xs mt-0.5">{new Date(r.submittedAt).toLocaleString("id-ID")}</div>}
                       </div>
                       <div className="text-right">
-                        <span className="px-3 py-1 rounded-full text-lg font-bold" style={{ background: (r.score??0) >= 75 ? "rgba(22,163,74,0.2)" : (r.score??0) >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: (r.score??0) >= 75 ? "#4ade80" : (r.score??0) >= 50 ? "#fbbf24" : "#f87171" }}>
+                        <span className="px-3 py-1 rounded-full text-lg font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
                           {r.score !== null && r.score !== undefined ? r.score.toFixed(1) : "Perlu Dinilai"}
                         </span>
 
@@ -3010,7 +3920,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
 
       // Write sessions directly to avoid overwriting other data with stale state
       const nextData = { ...currentData, sessions };
-      saveData(nextData);
+      saveData(nextData, ["sessions"]);
     };
 
     saveSession(); // immediate on mount/answer change

@@ -1145,7 +1145,6 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
 
     try {
       const prompt = buildPrompt();
-      const prompt = buildPrompt();
       let json = null;
       const errorLog = [];
 

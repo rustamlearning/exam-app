@@ -702,8 +702,7 @@ function ImportDataModal({ type, onImport, onClose, showToast }) {
         text = result.value;
       }
 
-      const lines = text.split(/
-/).map(l => l.trim()).filter(Boolean);
+      const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
       const parsed = [];
 
       if (type === "students") {
@@ -1117,7 +1116,7 @@ const MATH_SYMBOLS = [
   { label: "²", val: "²" }, { label: "³", val: "³" }, { label: "π", val: "π" },
   { label: "∑", val: "∑" }, { label: "∫", val: "∫" }, { label: "∆", val: "∆" },
   { label: "α", val: "α" }, { label: "β", val: "β" }, { label: "θ", val: "θ" },
-  { label: "λ", val: "λ" }, { label: "μ", val: "μ" }, { label: "σ", val: "σ" },
+  { label: "λ", val: "λ }, { label: "μ", val: "μ" }, { label: "σ", val: "σ" },
   { label: "∈", val: "∈" }, { label: "∉", val: "∉" }, { label: "⊂", val: "⊂" },
   { label: "∪", val: "∪" }, { label: "∩", val: "∩" }, { label: "∅", val: "∅" },
   { label: "→", val: "→" }, { label: "⟹", val: "⟹" }, { label: "⟺", val: "⟺" },
@@ -1125,156 +1124,8 @@ const MATH_SYMBOLS = [
   { label: "¾", val: "¾" }, { label: "°", val: "°" }, { label: "|x|", val: "|" },
 ];
 
-// ============= WORD PASTE CLEANER =============
-// Maps Symbol font codepoints (used by MS Word) to proper Unicode characters.
-// Word stores Symbol-font text as ASCII bytes; when copied they paste as garbled chars.
-const SYMBOL_FONT_MAP = {
-  // Lowercase Greek
-  'a':'α','b':'β','c':'χ','d':'δ','e':'ε','f':'φ','g':'γ','h':'η','i':'ι',
-  'j':'ϕ','k':'κ','l':'λ','m':'μ','n':'ν','o':'ο','p':'π','q':'θ','r':'ρ',
-  's':'σ','t':'τ','u':'υ','v':'ϖ','w':'ω','x':'ξ','y':'ψ','z':'ζ',
-  // Uppercase Greek
-  'A':'Α','B':'Β','C':'Χ','D':'Δ','E':'Ε','F':'Φ','G':'Γ','H':'Η','I':'Ι',
-  'J':'ϑ','K':'Κ','L':'Λ','M':'Μ','N':'Ν','O':'Ο','P':'Π','Q':'Θ','R':'Ρ',
-  'S':'Σ','T':'Τ','U':'Υ','V':'ς','W':'Ω','X':'Ξ','Y':'Ψ','Z':'Ζ',
-  // Math & punctuation
-  '!':'!','\xA0':' ','#':'#','%':'%','&':'&','\u221D':'∝',
-  '\u00AB':'≤','\u00BB':'≥','\u00D7':'×','\u00F7':'÷','\u00B1':'±',
-  '\u00B5':'μ','\u00B0':'°',
-  // Symbol font special chars (dec codes mapped to Unicode)
-  '\xB0':'°','\xB1':'±','\xB2':'²','\xB3':'³',
-  '\xB4':'´','\xB5':'μ','\xB6':'¶','\xBF':'≅',
-  '\xC0':'≅','\xC2':'≥','\xC3':'∝','\xC4':'∂',
-  '\xC5':'•','\xC6':'÷','\xC7':'≠','\xC8':'≡',
-  '\xC9':'≈','\xCA':'…','\xCB':'─','\xCC':'│',
-  '\xD0':'⟵','\xD1':'⟹','\xD2':'⟺','\xD4':'↵',
-  '\xD5':'←','\xD6':'↑','\xD7':'→','\xD8':'↓',
-  '\xE0':'◊','\xE1':'⟨','\xE2':'®','\xE3':'©',
-  '\xE4':'™','\xE5':'∑','\xE6':'⌠','\xE7':'⌡',
-  '\xE8':'√','\xE9':'⊃','\xEA':'⊇','\xEB':'⊄',
-  '\xEC':'⊂','\xED':'⊆','\xEE':'∈','\xEF':'∉',
-  '\xF0':'∠','\xF1':'∇','\xF2':'®','\xF3':'©',
-  '\xF4':'™','\xF5':'∏','\xF6':'√','\xF7':'⋅',
-  '\xF8':'¬','\xF9':'∧','\xFA':'∨','\xFB':'⟺',
-  '\xFC':'⟹','\xFD':'⟵','\xFE':'⟶',
-  // Common private-use area chars from Symbol/Wingdings
-  '\uF020':' ','\uF021':'!','\uF022':'"','\uF023':'#',
-  '\uF025':'%','\uF026':'&','\uF028':'(','\uF029':')',
-  '\uF02B':'+','\uF02C':',','\uF02D':'-','\uF02E':'.',
-  '\uF02F':'/','\uF030':'0','\uF031':'1','\uF032':'2',
-  '\uF033':'3','\uF034':'4','\uF035':'5','\uF036':'6',
-  '\uF037':'7','\uF038':'8','\uF039':'9',
-  '\uF03C':'<','\uF03D':'=','\uF03E':'>',
-  '\uF041':'Α','\uF042':'Β','\uF043':'Χ','\uF044':'Δ',
-  '\uF045':'Ε','\uF046':'Φ','\uF047':'Γ','\uF048':'Η',
-  '\uF049':'Ι','\uF04B':'Κ','\uF04C':'Λ','\uF04D':'Μ',
-  '\uF04E':'Ν','\uF04F':'Ο','\uF050':'Π','\uF051':'Θ',
-  '\uF052':'Ρ','\uF053':'Σ','\uF054':'Τ','\uF055':'Υ',
-  '\uF056':'ς','\uF057':'Ω','\uF058':'Ξ','\uF059':'Ψ',
-  '\uF05A':'Ζ',
-  '\uF061':'α','\uF062':'β','\uF063':'χ','\uF064':'δ',
-  '\uF065':'ε','\uF066':'φ','\uF067':'γ','\uF068':'η',
-  '\uF069':'ι','\uF06A':'ϕ','\uF06B':'κ','\uF06C':'λ',
-  '\uF06D':'μ','\uF06E':'ν','\uF06F':'ο','\uF070':'π',
-  '\uF071':'θ','\uF072':'ρ','\uF073':'σ','\uF074':'τ',
-  '\uF075':'υ','\uF076':'ϖ','\uF077':'ω','\uF078':'ξ',
-  '\uF079':'ψ','\uF07A':'ζ',
-  '\uF0B1':'±','\uF0B4':'×','\uF0B8':'÷','\uF0B9':'≠',
-  '\uF0B3':'≥','\uF0A3':'≤','\uF0B0':'°','\uF070':'π',
-  '\uF0E5':'∑','\uF0E6':'∫','\uF0D6':'∞','\uF0C4':'∂',
-  '\uF0D1':'⟹','\uF0AB':'↵','\uF0AC':'←','\uF0AD':'↑',
-  '\uF0AE':'→','\uF0AF':'↓','\uF0DE':'√',
-  '\uF0CE':'∈','\uF0CF':'∉','\uF0CC':'⊂','\uF0CD':'⊆',
-  '\uF0CA':'⊄','\uF0C9':'⊃','\uF0CB':'⊇',
-  '\uF0C7':'≡','\uF0C8':'≈','\uF0C1':'∝','\uF0C3':'∂',
-  '\uF0C5':'•','\uF0C6':'÷','\uF0D0':'∠','\uF0D2':'∇',
-  '\uF0E3':'©','\uF0E4':'™','\uF0E2':'®',
-  '\uF0F5':'∏',
-};
-
-// Extract text from HTML element respecting Symbol font spans
-function extractHtmlWithSymbolFix(html) {
-  try {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, "text/html");
-    const result = [];
-    const walk = (node) => {
-      if (node.nodeType === Node.TEXT_NODE) {
-        result.push(node.textContent);
-        return;
-      }
-      if (node.nodeType !== Node.ELEMENT_NODE) return;
-      const tag = node.tagName.toLowerCase();
-      if (tag === "script" || tag === "style") return;
-      // Check if this element uses Symbol font
-      const style = node.getAttribute("style") || "";
-      const fontFace = node.getAttribute("face") || "";
-      const isSymbol = /Symbol/i.test(style) || /Symbol/i.test(fontFace) ||
-        /Symbol/i.test(node.className || "");
-      if (isSymbol) {
-        // Map each character through Symbol font map
-        const mapped = [...node.textContent].map(c => SYMBOL_FONT_MAP[c] || c).join("");
-        result.push(mapped);
-      } else {
-        // Process children normally
-        for (const child of node.childNodes) walk(child);
-      }
-      // Add newline for block elements
-      if (["p","div","br","li","tr"].includes(tag)) result.push("\n");
-    };
-    walk(doc.body);
-    return result.join("").replace(/\n{3,}/g, "\n\n").trim();
-  } catch {
-    return null;
-  }
-}
-
-// Also fix private-use area chars that come from Symbol font in plain text
-function fixPrivateUseChars(text) {
-  return [...text].map(c => {
-    const code = c.codePointAt(0);
-    // Private Use Area: U+E000–U+F8FF (common in Word Symbol pastes)
-    if (code >= 0xE000 && code <= 0xF8FF) return SYMBOL_FONT_MAP[c] || c;
-    // Also fix individual known bad chars
-    return SYMBOL_FONT_MAP[c] || c;
-  }).join("");
-}
-
-// Master paste handler — call this in onPaste of any input/textarea
-function handleMathPaste(e, currentValue, onChange) {
-  e.preventDefault();
-  const cd = e.clipboardData;
-  let text = "";
-
-  // Try HTML first to detect Symbol font spans
-  const html = cd.getData("text/html");
-  if (html) {
-    const fromHtml = extractHtmlWithSymbolFix(html);
-    if (fromHtml) { text = fromHtml; }
-  }
-
-  // Fall back to plain text
-  if (!text) {
-    text = cd.getData("text/plain") || "";
-  }
-
-  // Always apply private-use-area fix to catch Symbol chars in plain text
-  text = fixPrivateUseChars(text);
-
-  // Insert at cursor position
-  const el = e.target;
-  const start = el.selectionStart ?? currentValue.length;
-  const end = el.selectionEnd ?? currentValue.length;
-  const newVal = currentValue.slice(0, start) + text + currentValue.slice(end);
-  onChange(newVal);
-  // Restore cursor after the inserted text
-  setTimeout(() => {
-    el.focus();
-    const pos = start + text.length;
-    el.setSelectionRange(pos, pos);
-  }, 0);
-}
-
+// Fraction input helper: [a/b] → renders as fraction
+function MathTextarea({ value, onChange, placeholder, rows = 4, textareaRef }) {
   const [showPalette, setShowPalette] = useState(false);
   const internalRef = useRef(null);
   const ref = textareaRef || internalRef;
@@ -1342,7 +1193,6 @@ function handleMathPaste(e, currentValue, onChange) {
         value={value}
         onChange={e => onChange(e.target.value)}
         onKeyDown={handleKeyboard}
-        onPaste={e => handleMathPaste(e, value, onChange)}
         rows={rows}
         placeholder={placeholder}
         className="w-full py-2.5 px-3 rounded-xl text-sm outline-none resize-y font-mono"
@@ -1497,7 +1347,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
             </div>
             <div>
               <label className="text-blue-300 text-sm font-medium mb-1 block">Teks Soal</label>
-              <textarea value={form.text} onChange={e => setForm({ ...form, text: e.target.value })} onPaste={e => handleMathPaste(e, form.text, v => setForm(f => ({ ...f, text: v })))} rows={4} placeholder="Masukkan teks soal..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+              <textarea value={form.text} onChange={e => setForm({ ...form, text: e.target.value })} rows={4} placeholder="Masukkan teks soal..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
             </div>
             <div>
               <label className="text-blue-300 text-sm font-medium mb-1 block">Gambar Soal (Opsional)</label>
@@ -1522,7 +1372,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
                     <button onClick={() => setForm(f => ({ ...f, correctAnswer: i }))} className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold shrink-0 transition" style={{ background: form.correctAnswer === i ? "#16a34a" : "rgba(51,65,85,0.5)", color: "white" }}>
                       {String.fromCharCode(65 + i)}
                     </button>
-                    <input value={o} onChange={e => { const opts = [...form.options]; opts[i] = e.target.value; setForm({ ...form, options: opts }); }} onPaste={e => { const idx = i; handleMathPaste(e, o, v => { const opts = [...form.options]; opts[idx] = v; setForm(f => ({ ...f, options: opts })); }); }} placeholder={`Pilihan ${String.fromCharCode(65 + i)}`} className="flex-1 py-2 px-3 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: `1px solid ${form.correctAnswer === i ? "rgba(22,163,74,0.5)" : "rgba(59,130,246,0.25)"}` }} />
+                    <input value={o} onChange={e => { const opts = [...form.options]; opts[i] = e.target.value; setForm({ ...form, options: opts }); }} placeholder={`Pilihan ${String.fromCharCode(65 + i)}`} className="flex-1 py-2 px-3 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: `1px solid ${form.correctAnswer === i ? "rgba(22,163,74,0.5)" : "rgba(59,130,246,0.25)"}` }} />
                   </div>
                 ))}
                 <p className="text-slate-500 text-xs mt-1">Klik huruf untuk menandai jawaban benar (hijau)</p>
@@ -1592,17 +1442,11 @@ function ImportSoalModal({ data, onImport, onClose, showToast }) {
       if (file.name.endsWith(".docx")) {
         const mammoth = await loadMammoth();
         const ab = await file.arrayBuffer();
-        // Extract with HTML to preserve Symbol font info
-        const [rawResult, htmlResult] = await Promise.all([
-          mammoth.extractRawText({ arrayBuffer: ab }),
-          mammoth.convertToHtml({ arrayBuffer: ab }),
-        ]);
-        // Try HTML extraction first (preserves Symbol font spans from Word)
-        const fromHtml = extractHtmlWithSymbolFix(htmlResult.value);
-        setRawText(fromHtml || fixPrivateUseChars(rawResult.value));
+        const result = await mammoth.extractRawText({ arrayBuffer: ab });
+        setRawText(result.value);
       } else if (file.name.endsWith(".txt")) {
         const text = await file.text();
-        setRawText(fixPrivateUseChars(text));
+        setRawText(text);
       } else {
         showToast("Format tidak didukung. Gunakan .docx atau .txt", "error");
       }

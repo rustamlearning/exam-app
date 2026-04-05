@@ -1357,6 +1357,20 @@ function AIGenerateModal({ data, onImport, onClose, showToast, userId, subjectFi
     ? (data.subjects || []).filter(s => s.id === subjectFilter)
     : (data.subjects || []);
 
+  // Guard: teacher has no subjects assigned
+  if (availableSubjects.length === 0) {
+    return (
+      <Modal onClose={onClose} wide>
+        <div className="text-center py-8">
+          <BookOpen size={48} className="mx-auto mb-4 text-slate-500" />
+          <p className="text-amber-400 font-semibold mb-2">Belum Ada Mata Pelajaran yang Diampu</p>
+          <p className="text-sm text-slate-400 mb-4">Hubungi admin untuk menetapkan mata pelajaran yang Anda ampu sebelum menggunakan AI Generate.</p>
+          <Btn variant="secondary" onClick={onClose}>Tutup</Btn>
+        </div>
+      </Modal>
+    );
+  }
+
   const PROMPT_EXAMPLES = [
     "Fokus pada soal aplikasi dan analisis (bukan hafalan)",
     "Gunakan konteks kehidupan sehari-hari / fenomena nyata",
@@ -1766,9 +1780,9 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
 
   const [showMineOnly, setShowMineOnly] = useState(false);
   const allQ = data.questions || [];
-  // Guru only sees questions for their subjects
+  // Guru sees: questions for their subjects OR questions they personally created/imported
   const subjectFilteredQ = teacherSubjects
-    ? allQ.filter(q => teacherSubjects.includes(q.subjectId))
+    ? allQ.filter(q => teacherSubjects.includes(q.subjectId) || (userId && q.createdBy === userId))
     : allQ;
   const baseQ = (userId && showMineOnly) ? subjectFilteredQ.filter(q => q.createdBy === userId) : subjectFilteredQ;
   const filtered = baseQ.filter(q => {
@@ -1858,7 +1872,10 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     showToast(`${importedQuestions.length} soal berhasil diimpor`);
   };
 
-  const getSubjectName = (sid) => (data.subjects || []).find(s => s.id === sid)?.name || "-";
+  const getSubjectName = (sid) => {
+    if (!sid) return "⚠️ Mapel tidak diset";
+    return (data.subjects || []).find(s => s.id === sid)?.name || "⚠️ Mapel tidak dikenal";
+  };
 
   // Science editor: insert text into a specific field
   const handleScienceInsert = (text) => {
@@ -2050,6 +2067,20 @@ function ImportSoalModal({ data, onImport, onClose, showToast, visibleSubjects }
   const subjects = visibleSubjects || data.subjects || [];
   const [step, setStep] = useState("upload");
   const [subjectId, setSubjectId] = useState(subjects[0]?.id || "");
+
+  // Guard: no subjects available for this teacher
+  if (subjects.length === 0) {
+    return (
+      <Modal title="Import Soal dari Dokumen" onClose={onClose} wide>
+        <div className="text-center py-8">
+          <BookOpen size={48} className="mx-auto mb-4 text-slate-500" />
+          <p className="text-amber-400 font-semibold mb-2">Belum Ada Mata Pelajaran yang Diampu</p>
+          <p className="text-sm text-slate-400 mb-4">Hubungi admin untuk menetapkan mata pelajaran yang Anda ampu sebelum mengimpor soal.</p>
+          <Btn variant="secondary" onClick={onClose}>Tutup</Btn>
+        </div>
+      </Modal>
+    );
+  }
   const [rawText, setRawText] = useState("");
   const [parsed, setParsed] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -2230,7 +2261,12 @@ function ImportSoalModal({ data, onImport, onClose, showToast, visibleSubjects }
       {step === "preview" && (
         <div>
           <div className="flex items-center justify-between mb-4">
-            <div className="text-green-400 font-semibold">{parsed.length} soal terdeteksi</div>
+            <div>
+              <div className="text-green-400 font-semibold">{parsed.length} soal terdeteksi</div>
+              <div className="text-xs text-blue-300 mt-1">
+                Akan diimpor ke: <strong>{subjects.find(s => s.id === subjectId)?.name || "-"}</strong>
+              </div>
+            </div>
             <Btn variant="secondary" onClick={() => setStep("upload")}><ArrowLeft size={14} />Kembali</Btn>
           </div>
           {importProgress && (

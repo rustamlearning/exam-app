@@ -225,28 +225,20 @@ export default function ExamApp() {
       // 2. Load all collections in parallel
       try {
         const vals = await Promise.all(COLS.map(col => store.getCol(col)));
-        const fromFirebase = {
+        const d = {
           meta: vals[0] || DEFAULT_DATA.meta,
           teachers: vals[1] || [],
           students: vals[2] || [],
           subjects: vals[3]?.length ? vals[3] : MAPEL_K13,
           questions: vals[4] || [],
           exams: vals[5] || [],
-          sessions: [],
-          results: [],
+          sessions: vals[6] || [],
+          results: vals[7] || [],
         };
-        // Merge with cache: never let Firebase empty arrays overwrite good local data
-        const existing = ls.get(CACHE_KEY) || {};
-        const d = safeMerge(existing, fromFirebase);
         setData(d);
         setLoading(false);
         ls.set(CACHE_KEY, d);
-        // Backup: only update if firebase has richer data
-        const bkp = ls.get(BACKUP_KEY);
-        const dTotal = (d.questions?.length||0)+(d.students?.length||0)+(d.teachers?.length||0);
-        const bTotal = (bkp?.questions?.length||0)+(bkp?.students?.length||0)+(bkp?.teachers?.length||0);
-        if (!bkp || dTotal >= bTotal) ls.set(BACKUP_KEY, d);
-        // Write defaults for any missing collections in Firebase
+        ls.set(BACKUP_KEY, d);
         COLS.forEach((col, i) => {
           if (vals[i] === null) {
             const def = col === "subjects" ? MAPEL_K13 : col === "meta" ? DEFAULT_DATA.meta : [];
@@ -271,22 +263,11 @@ export default function ExamApp() {
         const u = store.listenCol(col, (val, meta) => {
           if (val === null || val === undefined) return;
           if (meta.hasPendingWrites) return;
-          if (Date.now() - (writeTimesRef.current[col] || 0) < 2000) return;
+          if (Date.now() - (writeTimesRef.current[col] || 0) < 1500) return;
           setData(prev => {
             if (!prev) return prev;
-            // SAFETY: never overwrite non-empty array with empty array from Firebase
-            const prevVal = prev[col];
-            if (Array.isArray(prevVal) && prevVal.length > 0 && Array.isArray(val) && val.length === 0) {
-              console.warn(`[safeguard] Blocked empty-array overwrite for col: ${col}`);
-              return prev;
-            }
             const next = { ...prev, [col]: val };
             ls.set(CACHE_KEY, next);
-            // Only update backup if new data is richer than current backup
-            const backup = ls.get(BACKUP_KEY);
-            if (!backup || !backup[col] || (Array.isArray(val) && val.length >= (backup[col]?.length || 0))) {
-              ls.set(BACKUP_KEY, next);
-            }
             return next;
           });
         });
@@ -300,13 +281,7 @@ export default function ExamApp() {
     if (!newData) return;
     setData(newData);
     ls.set(CACHE_KEY, newData);
-    // Only update backup if new data has more/equal content than current backup
-    const currentBackup = ls.get(BACKUP_KEY);
-    const newTotal = (newData.questions?.length || 0) + (newData.students?.length || 0) + (newData.teachers?.length || 0) + (newData.exams?.length || 0);
-    const backupTotal = (currentBackup?.questions?.length || 0) + (currentBackup?.students?.length || 0) + (currentBackup?.teachers?.length || 0) + (currentBackup?.exams?.length || 0);
-    if (!currentBackup || newTotal >= backupTotal) {
-      ls.set(BACKUP_KEY, newData);
-    }
+    ls.set(BACKUP_KEY, newData);
     const toSave = hints || COLS.filter(col => {
       const prev = dataRef.current;
       return newData[col] !== undefined && (!prev || JSON.stringify(newData[col]) !== JSON.stringify(prev[col]));
@@ -2660,33 +2635,10 @@ function SettingsView({ data, dataRef, saveData, showToast }) {
           <Btn onClick={() => showToast("API Key tersimpan di browser")}><Save size={14} />Simpan API Key</Btn>
         </div>
       </Card>
-      <Card className="mb-4" style={{ border: "1px solid rgba(234,179,8,0.25)", background: "rgba(234,179,8,0.04)" }}>
-        <h3 className="font-bold mb-2 flex items-center gap-2" style={{ color: "#fbbf24" }}><RefreshCw size={16} />Pulihkan Data dari Backup</h3>
-        <p className="text-sm mb-3" style={{ color: "inherit", opacity: 0.7 }}>Jika data tiba-tiba hilang atau kosong, gunakan tombol ini untuk memulihkan dari backup lokal browser.</p>
-        <Btn onClick={() => {
-          const backup = ls.get(BACKUP_KEY) || ls.get(CACHE_KEY);
-          if (!backup || (!(backup.questions?.length) && !(backup.students?.length) && !(backup.teachers?.length))) {
-            return showToast("Tidak ada backup yang tersedia di browser ini", "error");
-          }
-          const total = (backup.questions?.length||0) + (backup.students?.length||0) + (backup.teachers?.length||0) + (backup.exams?.length||0);
-          if (!confirm(`Ditemukan backup dengan ${total} item (${backup.questions?.length||0} soal, ${backup.students?.length||0} siswa, ${backup.teachers?.length||0} guru, ${backup.exams?.length||0} ujian). Pulihkan sekarang?`)) return;
-          saveData({ ...DEFAULT_DATA, ...backup }, COLS);
-          showToast(`Data berhasil dipulihkan! ${total} item dikembalikan.`);
-        }} variant="secondary"><RefreshCw size={14} />Pulihkan dari Backup Lokal</Btn>
-      </Card>
       <Card>
         <h3 className="text-red-400 font-bold mb-2">Zona Bahaya</h3>
-        <p className="text-sm mb-3" style={{ color: "inherit", opacity: 0.7 }}>Reset seluruh data ke kondisi awal. Tidak dapat dibatalkan. Backup akan tersimpan otomatis sebelum reset.</p>
-        <Btn variant="danger" onClick={() => {
-          if (!confirm("PERINGATAN: Ini akan menghapus SEMUA data guru, siswa, soal, dan ujian!")) return;
-          const konfirmasi = prompt("Ketik RESET untuk konfirmasi:");
-          if (konfirmasi !== "RESET") return showToast("Reset dibatalkan", "error");
-          // Save one last backup before wiping
-          const current = ls.get(CACHE_KEY);
-          if (current) ls.set("sman6_pre_reset_backup", JSON.stringify({ data: current, time: new Date().toISOString() }));
-          saveData(DEFAULT_DATA, COLS);
-          showToast("Data telah direset. Backup tersimpan di browser.");
-        }}><AlertTriangle size={14} />Reset Semua Data</Btn>
+        <p className="text-sm mb-3" style={{ color: "inherit", opacity: 0.7 }}>Reset seluruh data ke kondisi awal. Tidak dapat dibatalkan.</p>
+        <Btn variant="danger" onClick={() => { if (!confirm("PERINGATAN: Ini akan menghapus SEMUA data!")) return; if (!confirm("Yakin benar-benar ingin reset?")) return; saveData(DEFAULT_DATA, COLS); showToast("Data telah direset"); }}><AlertTriangle size={14} />Reset Semua Data</Btn>
       </Card>
     </div>
   );

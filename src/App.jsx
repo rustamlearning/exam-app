@@ -225,20 +225,28 @@ export default function ExamApp() {
       // 2. Load all collections in parallel
       try {
         const vals = await Promise.all(COLS.map(col => store.getCol(col)));
-        const d = {
+        const fromFirebase = {
           meta: vals[0] || DEFAULT_DATA.meta,
           teachers: vals[1] || [],
           students: vals[2] || [],
           subjects: vals[3]?.length ? vals[3] : MAPEL_K13,
           questions: vals[4] || [],
           exams: vals[5] || [],
-          sessions: vals[6] || [],
-          results: vals[7] || [],
+          sessions: [],
+          results: [],
         };
+        // Merge with cache: never let Firebase empty arrays overwrite good local data
+        const existing = ls.get(CACHE_KEY) || {};
+        const d = safeMerge(existing, fromFirebase);
         setData(d);
         setLoading(false);
         ls.set(CACHE_KEY, d);
-        ls.set(BACKUP_KEY, d);
+        // Backup: only update if firebase has richer data
+        const bkp = ls.get(BACKUP_KEY);
+        const dTotal = (d.questions?.length||0)+(d.students?.length||0)+(d.teachers?.length||0);
+        const bTotal = (bkp?.questions?.length||0)+(bkp?.students?.length||0)+(bkp?.teachers?.length||0);
+        if (!bkp || dTotal >= bTotal) ls.set(BACKUP_KEY, d);
+        // Write defaults for any missing collections in Firebase
         COLS.forEach((col, i) => {
           if (vals[i] === null) {
             const def = col === "subjects" ? MAPEL_K13 : col === "meta" ? DEFAULT_DATA.meta : [];
@@ -263,11 +271,22 @@ export default function ExamApp() {
         const u = store.listenCol(col, (val, meta) => {
           if (val === null || val === undefined) return;
           if (meta.hasPendingWrites) return;
-          if (Date.now() - (writeTimesRef.current[col] || 0) < 1500) return;
+          if (Date.now() - (writeTimesRef.current[col] || 0) < 2000) return;
           setData(prev => {
             if (!prev) return prev;
+            // SAFETY: never overwrite non-empty array with empty array from Firebase
+            const prevVal = prev[col];
+            if (Array.isArray(prevVal) && prevVal.length > 0 && Array.isArray(val) && val.length === 0) {
+              console.warn(`[safeguard] Blocked empty-array overwrite for col: ${col}`);
+              return prev;
+            }
             const next = { ...prev, [col]: val };
             ls.set(CACHE_KEY, next);
+            // Only update backup if new data is richer than current backup
+            const backup = ls.get(BACKUP_KEY);
+            if (!backup || !backup[col] || (Array.isArray(val) && val.length >= (backup[col]?.length || 0))) {
+              ls.set(BACKUP_KEY, next);
+            }
             return next;
           });
         });
@@ -281,7 +300,13 @@ export default function ExamApp() {
     if (!newData) return;
     setData(newData);
     ls.set(CACHE_KEY, newData);
-    ls.set(BACKUP_KEY, newData);
+    // Only update backup if new data has more/equal content than current backup
+    const currentBackup = ls.get(BACKUP_KEY);
+    const newTotal = (newData.questions?.length || 0) + (newData.students?.length || 0) + (newData.teachers?.length || 0) + (newData.exams?.length || 0);
+    const backupTotal = (currentBackup?.questions?.length || 0) + (currentBackup?.students?.length || 0) + (currentBackup?.teachers?.length || 0) + (currentBackup?.exams?.length || 0);
+    if (!currentBackup || newTotal >= backupTotal) {
+      ls.set(BACKUP_KEY, newData);
+    }
     const toSave = hints || COLS.filter(col => {
       const prev = dataRef.current;
       return newData[col] !== undefined && (!prev || JSON.stringify(newData[col]) !== JSON.stringify(prev[col]));
@@ -1205,264 +1230,96 @@ function MathTextarea({ value, onChange, placeholder, rows = 4, textareaRef }) {
 
 // ============= AI GENERATE MODAL =============
 function AIGenerateModal({ data, onImport, onClose, showToast, userId, subjectFilter }) {
+  const [apiKey, setApiKey] = useState(() => { try { return localStorage.getItem("groq_api_key") || ""; } catch { return ""; } });
   const [subjectId, setSubjectId] = useState(subjectFilter || (data.subjects || [])[0]?.id || "");
   const [topic, setTopic] = useState("");
-  const [customPrompt, setCustomPrompt] = useState("");
   const [count, setCount] = useState(5);
   const [qtype, setQtype] = useState("pilgan");
-  const [difficulty, setDifficulty] = useState("sedang");
   const [loading, setLoading] = useState(false);
-  const [loadingMsg, setLoadingMsg] = useState("");
   const [generated, setGenerated] = useState([]);
-  const [selected, setSelected] = useState([]);
-  const [step, setStep] = useState(1);
 
   const availableSubjects = subjectFilter
     ? (data.subjects || []).filter(s => s.id === subjectFilter)
     : (data.subjects || []);
 
-  const PROMPT_EXAMPLES = [
-    "Fokus pada soal aplikasi dan analisis (bukan hafalan)",
-    "Gunakan konteks kehidupan sehari-hari / fenomena nyata",
-    "Buat soal HOTS (Higher Order Thinking Skills)",
-    "Sertakan angka dan perhitungan pada setiap soal",
-    "Soal berbasis wacana / teks bacaan pendek",
-    "Hindari soal yang terlalu mudah ditebak",
-  ];
-
-  const loadingMessages = [
-    "Menghubungi Gemini 2.5 Flash…",
-    "Merancang soal berkualitas tinggi…",
-    "Menyusun kunci jawaban & pembahasan…",
-    "Memformat hasil generate…",
-  ];
-
   const handleGenerate = async () => {
-    const apiKey = (() => { try { return localStorage.getItem("gemini_api_key") || ""; } catch { return ""; } })();
-    if (!apiKey.trim()) return showToast("API Key Gemini belum diatur — buka Pengaturan → Integrasi AI", "error");
+    if (!apiKey.trim()) return showToast("Masukkan Groq API Key terlebih dahulu", "error");
     if (!topic.trim()) return showToast("Masukkan topik soal", "error");
     setLoading(true);
-    let msgIdx = 0;
-    setLoadingMsg(loadingMessages[0]);
-    const msgTimer = setInterval(() => { msgIdx = (msgIdx + 1) % loadingMessages.length; setLoadingMsg(loadingMessages[msgIdx]); }, 1800);
-
     const subjName = (data.subjects || []).find(s => s.id === subjectId)?.name || "Umum";
-    const diffLabel = { mudah: "mudah (C1–C2)", sedang: "sedang (C3–C4)", sulit: "sulit (C5–C6)" }[difficulty];
-    const typeDesc = qtype === "pilgan" ? "pilihan ganda dengan 5 pilihan (A, B, C, D, E)" : qtype === "benar_salah" ? "benar/salah dengan options [\"Benar\",\"Salah\"]" : "uraian dengan options kosong []";
-    const instruksiTambahan = customPrompt.trim() ? `\nInstruksi khusus dari guru: ${customPrompt.trim()}` : "";
-
-    const prompt = `Kamu adalah pembuat soal profesional kurikulum SMA Indonesia.
-Buat ${count} soal ${typeDesc} tentang topik "${topic}" untuk mata pelajaran ${subjName}, tingkat kesulitan ${diffLabel}.${instruksiTambahan}
-Kembalikan HANYA JSON array valid, tanpa markdown, tanpa penjelasan, langsung dimulai dari karakter "[".
-Format setiap soal:
-{"text":"teks soal lengkap","options":["pilihan A","pilihan B","pilihan C","pilihan D","pilihan E"],"correctAnswer":0,"explanation":"pembahasan singkat dan jelas","type":"${qtype}","difficulty":"${difficulty}"}
-Aturan:
-- correctAnswer adalah index (0–4) dari jawaban yang benar
-- Untuk benar_salah: options harus persis ["Benar","Salah"]
-- Untuk uraian: options harus []
-- Gunakan simbol unicode jika perlu: ×÷±√π²³≤≥≠∞∑∫∆αβθλμσ
-- Soal harus bervariasi dan tidak mengulang konsep yang sama
-- Pembahasan wajib ada dan informatif`;
-
+    const prompt = `Buat ${count} soal ${qtype === "pilgan" ? "pilihan ganda (5 pilihan A-E)" : qtype === "benar_salah" ? "benar/salah" : "uraian"} tentang "${topic}" untuk mata pelajaran ${subjName} SMA.
+Untuk setiap soal, berikan dalam format JSON array:
+[{"text":"teks soal","options":["A","B","C","D","E"],"correctAnswer":0,"explanation":"pembahasan singkat","type":"${qtype}"}]
+Untuk tipe benar_salah, options harus ["Benar","Salah"].
+Untuk uraian, options kosong [].
+Gunakan simbol matematika unicode jika perlu (×÷±√π²³≤≥≠∞∑∫∆αβθ dll).
+Kembalikan HANYA JSON array tanpa penjelasan lain.`;
     try {
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey.trim()}`, {
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.7, maxOutputTokens: 8192 } })
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+        body: JSON.stringify({ model: "llama3-8b-8192", messages: [{ role: "user", content: prompt }], max_tokens: 4000, temperature: 0.7 })
       });
-      if (!res.ok) { const err = await res.json(); throw new Error(err.error?.message || `HTTP ${res.status}`); }
+      if (!res.ok) { const err = await res.json(); throw new Error(err.error?.message || "API error"); }
       const json = await res.json();
-      const text = json.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      const text = json.choices?.[0]?.message?.content || "";
       const match = text.match(/\[[\s\S]*\]/);
-      if (!match) throw new Error("Format respons tidak valid — coba generate ulang");
+      if (!match) throw new Error("Format respons tidak valid");
       const parsed = JSON.parse(match[0]);
       const questions = parsed.map(q => ({ ...q, subjectId, createdBy: userId || "admin", id: genId() }));
       setGenerated(questions);
-      setSelected(questions.map((_, i) => i));
-      setStep(2);
+      try { localStorage.setItem("groq_api_key", apiKey); } catch {}
     } catch(e) { showToast("Error: " + e.message, "error"); }
-    clearInterval(msgTimer);
     setLoading(false);
   };
 
-  const toggleSelect = (i) => setSelected(prev => prev.includes(i) ? prev.filter(x => x !== i) : [...prev, i]);
-  const selectedQuestions = generated.filter((_, i) => selected.includes(i));
-  const diffColor = { mudah: "#22c55e", sedang: "#f59e0b", sulit: "#ef4444" };
-
   return (
-    <Modal onClose={onClose} wide>
-      {/* Header */}
-      <div className="rounded-t-2xl -mx-6 -mt-6 mb-6 px-6 pt-6 pb-5" style={{ background: "linear-gradient(135deg, rgba(99,102,241,0.25) 0%, rgba(168,85,247,0.2) 50%, rgba(59,130,246,0.15) 100%)", borderBottom: "1px solid rgba(99,102,241,0.2)" }}>
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl flex items-center justify-center text-xl" style={{ background: "linear-gradient(135deg, #6366f1, #a855f7)", boxShadow: "0 4px 15px rgba(99,102,241,0.4)" }}>✨</div>
-          <div>
-            <h2 className="font-bold text-lg text-white">AI Generate Soal</h2>
-            <p className="text-xs" style={{ color: "rgba(196,181,253,0.8)" }}>Powered by Gemini 2.5 Flash · Google AI</p>
-          </div>
-          {step === 2 && <div className="ml-auto flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold" style={{ background: "rgba(34,197,94,0.15)", color: "#4ade80", border: "1px solid rgba(34,197,94,0.25)" }}><CheckCircle size={12} /> {generated.length} soal siap</div>}
+    <Modal title="🤖 AI Generate Soal (Groq)" onClose={onClose} wide>
+      <div className="space-y-4">
+        <div>
+          <label className="text-blue-300 text-sm font-medium mb-1 block">Groq API Key</label>
+          <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="gsk_..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+          <p className="text-xs mt-1" style={{ color: "inherit", opacity: 0.5 }}>Dapatkan gratis di console.groq.com — tersimpan lokal di browser Anda</p>
         </div>
-        <div className="flex items-center gap-2 mt-4">
-          {[["1","Konfigurasi"],["2","Preview & Import"]].map(([n, label], idx) => (
-            <div key={n} className="flex items-center gap-1.5">
-              <div className="w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold" style={{ background: step >= idx+1 ? "linear-gradient(135deg,#6366f1,#a855f7)" : "rgba(51,65,85,0.6)", color: step >= idx+1 ? "white" : "#64748b" }}>{n}</div>
-              <span className="text-xs" style={{ color: step >= idx+1 ? "#c4b5fd" : "#475569" }}>{label}</span>
-              {idx === 0 && <div className="w-8 h-px" style={{ background: step >= 2 ? "rgba(99,102,241,0.5)" : "rgba(51,65,85,0.5)" }} />}
-            </div>
-          ))}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <Select label="Mata Pelajaran" value={subjectId} onChange={e => setSubjectId(e.target.value)}>
+            {availableSubjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </Select>
+          <Select label="Tipe Soal" value={qtype} onChange={e => setQtype(e.target.value)}>
+            <option value="pilgan">Pilihan Ganda</option>
+            <option value="benar_salah">Benar / Salah</option>
+            <option value="uraian">Uraian</option>
+          </Select>
         </div>
-      </div>
-
-      {step === 1 && (
-        <div className="space-y-5">
-          {/* Subject + Type */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label className="text-sm font-semibold mb-2 block" style={{ color: "#a5b4fc" }}>📚 Mata Pelajaran</label>
-              <select value={subjectId} onChange={e => setSubjectId(e.target.value)} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(99,102,241,0.2)" }}>
-                {availableSubjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="text-sm font-semibold mb-2 block" style={{ color: "#a5b4fc" }}>🎯 Tipe Soal</label>
-              <div className="grid grid-cols-3 gap-1.5">
-                {[["pilgan","PG","🔘"],["benar_salah","B/S","✅"],["uraian","Uraian","📝"]].map(([val, label, icon]) => (
-                  <button key={val} onClick={() => setQtype(val)} className="py-2 rounded-xl text-xs font-semibold transition-all" style={{ background: qtype === val ? "linear-gradient(135deg,rgba(99,102,241,0.4),rgba(168,85,247,0.3))" : "rgba(15,23,42,0.6)", border: `1px solid ${qtype === val ? "rgba(99,102,241,0.5)" : "rgba(51,65,85,0.5)"}`, color: qtype === val ? "#c4b5fd" : "#64748b" }}>
-                    <div>{icon}</div><div>{label}</div>
-                  </button>
-                ))}
-              </div>
-            </div>
+        <Input label="Topik / Materi" value={topic} onChange={e => setTopic(e.target.value)} placeholder="Cth: Persamaan Kuadrat, Fotosintesis, Revolusi Prancis..." />
+        <div>
+          <label className="text-blue-300 text-sm font-medium mb-1 block">Jumlah Soal: {count}</label>
+          <input type="range" min={3} max={20} value={count} onChange={e => setCount(Number(e.target.value))} className="w-full" />
+        </div>
+        {generated.length === 0 ? (
+          <div className="flex justify-end gap-2">
+            <Btn variant="secondary" onClick={onClose}>Batal</Btn>
+            <Btn onClick={handleGenerate} disabled={loading}>{loading ? <RefreshCw size={14} className="animate-spin" /> : <Play size={14} />}{loading ? "Generating..." : "Generate Soal"}</Btn>
           </div>
-
-          {/* Topic */}
+        ) : (
           <div>
-            <label className="text-sm font-semibold mb-2 block" style={{ color: "#a5b4fc" }}>💡 Topik / Materi</label>
-            <input value={topic} onChange={e => setTopic(e.target.value)} onKeyDown={e => { if (e.key === "Enter" && !loading) handleGenerate(); }} placeholder="Cth: Persamaan Kuadrat, Fotosintesis, Revolusi Prancis…" className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(99,102,241,0.2)" }} />
-          </div>
-
-          {/* Custom Instructions */}
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <label className="text-sm font-semibold" style={{ color: "#a5b4fc" }}>📝 Instruksi Khusus <span className="font-normal text-xs" style={{ color: "#475569" }}>(opsional)</span></label>
-            </div>
-            <textarea
-              value={customPrompt}
-              onChange={e => setCustomPrompt(e.target.value)}
-              rows={3}
-              placeholder="Tulis instruksi spesifik yang Anda inginkan…&#10;Cth: Buat soal HOTS berbasis wacana, gunakan konteks kehidupan sehari-hari, sertakan perhitungan, dll."
-              className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none"
-              style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(99,102,241,0.2)", lineHeight: 1.6 }}
-            />
-            {/* Shortcut chips */}
-            <div className="flex flex-wrap gap-1.5 mt-2">
-              {PROMPT_EXAMPLES.map((ex, i) => (
-                <button key={i} onClick={() => setCustomPrompt(prev => prev ? prev + ". " + ex : ex)} className="px-2.5 py-1 rounded-full text-xs transition-all hover:opacity-90" style={{ background: "rgba(99,102,241,0.1)", color: "#818cf8", border: "1px solid rgba(99,102,241,0.2)" }}>
-                  + {ex}
-                </button>
+            <div className="text-green-400 font-semibold mb-3">{generated.length} soal berhasil digenerate</div>
+            <div className="space-y-2 max-h-64 overflow-y-auto mb-4">
+              {generated.map((q, i) => (
+                <div key={i} className="p-3 rounded-xl text-sm" style={{ background: "rgba(15,23,42,0.5)" }}>
+                  <div className="font-medium mb-1" style={{ color: "inherit" }}>{i+1}. {q.text.substring(0, 120)}</div>
+                  {q.options?.length > 0 && <div className="flex flex-wrap gap-1">{q.options.map((o, oi) => <span key={oi} className="px-2 py-0.5 rounded text-xs" style={{ background: oi === q.correctAnswer ? "rgba(22,163,74,0.2)" : "rgba(51,65,85,0.5)", color: oi === q.correctAnswer ? "#4ade80" : "#94a3b8" }}>{String.fromCharCode(65+oi)}. {o}</span>)}</div>}
+                  {q.explanation && <div className="text-blue-300 text-xs mt-1">💡 {q.explanation.substring(0, 80)}</div>}
+                </div>
               ))}
             </div>
-          </div>
-
-          {/* Count + Difficulty */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <label className="text-sm font-semibold mb-2 flex items-center justify-between" style={{ color: "#a5b4fc" }}>
-                <span>📊 Jumlah Soal</span>
-                <span className="text-lg font-bold" style={{ color: "#818cf8" }}>{count}</span>
-              </label>
-              <input type="range" min={3} max={20} value={count} onChange={e => setCount(Number(e.target.value))} className="w-full accent-indigo-500" />
-              <div className="flex justify-between text-xs mt-1" style={{ color: "#475569" }}><span>3</span><span>20</span></div>
-            </div>
-            <div>
-              <label className="text-sm font-semibold mb-2 block" style={{ color: "#a5b4fc" }}>⚡ Tingkat Kesulitan</label>
-              <div className="grid grid-cols-3 gap-1.5">
-                {[["mudah","Mudah"],["sedang","Sedang"],["sulit","Sulit"]].map(([val, label]) => (
-                  <button key={val} onClick={() => setDifficulty(val)} className="py-2 rounded-xl text-xs font-semibold transition-all" style={{ background: difficulty === val ? `${diffColor[val]}22` : "rgba(15,23,42,0.6)", border: `1px solid ${difficulty === val ? diffColor[val] + "66" : "rgba(51,65,85,0.5)"}`, color: difficulty === val ? diffColor[val] : "#64748b" }}>{label}</button>
-                ))}
-              </div>
+            <div className="flex justify-end gap-2">
+              <Btn variant="secondary" onClick={() => setGenerated([])}>Generate Ulang</Btn>
+              <Btn variant="success" onClick={() => { onImport(generated); onClose(); }}><CheckCircle size={14} />Import {generated.length} Soal</Btn>
             </div>
           </div>
-
-          {/* Loading / Actions */}
-          {loading ? (
-            <div className="flex flex-col items-center gap-3 py-6">
-              <div className="relative w-14 h-14">
-                <div className="absolute inset-0 rounded-full" style={{ background: "linear-gradient(135deg,rgba(99,102,241,0.2),rgba(168,85,247,0.2))", border: "2px solid rgba(99,102,241,0.3)" }} />
-                <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-indigo-400 animate-spin" />
-                <div className="absolute inset-0 flex items-center justify-center text-xl">✨</div>
-              </div>
-              <div className="text-center">
-                <p className="text-sm font-semibold" style={{ color: "#a5b4fc" }}>{loadingMsg}</p>
-                <p className="text-xs mt-1" style={{ color: "#475569" }}>Harap tunggu, Gemini sedang bekerja…</p>
-              </div>
-            </div>
-          ) : (
-            <div className="flex gap-2 justify-end">
-              <Btn variant="secondary" onClick={onClose}>Batal</Btn>
-              <button onClick={handleGenerate} className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm transition-all" style={{ background: "linear-gradient(135deg, #6366f1, #a855f7)", color: "white", boxShadow: "0 4px 15px rgba(99,102,241,0.35)" }}>
-                <Play size={15} /> Generate {count} Soal
-              </button>
-            </div>
-          )}
-        </div>
-      )}
-
-      {step === 2 && (
-        <div>
-          <div className="flex items-center justify-between mb-4 px-4 py-3 rounded-xl" style={{ background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.2)" }}>
-            <div className="flex items-center gap-2">
-              <CheckCircle size={16} className="text-green-400" />
-              <span className="text-sm font-semibold text-green-400">{generated.length} soal berhasil digenerate</span>
-            </div>
-            <div className="flex gap-2">
-              <button onClick={() => setSelected(generated.map((_,i)=>i))} className="text-xs px-2 py-1 rounded-lg" style={{ background: "rgba(34,197,94,0.15)", color: "#4ade80" }}>Pilih Semua</button>
-              <button onClick={() => setSelected([])} className="text-xs px-2 py-1 rounded-lg" style={{ background: "rgba(51,65,85,0.5)", color: "#94a3b8" }}>Batal Semua</button>
-            </div>
-          </div>
-          <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1 mb-5" style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(99,102,241,0.3) transparent" }}>
-            {generated.map((q, i) => {
-              const isSel = selected.includes(i);
-              return (
-                <div key={i} onClick={() => toggleSelect(i)} className="p-3.5 rounded-xl cursor-pointer transition-all" style={{ background: isSel ? "rgba(99,102,241,0.1)" : "rgba(15,23,42,0.5)", border: `1px solid ${isSel ? "rgba(99,102,241,0.35)" : "rgba(51,65,85,0.4)"}` }}>
-                  <div className="flex items-start gap-2.5">
-                    <div className="flex-shrink-0 w-5 h-5 rounded-md mt-0.5 flex items-center justify-center" style={{ background: isSel ? "rgba(99,102,241,0.8)" : "rgba(51,65,85,0.5)", border: `1px solid ${isSel ? "rgba(99,102,241,0.8)" : "rgba(71,85,105,0.5)"}` }}>
-                      {isSel && <CheckCircle size={12} color="white" />}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className="text-xs font-bold" style={{ color: "#6366f1" }}>#{i+1}</span>
-                        <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: `${diffColor[q.difficulty || difficulty]}18`, color: diffColor[q.difficulty || difficulty] }}>{q.difficulty || difficulty}</span>
-                      </div>
-                      <p className="text-sm font-medium leading-relaxed" style={{ color: "#e2e8f0" }}>{q.text.substring(0, 130)}{q.text.length > 130 ? "…" : ""}</p>
-                      {q.options?.length > 0 && (
-                        <div className="flex flex-wrap gap-1 mt-2">
-                          {q.options.map((o, oi) => (
-                            <span key={oi} className="px-2 py-0.5 rounded-md text-xs" style={{ background: oi === q.correctAnswer ? "rgba(34,197,94,0.15)" : "rgba(30,41,59,0.6)", color: oi === q.correctAnswer ? "#4ade80" : "#64748b", border: `1px solid ${oi === q.correctAnswer ? "rgba(34,197,94,0.3)" : "transparent"}` }}>
-                              {String.fromCharCode(65+oi)}. {o.substring(0, 30)}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                      {q.explanation && <p className="text-xs mt-2" style={{ color: "#818cf8" }}>💡 {q.explanation.substring(0, 100)}</p>}
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-          <div className="flex items-center gap-2">
-            <button onClick={() => { setStep(1); setGenerated([]); setSelected([]); }} className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-semibold" style={{ background: "rgba(51,65,85,0.5)", color: "#94a3b8" }}>
-              <RefreshCw size={14} /> Generate Ulang
-            </button>
-            <div className="ml-auto flex items-center gap-2">
-              <span className="text-xs" style={{ color: "#64748b" }}>{selected.length} dari {generated.length} dipilih</span>
-              <button onClick={() => { if (selected.length === 0) return showToast("Pilih minimal 1 soal", "error"); onImport(selectedQuestions); onClose(); showToast(`${selectedQuestions.length} soal berhasil diimport!`); }} className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm" style={{ background: selected.length > 0 ? "linear-gradient(135deg, #059669, #10b981)" : "rgba(51,65,85,0.5)", color: selected.length > 0 ? "white" : "#475569", boxShadow: selected.length > 0 ? "0 4px 15px rgba(16,185,129,0.3)" : "none", cursor: selected.length > 0 ? "pointer" : "not-allowed" }}>
-                <Download size={15} /> Import {selected.length} Soal
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+        )}
+      </div>
     </Modal>
   );
 }
@@ -2791,30 +2648,45 @@ function SettingsView({ data, dataRef, saveData, showToast }) {
           <p>Total Soal: {data.questions.length} | Total Ujian: {data.exams.length}</p>
         </div>
       </Card>
-      <Card className="mb-4" style={{ background: "rgba(99,102,241,0.05)", border: "1px solid rgba(99,102,241,0.15)" }}>
-        <div className="flex items-center gap-3 mb-4">
-          <div className="w-9 h-9 rounded-xl flex items-center justify-center text-lg" style={{ background: "linear-gradient(135deg,#6366f1,#a855f7)", boxShadow: "0 3px 12px rgba(99,102,241,0.35)" }}>✨</div>
-          <div>
-            <h3 className="font-bold" style={{ color: "inherit" }}>Integrasi AI — Gemini 2.5 Flash</h3>
-            <p className="text-xs" style={{ color: "rgba(165,180,252,0.7)" }}>Google AI · Model terbaru &amp; tercepat</p>
-          </div>
-        </div>
-        <p className="text-sm mb-4" style={{ color: "inherit", opacity: 0.7 }}>API Key Google AI Studio untuk fitur <strong>Generate Soal otomatis</strong>. Gratis hingga batas tertentu — tidak perlu kartu kredit. <a href="https://aistudio.google.com/app/apikey" target="_blank" className="text-indigo-400 underline hover:text-indigo-300">Dapatkan di aistudio.google.com →</a></p>
+      <Card className="mb-4">
+        <h3 className="font-bold mb-4 flex items-center gap-2" style={{ color: "inherit" }}>🤖 Integrasi AI (Groq)</h3>
+        <p className="text-sm mb-3" style={{ color: "inherit", opacity: 0.7 }}>API Key Groq untuk fitur Generate Soal otomatis. Dapatkan gratis di <a href="https://console.groq.com" target="_blank" className="text-blue-400 underline">console.groq.com</a></p>
         <div className="space-y-3 max-w-md">
           <div>
-            <label className="text-sm font-semibold mb-1.5 block" style={{ color: "#a5b4fc" }}>Gemini API Key</label>
-            <input type="password" defaultValue={(() => { try { return localStorage.getItem("gemini_api_key") || ""; } catch { return ""; } })()} onChange={e => { try { localStorage.setItem("gemini_api_key", e.target.value); } catch {} }} placeholder="AIzaSy..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(99,102,241,0.25)" }} />
-            <p className="text-xs mt-1.5" style={{ color: "inherit", opacity: 0.5 }}>Tersimpan di browser (localStorage) — tidak dikirim ke server manapun</p>
+            <label className="text-blue-300 text-sm font-medium mb-1 block">Groq API Key</label>
+            <input type="password" defaultValue={(() => { try { return localStorage.getItem("groq_api_key") || ""; } catch { return ""; } })()} onChange={e => { try { localStorage.setItem("groq_api_key", e.target.value); } catch {} }} placeholder="gsk_..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+            <p className="text-xs mt-1" style={{ color: "inherit", opacity: 0.5 }}>Tersimpan di browser (localStorage) — tidak dikirim ke server</p>
           </div>
-          <button onClick={() => showToast("API Key Gemini tersimpan di browser")} className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition" style={{ background: "linear-gradient(135deg, rgba(99,102,241,0.3), rgba(168,85,247,0.2))", color: "#c4b5fd", border: "1px solid rgba(99,102,241,0.3)" }}>
-            <Save size={14} /> Simpan API Key
-          </button>
+          <Btn onClick={() => showToast("API Key tersimpan di browser")}><Save size={14} />Simpan API Key</Btn>
         </div>
+      </Card>
+      <Card className="mb-4" style={{ border: "1px solid rgba(234,179,8,0.25)", background: "rgba(234,179,8,0.04)" }}>
+        <h3 className="font-bold mb-2 flex items-center gap-2" style={{ color: "#fbbf24" }}><RefreshCw size={16} />Pulihkan Data dari Backup</h3>
+        <p className="text-sm mb-3" style={{ color: "inherit", opacity: 0.7 }}>Jika data tiba-tiba hilang atau kosong, gunakan tombol ini untuk memulihkan dari backup lokal browser.</p>
+        <Btn onClick={() => {
+          const backup = ls.get(BACKUP_KEY) || ls.get(CACHE_KEY);
+          if (!backup || (!(backup.questions?.length) && !(backup.students?.length) && !(backup.teachers?.length))) {
+            return showToast("Tidak ada backup yang tersedia di browser ini", "error");
+          }
+          const total = (backup.questions?.length||0) + (backup.students?.length||0) + (backup.teachers?.length||0) + (backup.exams?.length||0);
+          if (!confirm(`Ditemukan backup dengan ${total} item (${backup.questions?.length||0} soal, ${backup.students?.length||0} siswa, ${backup.teachers?.length||0} guru, ${backup.exams?.length||0} ujian). Pulihkan sekarang?`)) return;
+          saveData({ ...DEFAULT_DATA, ...backup }, COLS);
+          showToast(`Data berhasil dipulihkan! ${total} item dikembalikan.`);
+        }} variant="secondary"><RefreshCw size={14} />Pulihkan dari Backup Lokal</Btn>
       </Card>
       <Card>
         <h3 className="text-red-400 font-bold mb-2">Zona Bahaya</h3>
-        <p className="text-sm mb-3" style={{ color: "inherit", opacity: 0.7 }}>Reset seluruh data ke kondisi awal. Tidak dapat dibatalkan.</p>
-        <Btn variant="danger" onClick={() => { if (!confirm("PERINGATAN: Ini akan menghapus SEMUA data!")) return; if (!confirm("Yakin benar-benar ingin reset?")) return; saveData(DEFAULT_DATA, COLS); showToast("Data telah direset"); }}><AlertTriangle size={14} />Reset Semua Data</Btn>
+        <p className="text-sm mb-3" style={{ color: "inherit", opacity: 0.7 }}>Reset seluruh data ke kondisi awal. Tidak dapat dibatalkan. Backup akan tersimpan otomatis sebelum reset.</p>
+        <Btn variant="danger" onClick={() => {
+          if (!confirm("PERINGATAN: Ini akan menghapus SEMUA data guru, siswa, soal, dan ujian!")) return;
+          const konfirmasi = prompt("Ketik RESET untuk konfirmasi:");
+          if (konfirmasi !== "RESET") return showToast("Reset dibatalkan", "error");
+          // Save one last backup before wiping
+          const current = ls.get(CACHE_KEY);
+          if (current) ls.set("sman6_pre_reset_backup", JSON.stringify({ data: current, time: new Date().toISOString() }));
+          saveData(DEFAULT_DATA, COLS);
+          showToast("Data telah direset. Backup tersimpan di browser.");
+        }}><AlertTriangle size={14} />Reset Semua Data</Btn>
       </Card>
     </div>
   );

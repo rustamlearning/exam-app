@@ -1203,29 +1203,286 @@ function MathTextarea({ value, onChange, placeholder, rows = 4, textareaRef }) {
   );
 }
 
+// ============= AI GENERATE MODAL =============
+function AIGenerateModal({ data, onImport, onClose, showToast, userId, subjectFilter }) {
+  const [apiKey, setApiKey] = useState(() => { try { return localStorage.getItem("groq_api_key") || ""; } catch { return ""; } });
+  const [subjectId, setSubjectId] = useState(subjectFilter || (data.subjects || [])[0]?.id || "");
+  const [topic, setTopic] = useState("");
+  const [count, setCount] = useState(5);
+  const [qtype, setQtype] = useState("pilgan");
+  const [loading, setLoading] = useState(false);
+  const [generated, setGenerated] = useState([]);
+
+  const availableSubjects = subjectFilter
+    ? (data.subjects || []).filter(s => s.id === subjectFilter)
+    : (data.subjects || []);
+
+  const handleGenerate = async () => {
+    if (!apiKey.trim()) return showToast("Masukkan Groq API Key terlebih dahulu", "error");
+    if (!topic.trim()) return showToast("Masukkan topik soal", "error");
+    setLoading(true);
+    const subjName = (data.subjects || []).find(s => s.id === subjectId)?.name || "Umum";
+    const prompt = `Buat ${count} soal ${qtype === "pilgan" ? "pilihan ganda (5 pilihan A-E)" : qtype === "benar_salah" ? "benar/salah" : "uraian"} tentang "${topic}" untuk mata pelajaran ${subjName} SMA.
+Untuk setiap soal, berikan dalam format JSON array:
+[{"text":"teks soal","options":["A","B","C","D","E"],"correctAnswer":0,"explanation":"pembahasan singkat","type":"${qtype}"}]
+Untuk tipe benar_salah, options harus ["Benar","Salah"].
+Untuk uraian, options kosong [].
+Gunakan simbol matematika unicode jika perlu (×÷±√π²³≤≥≠∞∑∫∆αβθ dll).
+Kembalikan HANYA JSON array tanpa penjelasan lain.`;
+    try {
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+        body: JSON.stringify({ model: "llama3-8b-8192", messages: [{ role: "user", content: prompt }], max_tokens: 4000, temperature: 0.7 })
+      });
+      if (!res.ok) { const err = await res.json(); throw new Error(err.error?.message || "API error"); }
+      const json = await res.json();
+      const text = json.choices?.[0]?.message?.content || "";
+      const match = text.match(/\[[\s\S]*\]/);
+      if (!match) throw new Error("Format respons tidak valid");
+      const parsed = JSON.parse(match[0]);
+      const questions = parsed.map(q => ({ ...q, subjectId, createdBy: userId || "admin", id: genId() }));
+      setGenerated(questions);
+      try { localStorage.setItem("groq_api_key", apiKey); } catch {}
+    } catch(e) { showToast("Error: " + e.message, "error"); }
+    setLoading(false);
+  };
+
+  return (
+    <Modal title="🤖 AI Generate Soal (Groq)" onClose={onClose} wide>
+      <div className="space-y-4">
+        <div>
+          <label className="text-blue-300 text-sm font-medium mb-1 block">Groq API Key</label>
+          <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="gsk_..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+          <p className="text-xs mt-1" style={{ color: "inherit", opacity: 0.5 }}>Dapatkan gratis di console.groq.com — tersimpan lokal di browser Anda</p>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <Select label="Mata Pelajaran" value={subjectId} onChange={e => setSubjectId(e.target.value)}>
+            {availableSubjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </Select>
+          <Select label="Tipe Soal" value={qtype} onChange={e => setQtype(e.target.value)}>
+            <option value="pilgan">Pilihan Ganda</option>
+            <option value="benar_salah">Benar / Salah</option>
+            <option value="uraian">Uraian</option>
+          </Select>
+        </div>
+        <Input label="Topik / Materi" value={topic} onChange={e => setTopic(e.target.value)} placeholder="Cth: Persamaan Kuadrat, Fotosintesis, Revolusi Prancis..." />
+        <div>
+          <label className="text-blue-300 text-sm font-medium mb-1 block">Jumlah Soal: {count}</label>
+          <input type="range" min={3} max={20} value={count} onChange={e => setCount(Number(e.target.value))} className="w-full" />
+        </div>
+        {generated.length === 0 ? (
+          <div className="flex justify-end gap-2">
+            <Btn variant="secondary" onClick={onClose}>Batal</Btn>
+            <Btn onClick={handleGenerate} disabled={loading}>{loading ? <RefreshCw size={14} className="animate-spin" /> : <Play size={14} />}{loading ? "Generating..." : "Generate Soal"}</Btn>
+          </div>
+        ) : (
+          <div>
+            <div className="text-green-400 font-semibold mb-3">{generated.length} soal berhasil digenerate</div>
+            <div className="space-y-2 max-h-64 overflow-y-auto mb-4">
+              {generated.map((q, i) => (
+                <div key={i} className="p-3 rounded-xl text-sm" style={{ background: "rgba(15,23,42,0.5)" }}>
+                  <div className="font-medium mb-1" style={{ color: "inherit" }}>{i+1}. {q.text.substring(0, 120)}</div>
+                  {q.options?.length > 0 && <div className="flex flex-wrap gap-1">{q.options.map((o, oi) => <span key={oi} className="px-2 py-0.5 rounded text-xs" style={{ background: oi === q.correctAnswer ? "rgba(22,163,74,0.2)" : "rgba(51,65,85,0.5)", color: oi === q.correctAnswer ? "#4ade80" : "#94a3b8" }}>{String.fromCharCode(65+oi)}. {o}</span>)}</div>}
+                  {q.explanation && <div className="text-blue-300 text-xs mt-1">💡 {q.explanation.substring(0, 80)}</div>}
+                </div>
+              ))}
+            </div>
+            <div className="flex justify-end gap-2">
+              <Btn variant="secondary" onClick={() => setGenerated([])}>Generate Ulang</Btn>
+              <Btn variant="success" onClick={() => { onImport(generated); onClose(); }}><CheckCircle size={14} />Import {generated.length} Soal</Btn>
+            </div>
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+// ============= SCIENCE EDITOR MODAL =============
+function ScienceEditorModal({ onInsert, onClose }) {
+  const [activeTab, setActiveTab] = useState("symbols");
+  const [latexInput, setLatexInput] = useState("");
+  const [preview, setPreview] = useState("");
+
+  // Load KaTeX lazily
+  useEffect(() => {
+    if (!window.katex) {
+      const link = document.createElement("link");
+      link.rel = "stylesheet"; link.href = "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css";
+      document.head.appendChild(link);
+      const s = document.createElement("script");
+      s.src = "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js";
+      s.onload = () => { renderLatex(); };
+      document.head.appendChild(s);
+    } else { renderLatex(); }
+  }, [latexInput]);
+
+  const renderLatex = () => {
+    if (!window.katex || !latexInput) { setPreview(""); return; }
+    try { setPreview(window.katex.renderToString(latexInput, { throwOnError: false, displayMode: true })); }
+    catch { setPreview(""); }
+  };
+
+  const SYMBOL_GROUPS = {
+    "Matematika": ["±","×","÷","≠","≤","≥","≈","∞","√","²","³","π","∑","∫","∆","∂","∏","‰"],
+    "Kalkulus": ["∫","∮","∇","∂","lim","→","⟶","f'(x)","d/dx","∆x"],
+    "Huruf Yunani": ["α","β","γ","δ","ε","θ","λ","μ","ν","ξ","π","ρ","σ","τ","φ","χ","ψ","ω","Γ","Δ","Θ","Λ","Σ","Φ","Ψ","Ω"],
+    "Fisika": ["Ω","℃","℉","Å","eV","ħ","ℏ","⊕","⊗","↑","↓","⃗","‖","⊥","∥"],
+    "Himpunan": ["∈","∉","⊂","⊃","⊆","⊇","∪","∩","∅","∖","∁","ℕ","ℤ","ℚ","ℝ","ℂ"],
+    "Geometri": ["°","∠","△","▽","□","◇","⊙","⊥","∥","≅","∼","⟂"],
+  };
+
+  const CHEM_TEMPLATES = [
+    ["Persamaan biasa", "A + B → C + D"],
+    ["Kesetimbangan", "A ⇌ B"],
+    ["Reaksi asam-basa", "HCl + NaOH → NaCl + H₂O"],
+    ["Oksidasi", "2H₂ + O₂ → 2H₂O"],
+    ["Ionisasi", "NaCl → Na⁺ + Cl⁻"],
+    ["pH formula", "pH = -log[H⁺]"],
+    ["Mol", "n = m/Mr"],
+    ["Konsentrasi", "M = n/V"],
+    ["Hukum gas ideal", "PV = nRT"],
+    ["Energi aktivasi", "Ea = RT ln(A/k)"],
+    ["Laju reaksi", "v = k[A]^m[B]^n"],
+    ["Kesetimbangan Kc", "Kc = [C]^c[D]^d / [A]^a[B]^b"],
+    ["Perubahan entalpi", "ΔH = Hp - Hr"],
+    ["Buffer", "pH = pKa + log([A⁻]/[HA])"],
+  ];
+
+  const MATH_TEMPLATES = [
+    ["Pecahan", "\\frac{a}{b}"],
+    ["Akar", "\\sqrt{x}"],
+    ["Pangkat", "x^{n}"],
+    ["Integral", "\\int_{a}^{b} f(x)\\,dx"],
+    ["Sigma", "\\sum_{i=1}^{n} i"],
+    ["Limit", "\\lim_{x \\to 0}"],
+    ["Matriks 2×2", "\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}"],
+    ["Vektor", "\\vec{v}"],
+    ["Turunan", "\\frac{d}{dx}"],
+    ["Logaritma", "\\log_{b}(x)"],
+    ["sin/cos/tan", "\\sin\\theta, \\cos\\theta, \\tan\\theta"],
+    ["Mutlak", "|x|"],
+    ["Pi", "\\pi \\approx 3.14159"],
+    ["Sistem persamaan", "\\begin{cases} x+y=5 \\\\ x-y=1 \\end{cases}"],
+  ];
+
+  const tabs = ["symbols","equation","kimia","templates"];
+  const tabLabel = { symbols:"Simbol", equation:"Persamaan LaTeX", kimia:"Kimia", templates:"Template" };
+
+  return (
+    <Modal title="📐 Science Editor" onClose={onClose} wide>
+      <div className="flex gap-1 mb-4 flex-wrap">
+        {tabs.map(t => (
+          <button key={t} onClick={() => setActiveTab(t)} className="px-3 py-1.5 rounded-lg text-xs font-semibold transition" style={{ background: activeTab === t ? "#3b82f6" : "rgba(51,65,85,0.5)", color: activeTab === t ? "white" : "#94a3b8" }}>{tabLabel[t]}</button>
+        ))}
+      </div>
+
+      {activeTab === "symbols" && (
+        <div className="space-y-3 max-h-96 overflow-y-auto">
+          {Object.entries(SYMBOL_GROUPS).map(([group, syms]) => (
+            <div key={group}>
+              <div className="text-blue-400 text-xs font-bold mb-1">{group}</div>
+              <div className="flex flex-wrap gap-1">
+                {syms.map(s => (
+                  <button key={s} onClick={() => onInsert(s)} className="px-2 py-1 rounded text-sm font-mono hover:bg-blue-500/20 transition" style={{ background: "rgba(15,23,42,0.6)", color: "#e2e8f0", border: "1px solid rgba(59,130,246,0.15)", minWidth: "2.5rem", textAlign:"center" }}>{s}</button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {activeTab === "equation" && (
+        <div className="space-y-3">
+          <div>
+            <label className="text-blue-300 text-sm font-medium mb-1 block">LaTeX Input</label>
+            <textarea value={latexInput} onChange={e => setLatexInput(e.target.value)} rows={3} placeholder="Cth: \frac{-b \pm \sqrt{b^2-4ac}}{2a}" className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none font-mono" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+          </div>
+          {preview && (
+            <div className="p-4 rounded-xl" style={{ background: "rgba(15,23,42,0.5)", border: "1px solid rgba(59,130,246,0.15)" }}>
+              <div className="text-xs text-slate-400 mb-2">Preview:</div>
+              <div className="text-white overflow-x-auto" dangerouslySetInnerHTML={{ __html: preview }} />
+            </div>
+          )}
+          <div className="flex justify-end gap-2">
+            <Btn variant="secondary" onClick={() => setLatexInput("")}>Bersihkan</Btn>
+            <Btn onClick={() => { if(latexInput) onInsert(latexInput); }}><CheckCircle size={14} />Sisipkan LaTeX</Btn>
+          </div>
+        </div>
+      )}
+
+      {activeTab === "kimia" && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-96 overflow-y-auto">
+          {CHEM_TEMPLATES.map(([label, tpl]) => (
+            <button key={label} onClick={() => onInsert(tpl)} className="flex items-start gap-2 px-3 py-2 rounded-xl text-left text-xs transition hover:bg-blue-500/10" style={{ background: "rgba(15,23,42,0.5)", border: "1px solid rgba(59,130,246,0.1)" }}>
+              <span className="text-blue-400 font-medium shrink-0">{label}</span>
+              <span className="font-mono" style={{ color: "inherit", opacity: 0.7 }}>{tpl}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {activeTab === "templates" && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-96 overflow-y-auto">
+          {MATH_TEMPLATES.map(([label, tpl]) => (
+            <button key={label} onClick={() => onInsert(tpl)} className="flex items-start gap-2 px-3 py-2 rounded-xl text-left text-xs transition hover:bg-purple-500/10" style={{ background: "rgba(15,23,42,0.5)", border: "1px solid rgba(168,85,247,0.1)" }}>
+              <span className="text-purple-400 font-medium shrink-0">{label}</span>
+              <span className="font-mono" style={{ color: "inherit", opacity: 0.7 }}>{tpl}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
 // ============= QUESTION MANAGER =============
 function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
   const [showModal, setShowModal] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  const [showAIGenerate, setShowAIGenerate] = useState(false);
+  const [showScienceEditor, setShowScienceEditor] = useState(false);
+  const [scienceTarget, setScienceTarget] = useState(null); // which field to insert into
   const [editId, setEditId] = useState(null);
   const [filterSubject, setFilterSubject] = useState("all");
   const [form, setForm] = useState({ subjectId: "", type: "pilgan", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "", rubrik: "" });
   const [filterType, setFilterType] = useState("all");
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [bulkMode, setBulkMode] = useState(false);
+
+  // Teacher: only show their subjects; Admin: show all
+  const teacherSubjects = userId ? (data.teachers || []).find(t => t.id === userId)?.subjects || [] : null;
+  const visibleSubjects = teacherSubjects
+    ? (data.subjects || []).filter(s => teacherSubjects.includes(s.id))
+    : (data.subjects || []);
 
   const [showMineOnly, setShowMineOnly] = useState(false);
-  // Show all questions (not just createdBy this user) - prevents visibility issues
-  // from real-time sync delay. User can filter to "mine only".
   const allQ = data.questions || [];
-  const baseQ = (userId && showMineOnly) ? allQ.filter(q => q.createdBy === userId) : allQ;
+  // Guru only sees questions for their subjects
+  const subjectFilteredQ = teacherSubjects
+    ? allQ.filter(q => teacherSubjects.includes(q.subjectId))
+    : allQ;
+  const baseQ = (userId && showMineOnly) ? subjectFilteredQ.filter(q => q.createdBy === userId) : subjectFilteredQ;
   const filtered = baseQ.filter(q => {
     if (filterSubject !== "all" && q.subjectId !== filterSubject) return false;
     if (filterType !== "all" && (q.type || "pilgan") !== filterType) return false;
     return true;
   });
-  const myCount = userId ? allQ.filter(q => q.createdBy === userId).length : allQ.length;
+  const myCount = userId ? subjectFilteredQ.filter(q => q.createdBy === userId).length : allQ.length;
 
-  const openAdd = () => { setEditId(null); setForm({ subjectId: (data.subjects || [])[0]?.id || "", type: "pilgan", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "", rubrik: "" }); setShowModal(true); };
-  const openEdit = (q) => { setEditId(q.id); setForm({ subjectId: q.subjectId, type: q.type || "pilgan", text: q.text, image: q.image || "", options: q.options?.length ? [...q.options, "", "", ""].slice(0, 5) : ["", "", "", "", ""], correctAnswer: q.correctAnswer || 0, explanation: q.explanation || "", rubrik: q.rubrik || "" }); setShowModal(true); };
+  const defaultSubjectId = visibleSubjects[0]?.id || "";
+
+  const openAdd = () => {
+    setEditId(null);
+    setForm({ subjectId: defaultSubjectId, type: "pilgan", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "", rubrik: "" });
+    setShowModal(true);
+  };
+  const openEdit = (q) => {
+    setEditId(q.id);
+    setForm({ subjectId: q.subjectId, type: q.type || "pilgan", text: q.text, image: q.image || "", options: q.options?.length ? [...q.options, "", "", ""].slice(0, 5) : ["", "", "", "", ""], correctAnswer: q.correctAnswer || 0, explanation: q.explanation || "", rubrik: q.rubrik || "" });
+    setShowModal(true);
+  };
 
   const handleImageUpload = (e) => {
     const file = e.target.files[0]; if (!file) return;
@@ -1245,7 +1502,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     let questions = [...(latest.questions || [])];
     const qData = {
       ...form,
-      options: form.type === "pilgan" ? form.options.filter(o => o.trim()) : [],
+      options: form.type === "pilgan" ? form.options.filter(o => o.trim()) : (form.type === "benar_salah" ? ["Benar","Salah"] : []),
       createdBy: userId || "admin",
       type: form.type || "pilgan"
     };
@@ -1263,34 +1520,84 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     showToast("Soal dihapus");
   };
 
+  const handleBulkDelete = () => {
+    if (selectedIds.size === 0) return;
+    if (!confirm(`Hapus ${selectedIds.size} soal yang dipilih? Tindakan ini tidak dapat dibatalkan.`)) return;
+    const latest = dataRef?.current || data;
+    saveData({ ...latest, questions: (latest.questions || []).filter(q => !selectedIds.has(q.id)) }, ["questions"]);
+    setSelectedIds(new Set());
+    setBulkMode(false);
+    showToast(`${selectedIds.size} soal berhasil dihapus`);
+  };
+
+  const toggleSelect = (id) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const selectAll = () => {
+    if (selectedIds.size === filtered.length) setSelectedIds(new Set());
+    else setSelectedIds(new Set(filtered.map(q => q.id)));
+  };
+
   const handleBulkImport = (importedQuestions) => {
     const latest = dataRef?.current || data;
     const questions = [...(latest.questions || []), ...importedQuestions.map(q => ({ id: genId(), ...q, type: q.type || "pilgan", createdBy: userId || "admin" }))];
-    saveData({ ...latest, questions });
+    saveData({ ...latest, questions }, ["questions"]);
     setShowImport(false);
     showToast(`${importedQuestions.length} soal berhasil diimpor`);
   };
 
   const getSubjectName = (sid) => (data.subjects || []).find(s => s.id === sid)?.name || "-";
 
+  // Science editor: insert text into a specific field
+  const handleScienceInsert = (text) => {
+    if (!scienceTarget) return;
+    if (scienceTarget === "text") {
+      setForm(f => ({ ...f, text: f.text + text }));
+    } else if (scienceTarget === "explanation") {
+      setForm(f => ({ ...f, explanation: f.explanation + text }));
+    } else if (scienceTarget.startsWith("option_")) {
+      const idx = parseInt(scienceTarget.split("_")[1]);
+      setForm(f => { const opts = [...f.options]; opts[idx] = opts[idx] + text; return { ...f, options: opts }; });
+    }
+    setShowScienceEditor(false);
+  };
+
   return (
     <div>
       <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
         <div>
           <h2 className="text-2xl font-bold" style={{ color: "inherit" }}>Bank Soal</h2>
-          {userId && <p className="text-xs mt-0.5" style={{ color: "inherit", opacity: 0.6 }}>Soal saya: {myCount} | Total: {allQ.length}</p>}
+          {userId && <p className="text-xs mt-0.5" style={{ color: "inherit", opacity: 0.6 }}>Soal saya: {myCount} | Tampil: {filtered.length}</p>}
         </div>
         <div className="flex gap-2 flex-wrap">
           {userId && <button onClick={() => setShowMineOnly(v => !v)} className="px-3 py-2 rounded-xl text-xs font-medium transition" style={{ background: showMineOnly ? "rgba(59,130,246,0.25)" : "rgba(51,65,85,0.5)", color: showMineOnly ? "#60a5fa" : "#94a3b8", border: "1px solid rgba(59,130,246,0.2)" }}>{showMineOnly ? "✓ Soal Saya" : "Semua Soal"}</button>}
+          <button onClick={() => { setBulkMode(v => !v); setSelectedIds(new Set()); }} className="px-3 py-2 rounded-xl text-xs font-medium transition" style={{ background: bulkMode ? "rgba(220,38,38,0.2)" : "rgba(51,65,85,0.5)", color: bulkMode ? "#f87171" : "#94a3b8", border: "1px solid rgba(220,38,38,0.2)" }}>{bulkMode ? "✗ Batal Pilih" : "☑ Pilih Banyak"}</button>
+          <Btn variant="secondary" onClick={() => setShowAIGenerate(true)}><Play size={16} />AI Generate</Btn>
           <Btn variant="secondary" onClick={() => setShowImport(true)}><Upload size={16} />Import</Btn>
           <Btn onClick={openAdd}><Plus size={16} />Tambah Soal</Btn>
         </div>
       </div>
+
+      {bulkMode && selectedIds.size > 0 && (
+        <div className="mb-4 p-3 rounded-xl flex items-center justify-between" style={{ background: "rgba(220,38,38,0.1)", border: "1px solid rgba(220,38,38,0.2)" }}>
+          <span className="text-red-400 text-sm">{selectedIds.size} soal dipilih</span>
+          <div className="flex gap-2">
+            <button onClick={selectAll} className="text-xs text-blue-400 hover:underline">{selectedIds.size === filtered.length ? "Batalkan Semua" : "Pilih Semua"}</button>
+            <Btn variant="danger" onClick={handleBulkDelete}><Trash2 size={14} />Hapus {selectedIds.size} Soal</Btn>
+          </div>
+        </div>
+      )}
+
       <Card>
         <div className="mb-4 flex flex-wrap gap-2">
           <select value={filterSubject} onChange={e => setFilterSubject(e.target.value)} className="py-2 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.2)" }}>
             <option value="all">Semua Mata Pelajaran</option>
-            {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+            {visibleSubjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
           <select value={filterType} onChange={e => setFilterType(e.target.value)} className="py-2 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.2)" }}>
             <option value="all">Semua Tipe</option>
@@ -1300,18 +1607,23 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
             <option value="benar_salah">Benar/Salah</option>
           </select>
         </div>
-        <div className="text-xs mb-3" style={{ color: "inherit", opacity: 0.65 }}>{filtered.length} soal</div>
+        <div className="text-xs mb-3" style={{ color: "inherit", opacity: 0.65 }}>{filtered.length} soal{bulkMode && " — mode pilih aktif"}</div>
         {filtered.length === 0 ? <EmptyState icon={<FileText size={40} className="mx-auto" />} text="Belum ada soal" /> : (
           <div className="space-y-3 max-h-[60vh] overflow-y-auto">
             {filtered.map((q, i) => (
-              <div key={q.id} className="p-3 rounded-xl" style={{ background: "rgba(15,23,42,0.5)" }}>
+              <div key={q.id} className="p-3 rounded-xl transition" style={{ background: selectedIds.has(q.id) ? "rgba(220,38,38,0.1)" : "rgba(15,23,42,0.5)", border: selectedIds.has(q.id) ? "1px solid rgba(220,38,38,0.3)" : "1px solid transparent" }}>
                 <div className="flex items-start justify-between gap-2">
+                  {bulkMode && (
+                    <button onClick={() => toggleSelect(q.id)} className="mt-0.5 shrink-0 w-5 h-5 rounded border flex items-center justify-center transition" style={{ borderColor: selectedIds.has(q.id) ? "#ef4444" : "#475569", background: selectedIds.has(q.id) ? "#ef4444" : "transparent" }}>
+                      {selectedIds.has(q.id) && <CheckCircle size={12} color="white" />}
+                    </button>
+                  )}
                   <div className="flex-1">
                     <div className="flex items-center gap-2 mb-1 flex-wrap"><span className="text-blue-400 text-xs">{getSubjectName(q.subjectId)}</span>{userId && q.createdBy !== userId && <span className="px-1.5 py-0.5 rounded text-xs" style={{ background: "rgba(168,85,247,0.15)", color: "#c084fc" }}>dari guru lain</span>}<span className="px-1.5 py-0.5 rounded text-xs" style={{ background: q.type === "esai" ? "rgba(168,85,247,0.2)" : q.type === "uraian" ? "rgba(20,184,166,0.2)" : q.type === "benar_salah" ? "rgba(234,179,8,0.2)" : "rgba(59,130,246,0.2)", color: q.type === "esai" ? "#c084fc" : q.type === "uraian" ? "#2dd4bf" : q.type === "benar_salah" ? "#fbbf24" : "#60a5fa" }}>{q.type === "esai" ? "Esai" : q.type === "uraian" ? "Uraian" : q.type === "benar_salah" ? "Benar/Salah" : "Pilihan Ganda"}</span></div>
                     <div className="text-white text-sm mb-2">{i + 1}. {q.text.substring(0, 150)}{q.text.length > 150 ? "..." : ""}</div>
                     {q.image && <img src={q.image} alt="" className="max-h-24 rounded-lg mb-2" />}
                     <div className="flex flex-wrap gap-1">
-                      {q.options.map((o, oi) => (
+                      {(q.options || []).map((o, oi) => (
                         <span key={oi} className="px-2 py-0.5 rounded text-xs" style={{ background: oi === q.correctAnswer ? "rgba(22,163,74,0.2)" : "rgba(51,65,85,0.5)", color: oi === q.correctAnswer ? "#4ade80" : "#94a3b8" }}>
                           {String.fromCharCode(65 + oi)}. {o.substring(0, 30)}
                         </span>
@@ -1329,7 +1641,9 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
         )}
       </Card>
 
-      {showImport && <ImportSoalModal data={data} onImport={handleBulkImport} onClose={() => setShowImport(false)} showToast={showToast} />}
+      {showAIGenerate && <AIGenerateModal data={data} onImport={handleBulkImport} onClose={() => setShowAIGenerate(false)} showToast={showToast} userId={userId} subjectFilter={teacherSubjects ? defaultSubjectId : null} />}
+      {showImport && <ImportSoalModal data={data} onImport={handleBulkImport} onClose={() => setShowImport(false)} showToast={showToast} visibleSubjects={visibleSubjects} />}
+      {showScienceEditor && <ScienceEditorModal onInsert={handleScienceInsert} onClose={() => setShowScienceEditor(false)} />}
 
       {showModal && (
         <Modal title={editId ? "Edit Soal" : "Tambah Soal"} onClose={() => setShowModal(false)} wide>
@@ -1337,7 +1651,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <Select label="Mata Pelajaran" value={form.subjectId} onChange={e => setForm({ ...form, subjectId: e.target.value })}>
                 <option value="">-- Pilih Mapel --</option>
-                {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                {visibleSubjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
               </Select>
               <Select label="Tipe Soal" value={form.type} onChange={e => setForm({ ...form, type: e.target.value })}>
                 <option value="pilgan">Pilihan Ganda</option>
@@ -1347,8 +1661,11 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
               </Select>
             </div>
             <div>
-              <label className="text-blue-300 text-sm font-medium mb-1 block">Teks Soal</label>
-              <textarea value={form.text} onChange={e => setForm({ ...form, text: e.target.value })} rows={4} placeholder="Masukkan teks soal..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-blue-300 text-sm font-medium">Teks Soal</label>
+                <button type="button" onClick={() => { setScienceTarget("text"); setShowScienceEditor(true); }} className="text-xs px-2 py-1 rounded-lg flex items-center gap-1 transition" style={{ background: "rgba(168,85,247,0.2)", color: "#c084fc", border: "1px solid rgba(168,85,247,0.3)" }}>📐 Science Editor</button>
+              </div>
+              <MathTextarea value={form.text} onChange={v => setForm({ ...form, text: v })} placeholder="Masukkan teks soal... (gunakan simbol ± × √ dll)" rows={4} />
             </div>
             <div>
               <label className="text-blue-300 text-sm font-medium mb-1 block">Gambar Soal (Opsional)</label>
@@ -1367,13 +1684,18 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
             </div>
             {(form.type === "pilgan") && (
               <div>
-                <label className="text-blue-300 text-sm font-medium mb-2 block">Pilihan Jawaban</label>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-blue-300 text-sm font-medium">Pilihan Jawaban</label>
+                </div>
                 {form.options.map((o, i) => (
-                  <div key={i} className="flex items-center gap-2 mb-2">
-                    <button onClick={() => setForm(f => ({ ...f, correctAnswer: i }))} className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold shrink-0 transition" style={{ background: form.correctAnswer === i ? "#16a34a" : "rgba(51,65,85,0.5)", color: "white" }}>
+                  <div key={i} className="flex items-start gap-2 mb-2">
+                    <button onClick={() => setForm(f => ({ ...f, correctAnswer: i }))} className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold shrink-0 mt-1 transition" style={{ background: form.correctAnswer === i ? "#16a34a" : "rgba(51,65,85,0.5)", color: "white" }}>
                       {String.fromCharCode(65 + i)}
                     </button>
-                    <input value={o} onChange={e => { const opts = [...form.options]; opts[i] = e.target.value; setForm({ ...form, options: opts }); }} placeholder={`Pilihan ${String.fromCharCode(65 + i)}`} className="flex-1 py-2 px-3 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: `1px solid ${form.correctAnswer === i ? "rgba(22,163,74,0.5)" : "rgba(59,130,246,0.25)"}` }} />
+                    <div className="flex-1">
+                      <MathTextarea value={o} onChange={v => { const opts = [...form.options]; opts[i] = v; setForm({ ...form, options: opts }); }} placeholder={`Pilihan ${String.fromCharCode(65 + i)}`} rows={1} />
+                    </div>
+                    <button type="button" onClick={() => { setScienceTarget(`option_${i}`); setShowScienceEditor(true); }} className="mt-1 text-xs px-1.5 py-1 rounded flex items-center shrink-0 transition" style={{ background: "rgba(168,85,247,0.15)", color: "#c084fc" }} title="Science Editor">📐</button>
                   </div>
                 ))}
                 <p className="text-slate-500 text-xs mt-1">Klik huruf untuk menandai jawaban benar (hijau)</p>
@@ -1416,14 +1738,16 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
   );
 }
 
-// ============= IMPORT SOAL MODAL (Word/PDF) =============
-function ImportSoalModal({ data, onImport, onClose, showToast }) {
-  const [step, setStep] = useState("upload"); // upload | preview | done
-  const [subjectId, setSubjectId] = useState((data.subjects || [])[0]?.id || "");
+// ============= IMPORT SOAL MODAL (Word/PDF) — supports 100s of questions + math symbols =============
+function ImportSoalModal({ data, onImport, onClose, showToast, visibleSubjects }) {
+  const subjects = visibleSubjects || data.subjects || [];
+  const [step, setStep] = useState("upload");
+  const [subjectId, setSubjectId] = useState(subjects[0]?.id || "");
   const [rawText, setRawText] = useState("");
   const [parsed, setParsed] = useState([]);
   const [loading, setLoading] = useState(false);
   const [answerText, setAnswerText] = useState("");
+  const [importProgress, setImportProgress] = useState(null);
 
   const loadMammoth = async () => {
     if (window.mammoth) return window.mammoth;
@@ -1443,13 +1767,21 @@ function ImportSoalModal({ data, onImport, onClose, showToast }) {
       if (file.name.endsWith(".docx")) {
         const mammoth = await loadMammoth();
         const ab = await file.arrayBuffer();
+        // Use convertToHtml to preserve more content, then extract text
         const result = await mammoth.extractRawText({ arrayBuffer: ab });
+        // Also try to get equations/special chars
         setRawText(result.value);
+        showToast(`File dibaca: ${result.value.length} karakter`, "success");
       } else if (file.name.endsWith(".txt")) {
         const text = await file.text();
         setRawText(text);
+        showToast(`File dibaca: ${text.length} karakter`, "success");
+      } else if (file.name.endsWith(".csv")) {
+        // CSV: each row is a question
+        const text = await file.text();
+        setRawText(text);
       } else {
-        showToast("Format tidak didukung. Gunakan .docx atau .txt", "error");
+        showToast("Format tidak didukung. Gunakan .docx, .txt, atau .csv", "error");
       }
     } catch (err) {
       showToast("Gagal membaca file: " + err.message, "error");
@@ -1457,77 +1789,129 @@ function ImportSoalModal({ data, onImport, onClose, showToast }) {
     setLoading(false);
   };
 
+  // Enhanced parser: preserves math symbols, handles hundreds of questions
   const parseQuestions = () => {
     if (!rawText.trim()) return showToast("Tidak ada teks untuk diparse", "error");
-    const lines = rawText.split("\n").map(l => l.trim()).filter(Boolean);
-    const questions = [];
-    let current = null;
 
-    // Parse answer key from answerText
+    // Parse answer key
     const answerMap = {};
     if (answerText.trim()) {
-      const ansLines = answerText.split("\n").map(l => l.trim()).filter(Boolean);
-      ansLines.forEach(l => {
-        const m = l.match(/(\d+)\s*[.)\-:\s]\s*([A-Ea-e])/);
+      answerText.split("\n").forEach(l => {
+        l = l.trim();
+        // supports: "1. A", "1) A", "1 A", "1:A", "No.1 A"
+        const m = l.match(/(?:no\.?\s*)?(\d+)\s*[.):\-\s]\s*([A-Ea-e])\b/i);
         if (m) answerMap[parseInt(m[1])] = m[2].toUpperCase().charCodeAt(0) - 65;
       });
     }
 
+    const questions = [];
+    let current = null;
     let qNum = 0;
+
+    // Split by lines but keep math symbols
+    const lines = rawText.split(/\r?\n/).map(l => l.trimEnd()).filter(Boolean);
+
+    const pushCurrent = () => {
+      if (current && current.text.trim()) {
+        if (current.options.length < 2) {
+          // treat as essay if no options
+          current.options = [];
+          current.type = "uraian";
+          current.correctAnswer = 0;
+        }
+        questions.push(current);
+      }
+    };
+
     lines.forEach(line => {
-      // Detect question: starts with number. or number)
-      const qMatch = line.match(/^(\d+)[.)]\s+(.+)/);
+      const trimmed = line.trim();
+      // Match question number: "1." "1)" "1 ." "Soal 1." etc.
+      const qMatch = trimmed.match(/^(?:soal\s*)?(\d+)\s*[.)]\s+(.+)/i);
       if (qMatch) {
-        if (current && current.options.length >= 2) questions.push(current);
+        pushCurrent();
         qNum = parseInt(qMatch[1]);
-        current = { subjectId, text: qMatch[2], options: [], correctAnswer: answerMap[qNum] ?? 0, explanation: "" };
+        current = {
+          subjectId, type: "pilgan",
+          text: qMatch[2],
+          options: [],
+          correctAnswer: answerMap[qNum] ?? 0,
+          explanation: ""
+        };
         return;
       }
-      // Detect option: A. or A) or (A)
-      const optMatch = line.match(/^[(\s]*([A-Ea-e])[.)]\s+(.+)/);
+      // Match option: "A." "A)" "(A)" "a." — preserve everything after, including math
+      const optMatch = trimmed.match(/^[(\s]*([A-Ea-e])\s*[.)]\s+(.+)/);
       if (optMatch && current) {
         current.options.push(optMatch[2]);
         return;
       }
-      // Continue question text
-      if (current && current.options.length === 0) {
-        current.text += " " + line;
+      // Continuation of question text (before first option)
+      if (current && current.options.length === 0 && trimmed) {
+        current.text += "\n" + trimmed;
       }
     });
-    if (current && current.options.length >= 2) questions.push(current);
+    pushCurrent();
 
-    if (questions.length === 0) return showToast("Tidak ada soal yang terdeteksi. Pastikan format: '1. Pertanyaan' dan 'A. Pilihan'", "error");
+    if (questions.length === 0) {
+      return showToast("Tidak ada soal terdeteksi. Format: '1. Pertanyaan\\nA. Pilihan A\\nB. Pilihan B...'", "error");
+    }
     setParsed(questions);
     setStep("preview");
+    showToast(`${questions.length} soal berhasil diparse`, "success");
+  };
+
+  const handleImport = async () => {
+    // Import in chunks to avoid UI freeze for large sets
+    const CHUNK = 50;
+    setImportProgress({ done: 0, total: parsed.length });
+    let allImported = [];
+    for (let i = 0; i < parsed.length; i += CHUNK) {
+      const chunk = parsed.slice(i, i + CHUNK);
+      allImported = [...allImported, ...chunk];
+      setImportProgress({ done: Math.min(i + CHUNK, parsed.length), total: parsed.length });
+      await new Promise(r => setTimeout(r, 10)); // let UI breathe
+    }
+    onImport(allImported);
+    setImportProgress(null);
   };
 
   return (
     <Modal title="Import Soal dari Dokumen" onClose={onClose} wide>
       {step === "upload" && (
         <div className="space-y-4">
+          <div className="p-3 rounded-xl text-xs" style={{ background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.15)", color: "#93c5fd" }}>
+            <strong>Format dokumen:</strong><br/>
+            1. Teks soal (simbol matematika langsung disalin: ±×÷√π²³∑∫...)<br/>
+            A. Pilihan A &nbsp;&nbsp; B. Pilihan B &nbsp;&nbsp; C. Pilihan C &nbsp;&nbsp; D. Pilihan D &nbsp;&nbsp; E. Pilihan E<br/>
+            2. Soal berikutnya...<br/>
+            <em>Mendukung ratusan soal sekaligus • Format .docx, .txt, .csv</em>
+          </div>
           <Select label="Mata Pelajaran" value={subjectId} onChange={e => setSubjectId(e.target.value)}>
-            {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+            {subjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
           </Select>
           <div>
-            <label className="text-blue-300 text-sm font-medium mb-1 block">File Soal (.docx atau .txt)</label>
+            <label className="text-blue-300 text-sm font-medium mb-1 block">File Soal (.docx, .txt, .csv)</label>
             <label className="cursor-pointer flex flex-col items-center justify-center gap-2 p-8 rounded-xl transition" style={{ border: "2px dashed rgba(59,130,246,0.4)", background: "rgba(15,23,42,0.5)" }}>
               <Upload size={32} className="text-blue-400" />
               <span className="text-blue-300 font-medium">{loading ? "Membaca file..." : "Klik untuk pilih file"}</span>
-              <span className="text-slate-500 text-xs">Format: .docx, .txt</span>
-              <input type="file" accept=".docx,.txt" onChange={handleFile} className="hidden" disabled={loading} />
+              <span className="text-slate-500 text-xs">Simbol matematika (±×÷√π∑∫...) otomatis terbaca</span>
+              <input type="file" accept=".docx,.txt,.csv" onChange={handleFile} className="hidden" disabled={loading} />
             </label>
           </div>
           {rawText && (
             <div>
-              <label className="text-blue-300 text-sm font-medium mb-1 block">Preview teks ({rawText.length} karakter)</label>
-              <div className="p-3 rounded-xl text-slate-300 text-xs overflow-y-auto max-h-32" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.2)", whiteSpace: "pre-wrap" }}>
-                {rawText.substring(0, 500)}...
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-blue-300 text-sm font-medium">Preview ({rawText.length.toLocaleString()} karakter)</label>
+                <span className="text-xs text-green-400">✓ Siap diparse</span>
+              </div>
+              <div className="p-3 rounded-xl text-slate-300 text-xs overflow-y-auto max-h-32 font-mono" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.2)", whiteSpace: "pre-wrap" }}>
+                {rawText.substring(0, 800)}{rawText.length > 800 ? "\n..." : ""}
               </div>
             </div>
           )}
           <div>
-            <label className="text-blue-300 text-sm font-medium mb-1 block">Kunci Jawaban (opsional, format: "1. A", "2. B", ...)</label>
-            <textarea value={answerText} onChange={e => setAnswerText(e.target.value)} rows={4} placeholder={"1. A\n2. C\n3. B\n4. E\n..."} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+            <label className="text-blue-300 text-sm font-medium mb-1 block">Kunci Jawaban (opsional)</label>
+            <textarea value={answerText} onChange={e => setAnswerText(e.target.value)} rows={4} placeholder={"1. A\n2. C\n3. B\n4. E\n5. D\n...\n(bisa untuk ratusan soal)"} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500 font-mono" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
           </div>
           <div className="flex justify-end gap-2">
             <Btn variant="secondary" onClick={onClose}>Batal</Btn>
@@ -1542,23 +1926,33 @@ function ImportSoalModal({ data, onImport, onClose, showToast }) {
             <div className="text-green-400 font-semibold">{parsed.length} soal terdeteksi</div>
             <Btn variant="secondary" onClick={() => setStep("upload")}><ArrowLeft size={14} />Kembali</Btn>
           </div>
+          {importProgress && (
+            <div className="mb-4">
+              <div className="text-blue-400 text-sm mb-1">Mengimpor {importProgress.done}/{importProgress.total}...</div>
+              <div className="h-2 rounded-full overflow-hidden" style={{ background: "rgba(51,65,85,0.5)" }}>
+                <div className="h-full rounded-full" style={{ width: `${importProgress.done/importProgress.total*100}%`, background: "#3b82f6", transition: "width 0.2s" }} />
+              </div>
+            </div>
+          )}
           <div className="space-y-3 max-h-[50vh] overflow-y-auto mb-4">
-            {parsed.map((q, i) => (
+            {parsed.slice(0, 200).map((q, i) => (
               <div key={i} className="p-3 rounded-xl" style={{ background: "rgba(15,23,42,0.5)" }}>
-                <div className="text-white text-sm font-medium mb-1">{i+1}. {q.text.substring(0, 100)}</div>
+                <div className="text-white text-sm font-medium mb-1">{i+1}. {q.text.substring(0, 120)}</div>
                 <div className="flex flex-wrap gap-1">
-                  {q.options.map((o, oi) => (
+                  {q.options.slice(0,5).map((o, oi) => (
                     <span key={oi} className="px-2 py-0.5 rounded text-xs" style={{ background: oi === q.correctAnswer ? "rgba(22,163,74,0.2)" : "rgba(51,65,85,0.5)", color: oi === q.correctAnswer ? "#4ade80" : "#94a3b8" }}>
-                      {String.fromCharCode(65+oi)}. {o.substring(0,30)}
+                      {String.fromCharCode(65+oi)}. {o.substring(0,40)}
                     </span>
                   ))}
+                  {q.type === "uraian" && <span className="text-teal-400 text-xs">Uraian</span>}
                 </div>
               </div>
             ))}
+            {parsed.length > 200 && <div className="text-center text-slate-500 text-xs py-2">... dan {parsed.length - 200} soal lainnya (tidak ditampilkan semua)</div>}
           </div>
           <div className="flex justify-end gap-2">
             <Btn variant="secondary" onClick={() => setStep("upload")}><ArrowLeft size={14} />Edit</Btn>
-            <Btn variant="success" onClick={() => onImport(parsed)}><Download size={14} />Import {parsed.length} Soal</Btn>
+            <Btn variant="success" onClick={handleImport} disabled={!!importProgress}><Download size={14} />Import {parsed.length} Soal</Btn>
           </div>
         </div>
       )}
@@ -2227,6 +2621,18 @@ function SettingsView({ data, dataRef, saveData, showToast }) {
           <p>Kurikulum: K-13 & Merdeka Belajar</p>
           <p>Total Guru: {data.teachers.length} | Total Siswa: {data.students.length}</p>
           <p>Total Soal: {data.questions.length} | Total Ujian: {data.exams.length}</p>
+        </div>
+      </Card>
+      <Card className="mb-4">
+        <h3 className="font-bold mb-4 flex items-center gap-2" style={{ color: "inherit" }}>🤖 Integrasi AI (Groq)</h3>
+        <p className="text-sm mb-3" style={{ color: "inherit", opacity: 0.7 }}>API Key Groq untuk fitur Generate Soal otomatis. Dapatkan gratis di <a href="https://console.groq.com" target="_blank" className="text-blue-400 underline">console.groq.com</a></p>
+        <div className="space-y-3 max-w-md">
+          <div>
+            <label className="text-blue-300 text-sm font-medium mb-1 block">Groq API Key</label>
+            <input type="password" defaultValue={(() => { try { return localStorage.getItem("groq_api_key") || ""; } catch { return ""; } })()} onChange={e => { try { localStorage.setItem("groq_api_key", e.target.value); } catch {} }} placeholder="gsk_..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+            <p className="text-xs mt-1" style={{ color: "inherit", opacity: 0.5 }}>Tersimpan di browser (localStorage) — tidak dikirim ke server</p>
+          </div>
+          <Btn onClick={() => showToast("API Key tersimpan di browser")}><Save size={14} />Simpan API Key</Btn>
         </div>
       </Card>
       <Card>

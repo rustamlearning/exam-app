@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo, createContext, useContext } from "react";
 import { BookOpen, Users, GraduationCap, Settings, LogOut, Plus, Trash2, Edit, Eye, Clock, AlertTriangle, CheckCircle, XCircle, Monitor, Upload, ChevronRight, Menu, X, Search, FileText, BarChart3, Shield, Lock, Save, RefreshCw, ChevronDown, ArrowLeft, Home, User, Hash, Layers, Play, Square, Award, Bell, AlertCircle, Printer, Camera, Key, Download } from "lucide-react";
 import { initializeApp } from "firebase/app";
-import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, query, where, getDocs } from "firebase/firestore";
+import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, query, where, getDocs, runTransaction } from "firebase/firestore";
 
 // ============= CONSTANTS =============
 const SCHOOL_NAME = "SMA Negeri 6 Pangkajene dan Kepulauan";
@@ -189,15 +189,17 @@ const store = {
     try {
       // Save individual student doc (no race condition)
       await setDoc(doc(db, "sessions2", key), { ...sessionData, _key: key, ts: Date.now() });
-      // Also update index doc so MonitorView can listen to all sessions for this exam
+      // Update index doc atomically — prevents race condition with concurrent students
       const indexRef = doc(db, "examapp2", "sessions_" + examId);
-      const indexSnap = await getDoc(indexRef);
-      const existing = indexSnap.exists() ? (indexSnap.data().sessions || []) : [];
-      const idx = existing.findIndex(s => s.studentId === studentId);
-      const updated = [...existing];
-      if (idx >= 0) updated[idx] = sessionData;
-      else updated.push(sessionData);
-      await setDoc(indexRef, { sessions: updated, ts: Date.now() });
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(indexRef);
+        const existing = snap.exists() ? (snap.data().sessions || []) : [];
+        const idx = existing.findIndex(s => s.studentId === studentId);
+        const updated = [...existing];
+        if (idx >= 0) updated[idx] = sessionData;
+        else updated.push(sessionData);
+        tx.set(indexRef, { sessions: updated, ts: Date.now() });
+      });
     }
     catch(e) { console.error("saveSession", e); throw e; }
   },
@@ -246,15 +248,17 @@ const store = {
     try {
       // Save individual student result doc
       await setDoc(doc(db, "results2", key), { ...resultData, _key: key, ts: Date.now() });
-      // Also update index doc so ResultsView and MonitorView can listen
+      // Update index doc atomically — prevents race condition when 100+ students submit simultaneously
       const indexRef = doc(db, "examapp2", "results_" + examId);
-      const indexSnap = await getDoc(indexRef);
-      const existing = indexSnap.exists() ? (indexSnap.data().results || []) : [];
-      const idx = existing.findIndex(r => r.studentId === studentId);
-      const updated = [...existing];
-      if (idx >= 0) updated[idx] = resultData;
-      else updated.push(resultData);
-      await setDoc(indexRef, { results: updated, ts: Date.now() });
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(indexRef);
+        const existing = snap.exists() ? (snap.data().results || []) : [];
+        const idx = existing.findIndex(r => r.studentId === studentId);
+        const updated = [...existing];
+        if (idx >= 0) updated[idx] = resultData;
+        else updated.push(resultData);
+        tx.set(indexRef, { results: updated, ts: Date.now() });
+      });
     }
     catch(e) { console.error("saveResult", e); throw e; }
   },
@@ -3255,8 +3259,15 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
   const availableExams = data.exams.filter(e => {
     if (e.status !== "active") return false;
     if (!e.targetKelas?.includes(user.kelas)) return false;
+    if (now < new Date(e.startTime)) return false; // belum dimulai
     if (now > new Date(e.endTime)) return false;
     return !(data.results || []).find(r => r.examId === e.id && r.studentId === user.id);
+  });
+
+  const upcomingExams = data.exams.filter(e => {
+    if (e.status !== "active") return false;
+    if (!e.targetKelas?.includes(user.kelas)) return false;
+    return now < new Date(e.startTime); // aktif tapi belum mulai
   });
 
   const myResults = (data.results || []).filter(r => r.studentId === user.id);
@@ -3311,7 +3322,7 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
                     <div>
                       <h4 className="font-bold" style={{ color: "inherit" }}>{ex.title}</h4>
                       <div className="text-sm" style={{ color: "inherit", opacity: 0.7 }}>{(data.subjects || []).find(s => s.id === ex.subjectId)?.name} • {ex.questionIds.length} soal • {ex.duration} menit</div>
-                      <div className="text-blue-400 text-xs mt-1">Berakhir: {new Date(ex.endTime).toLocaleString("id-ID")}</div>
+                      <div className="text-blue-400 text-xs mt-1">Mulai: {new Date(ex.startTime).toLocaleString("id-ID")} • Berakhir: {new Date(ex.endTime).toLocaleString("id-ID")}</div>
                     </div>
                     <Btn onClick={() => {
                       if (confirm(`Mulai ujian "${ex.title}"?\n\nDurasi: ${ex.duration} menit\nJumlah soal: ${ex.questionIds.length}\n\nSetelah dimulai, Anda tidak dapat keluar dari ujian.`)) {
@@ -3321,6 +3332,26 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
                   </div>
                 </Card>
               ))}
+            </div>
+          )}
+
+          {upcomingExams.length > 0 && (
+            <div className="mb-6">
+              <h3 className="font-bold text-lg mb-3 flex items-center gap-2" style={{ color: "#60a5fa" }}><Clock size={18} />Ujian Akan Datang</h3>
+              <div className="space-y-3">
+                {upcomingExams.map(ex => (
+                  <Card key={ex.id} style={{ border: "1px solid rgba(96,165,250,0.25)", background: "rgba(30,41,59,0.7)", opacity: 0.85 }}>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h4 className="font-bold" style={{ color: "inherit" }}>{ex.title}</h4>
+                        <div className="text-sm" style={{ color: "inherit", opacity: 0.7 }}>{(data.subjects || []).find(s => s.id === ex.subjectId)?.name} • {ex.questionIds.length} soal • {ex.duration} menit</div>
+                        <div className="text-blue-400 text-xs mt-1 flex items-center gap-1"><Clock size={11} />Dimulai: {new Date(ex.startTime).toLocaleString("id-ID")}</div>
+                      </div>
+                      <span className="px-3 py-1 rounded-full text-xs font-bold" style={{ background: "rgba(96,165,250,0.15)", color: "#60a5fa", border: "1px solid rgba(96,165,250,0.3)" }}>Belum Dimulai</span>
+                    </div>
+                  </Card>
+                ))}
+              </div>
             </div>
           )}
         </div>
@@ -3602,7 +3633,12 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
 
   const questions = useMemo(() => {
     let qs = exam.questionIds.map(id => data.questions.find(q => q.id === id)).filter(Boolean);
-    if (exam.shuffleQuestions && !existingSession) {
+    if (existingSession?.questionOrder?.length) {
+      // Restore saved order from previous session
+      const orderMap = {};
+      existingSession.questionOrder.forEach((id, i) => { orderMap[id] = i; });
+      qs = [...qs].sort((a, b) => (orderMap[a.id] ?? 9999) - (orderMap[b.id] ?? 9999));
+    } else if (exam.shuffleQuestions) {
       const shuffled = [...qs];
       for (let i = shuffled.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
@@ -3611,7 +3647,11 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
       qs = shuffled;
     }
     return qs;
-  }, [exam, existingSession]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // deps kosong — shuffle hanya sekali saat mount, tidak re-shuffle
+
+  // Stable ref to question order so doSaveSession can access without stale closure
+  const questionsRef = useRef(questions);
 
   const [currentQ, setCurrentQ] = useState(0);
   const [answers, setAnswers] = useState(existingSession?.answers || {});
@@ -3624,12 +3664,15 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
   const [result, setResult] = useState(null);
   const [showNav, setShowNav] = useState(false);
 
+  // Ref for handleSubmit to avoid stale closure in timer interval
+  const handleSubmitRef = useRef(null);
+
   // Timer
   useEffect(() => {
     if (submitted) return;
     const iv = setInterval(() => {
       setTimeLeft(t => {
-        if (t <= 1) { clearInterval(iv); handleSubmit(true); return 0; }
+        if (t <= 1) { clearInterval(iv); handleSubmitRef.current?.(true); return 0; }
         return t - 1;
       });
     }, 1000);
@@ -3731,6 +3774,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
       studentName: user.name, kelas: user.kelas,
       answers: { ...answersRef.current },
       currentQuestion: currentQRef.current,
+      questionOrder: questionsRef.current.map(q => q.id), // persist shuffle order
       status, violations: violationsRef.current,
       timeLeft: timeLeftRef.current,
       lastUpdate: now, startedAt: existingSession?.startedAt || now
@@ -3809,6 +3853,9 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
     }
     showToast(auto ? "Waktu habis! Jawaban dikumpulkan otomatis." : "Jawaban berhasil dikumpulkan!");
   }, [questions, exam, user, data, saveData, showToast]);
+
+  // Keep ref always up-to-date so timer can call latest version without stale closure
+  useEffect(() => { handleSubmitRef.current = handleSubmit; }, [handleSubmit]);
 
   const formatTime = s => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 

@@ -1205,10 +1205,9 @@ function MathTextarea({ value, onChange, placeholder, rows = 4, textareaRef }) {
 
 // ============= AI GENERATE MODAL =============
 function AIGenerateModal({ data, onImport, onClose, showToast, userId, subjectFilter }) {
-  const [apiKey, setApiKey] = useState(() => { try { return localStorage.getItem("gemini_api_key") || ""; } catch { return ""; } });
-  const [showKey, setShowKey] = useState(false);
   const [subjectId, setSubjectId] = useState(subjectFilter || (data.subjects || [])[0]?.id || "");
   const [topic, setTopic] = useState("");
+  const [customPrompt, setCustomPrompt] = useState("");
   const [count, setCount] = useState(5);
   const [qtype, setQtype] = useState("pilgan");
   const [difficulty, setDifficulty] = useState("sedang");
@@ -1216,11 +1215,20 @@ function AIGenerateModal({ data, onImport, onClose, showToast, userId, subjectFi
   const [loadingMsg, setLoadingMsg] = useState("");
   const [generated, setGenerated] = useState([]);
   const [selected, setSelected] = useState([]);
-  const [step, setStep] = useState(1); // 1=config, 2=preview
+  const [step, setStep] = useState(1);
 
   const availableSubjects = subjectFilter
     ? (data.subjects || []).filter(s => s.id === subjectFilter)
     : (data.subjects || []);
+
+  const PROMPT_EXAMPLES = [
+    "Fokus pada soal aplikasi dan analisis (bukan hafalan)",
+    "Gunakan konteks kehidupan sehari-hari / fenomena nyata",
+    "Buat soal HOTS (Higher Order Thinking Skills)",
+    "Sertakan angka dan perhitungan pada setiap soal",
+    "Soal berbasis wacana / teks bacaan pendek",
+    "Hindari soal yang terlalu mudah ditebak",
+  ];
 
   const loadingMessages = [
     "Menghubungi Gemini 2.5 Flash…",
@@ -1230,27 +1238,21 @@ function AIGenerateModal({ data, onImport, onClose, showToast, userId, subjectFi
   ];
 
   const handleGenerate = async () => {
-    if (!apiKey.trim()) return showToast("Masukkan Gemini API Key terlebih dahulu", "error");
+    const apiKey = (() => { try { return localStorage.getItem("gemini_api_key") || ""; } catch { return ""; } })();
+    if (!apiKey.trim()) return showToast("API Key Gemini belum diatur — buka Pengaturan → Integrasi AI", "error");
     if (!topic.trim()) return showToast("Masukkan topik soal", "error");
     setLoading(true);
-    setStep(1);
     let msgIdx = 0;
     setLoadingMsg(loadingMessages[0]);
-    const msgTimer = setInterval(() => {
-      msgIdx = (msgIdx + 1) % loadingMessages.length;
-      setLoadingMsg(loadingMessages[msgIdx]);
-    }, 1800);
+    const msgTimer = setInterval(() => { msgIdx = (msgIdx + 1) % loadingMessages.length; setLoadingMsg(loadingMessages[msgIdx]); }, 1800);
 
     const subjName = (data.subjects || []).find(s => s.id === subjectId)?.name || "Umum";
     const diffLabel = { mudah: "mudah (C1–C2)", sedang: "sedang (C3–C4)", sulit: "sulit (C5–C6)" }[difficulty];
-    const typeDesc = qtype === "pilgan"
-      ? "pilihan ganda dengan 5 pilihan (A, B, C, D, E)"
-      : qtype === "benar_salah"
-      ? "benar/salah dengan options [\"Benar\",\"Salah\"]"
-      : "uraian dengan options kosong []";
+    const typeDesc = qtype === "pilgan" ? "pilihan ganda dengan 5 pilihan (A, B, C, D, E)" : qtype === "benar_salah" ? "benar/salah dengan options [\"Benar\",\"Salah\"]" : "uraian dengan options kosong []";
+    const instruksiTambahan = customPrompt.trim() ? `\nInstruksi khusus dari guru: ${customPrompt.trim()}` : "";
 
     const prompt = `Kamu adalah pembuat soal profesional kurikulum SMA Indonesia.
-Buat ${count} soal ${typeDesc} tentang topik "${topic}" untuk mata pelajaran ${subjName}, tingkat kesulitan ${diffLabel}.
+Buat ${count} soal ${typeDesc} tentang topik "${topic}" untuk mata pelajaran ${subjName}, tingkat kesulitan ${diffLabel}.${instruksiTambahan}
 Kembalikan HANYA JSON array valid, tanpa markdown, tanpa penjelasan, langsung dimulai dari karakter "[".
 Format setiap soal:
 {"text":"teks soal lengkap","options":["pilihan A","pilihan B","pilihan C","pilihan D","pilihan E"],"correctAnswer":0,"explanation":"pembahasan singkat dan jelas","type":"${qtype}","difficulty":"${difficulty}"}
@@ -1263,54 +1265,33 @@ Aturan:
 - Pembahasan wajib ada dan informatif`;
 
     try {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey.trim()}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.7, maxOutputTokens: 8192 }
-          })
-        }
-      );
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error?.message || `HTTP ${res.status}`);
-      }
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey.trim()}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.7, maxOutputTokens: 8192 } })
+      });
+      if (!res.ok) { const err = await res.json(); throw new Error(err.error?.message || `HTTP ${res.status}`); }
       const json = await res.json();
       const text = json.candidates?.[0]?.content?.parts?.[0]?.text || "";
       const match = text.match(/\[[\s\S]*\]/);
       if (!match) throw new Error("Format respons tidak valid — coba generate ulang");
       const parsed = JSON.parse(match[0]);
-      const questions = parsed.map(q => ({
-        ...q,
-        subjectId,
-        createdBy: userId || "admin",
-        id: genId()
-      }));
+      const questions = parsed.map(q => ({ ...q, subjectId, createdBy: userId || "admin", id: genId() }));
       setGenerated(questions);
       setSelected(questions.map((_, i) => i));
-      try { localStorage.setItem("gemini_api_key", apiKey.trim()); } catch {}
       setStep(2);
-    } catch(e) {
-      showToast("Error: " + e.message, "error");
-    }
+    } catch(e) { showToast("Error: " + e.message, "error"); }
     clearInterval(msgTimer);
     setLoading(false);
   };
 
-  const toggleSelect = (i) => setSelected(prev =>
-    prev.includes(i) ? prev.filter(x => x !== i) : [...prev, i]
-  );
+  const toggleSelect = (i) => setSelected(prev => prev.includes(i) ? prev.filter(x => x !== i) : [...prev, i]);
   const selectedQuestions = generated.filter((_, i) => selected.includes(i));
-
   const diffColor = { mudah: "#22c55e", sedang: "#f59e0b", sulit: "#ef4444" };
-  const qtypeIcon = { pilgan: "🔘", benar_salah: "✅", uraian: "📝" };
 
   return (
     <Modal onClose={onClose} wide>
-      {/* Header gradient */}
+      {/* Header */}
       <div className="rounded-t-2xl -mx-6 -mt-6 mb-6 px-6 pt-6 pb-5" style={{ background: "linear-gradient(135deg, rgba(99,102,241,0.25) 0%, rgba(168,85,247,0.2) 50%, rgba(59,130,246,0.15) 100%)", borderBottom: "1px solid rgba(99,102,241,0.2)" }}>
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-xl flex items-center justify-center text-xl" style={{ background: "linear-gradient(135deg, #6366f1, #a855f7)", boxShadow: "0 4px 15px rgba(99,102,241,0.4)" }}>✨</div>
@@ -1318,13 +1299,8 @@ Aturan:
             <h2 className="font-bold text-lg text-white">AI Generate Soal</h2>
             <p className="text-xs" style={{ color: "rgba(196,181,253,0.8)" }}>Powered by Gemini 2.5 Flash · Google AI</p>
           </div>
-          {step === 2 && (
-            <div className="ml-auto flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold" style={{ background: "rgba(34,197,94,0.15)", color: "#4ade80", border: "1px solid rgba(34,197,94,0.25)" }}>
-              <CheckCircle size={12} /> {generated.length} soal siap
-            </div>
-          )}
+          {step === 2 && <div className="ml-auto flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold" style={{ background: "rgba(34,197,94,0.15)", color: "#4ade80", border: "1px solid rgba(34,197,94,0.25)" }}><CheckCircle size={12} /> {generated.length} soal siap</div>}
         </div>
-        {/* Step indicator */}
         <div className="flex items-center gap-2 mt-4">
           {[["1","Konfigurasi"],["2","Preview & Import"]].map(([n, label], idx) => (
             <div key={n} className="flex items-center gap-1.5">
@@ -1338,28 +1314,6 @@ Aturan:
 
       {step === 1 && (
         <div className="space-y-5">
-          {/* API Key */}
-          <div className="p-4 rounded-2xl" style={{ background: "rgba(99,102,241,0.07)", border: "1px solid rgba(99,102,241,0.15)" }}>
-            <div className="flex items-center justify-between mb-2">
-              <label className="text-sm font-semibold" style={{ color: "#a5b4fc" }}>🔑 Gemini API Key</label>
-              <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-xs px-2 py-0.5 rounded-full" style={{ background: "rgba(99,102,241,0.15)", color: "#818cf8" }}>Dapatkan gratis →</a>
-            </div>
-            <div className="relative">
-              <input
-                type={showKey ? "text" : "password"}
-                value={apiKey}
-                onChange={e => setApiKey(e.target.value)}
-                placeholder="AIzaSy..."
-                className="w-full py-2.5 px-3 pr-10 rounded-xl text-white text-sm outline-none"
-                style={{ background: "rgba(15,23,42,0.7)", border: "1px solid rgba(99,102,241,0.25)", letterSpacing: showKey ? "normal" : "0.1em" }}
-              />
-              <button onClick={() => setShowKey(v => !v)} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white transition">
-                {showKey ? <Eye size={15} /> : <Eye size={15} style={{ opacity: 0.5 }} />}
-              </button>
-            </div>
-            <p className="text-xs mt-1.5" style={{ color: "rgba(148,163,184,0.6)" }}>Tersimpan di browser — tidak dikirim ke server manapun</p>
-          </div>
-
           {/* Subject + Type */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
@@ -1383,14 +1337,30 @@ Aturan:
           {/* Topic */}
           <div>
             <label className="text-sm font-semibold mb-2 block" style={{ color: "#a5b4fc" }}>💡 Topik / Materi</label>
-            <input
-              value={topic}
-              onChange={e => setTopic(e.target.value)}
-              onKeyDown={e => { if (e.key === "Enter" && !loading) handleGenerate(); }}
-              placeholder="Cth: Persamaan Kuadrat, Fotosintesis, Revolusi Prancis…"
-              className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none"
-              style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(99,102,241,0.2)" }}
+            <input value={topic} onChange={e => setTopic(e.target.value)} onKeyDown={e => { if (e.key === "Enter" && !loading) handleGenerate(); }} placeholder="Cth: Persamaan Kuadrat, Fotosintesis, Revolusi Prancis…" className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(99,102,241,0.2)" }} />
+          </div>
+
+          {/* Custom Instructions */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <label className="text-sm font-semibold" style={{ color: "#a5b4fc" }}>📝 Instruksi Khusus <span className="font-normal text-xs" style={{ color: "#475569" }}>(opsional)</span></label>
+            </div>
+            <textarea
+              value={customPrompt}
+              onChange={e => setCustomPrompt(e.target.value)}
+              rows={3}
+              placeholder="Tulis instruksi spesifik yang Anda inginkan…&#10;Cth: Buat soal HOTS berbasis wacana, gunakan konteks kehidupan sehari-hari, sertakan perhitungan, dll."
+              className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none"
+              style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(99,102,241,0.2)", lineHeight: 1.6 }}
             />
+            {/* Shortcut chips */}
+            <div className="flex flex-wrap gap-1.5 mt-2">
+              {PROMPT_EXAMPLES.map((ex, i) => (
+                <button key={i} onClick={() => setCustomPrompt(prev => prev ? prev + ". " + ex : ex)} className="px-2.5 py-1 rounded-full text-xs transition-all hover:opacity-90" style={{ background: "rgba(99,102,241,0.1)", color: "#818cf8", border: "1px solid rgba(99,102,241,0.2)" }}>
+                  + {ex}
+                </button>
+              ))}
+            </div>
           </div>
 
           {/* Count + Difficulty */}
@@ -1413,14 +1383,13 @@ Aturan:
             </div>
           </div>
 
-          {/* Actions */}
+          {/* Loading / Actions */}
           {loading ? (
             <div className="flex flex-col items-center gap-3 py-6">
-              <div className="relative">
-                <div className="w-14 h-14 rounded-full" style={{ background: "linear-gradient(135deg,rgba(99,102,241,0.2),rgba(168,85,247,0.2))", border: "2px solid rgba(99,102,241,0.3)" }}>
-                  <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-indigo-400 animate-spin" />
-                  <div className="absolute inset-0 flex items-center justify-center text-xl">✨</div>
-                </div>
+              <div className="relative w-14 h-14">
+                <div className="absolute inset-0 rounded-full" style={{ background: "linear-gradient(135deg,rgba(99,102,241,0.2),rgba(168,85,247,0.2))", border: "2px solid rgba(99,102,241,0.3)" }} />
+                <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-indigo-400 animate-spin" />
+                <div className="absolute inset-0 flex items-center justify-center text-xl">✨</div>
               </div>
               <div className="text-center">
                 <p className="text-sm font-semibold" style={{ color: "#a5b4fc" }}>{loadingMsg}</p>
@@ -1430,7 +1399,7 @@ Aturan:
           ) : (
             <div className="flex gap-2 justify-end">
               <Btn variant="secondary" onClick={onClose}>Batal</Btn>
-              <button onClick={handleGenerate} disabled={loading} className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm transition-all" style={{ background: "linear-gradient(135deg, #6366f1, #a855f7)", color: "white", boxShadow: "0 4px 15px rgba(99,102,241,0.35)", opacity: loading ? 0.7 : 1 }}>
+              <button onClick={handleGenerate} className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm transition-all" style={{ background: "linear-gradient(135deg, #6366f1, #a855f7)", color: "white", boxShadow: "0 4px 15px rgba(99,102,241,0.35)" }}>
                 <Play size={15} /> Generate {count} Soal
               </button>
             </div>
@@ -1440,7 +1409,6 @@ Aturan:
 
       {step === 2 && (
         <div>
-          {/* Summary bar */}
           <div className="flex items-center justify-between mb-4 px-4 py-3 rounded-xl" style={{ background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.2)" }}>
             <div className="flex items-center gap-2">
               <CheckCircle size={16} className="text-green-400" />
@@ -1451,13 +1419,11 @@ Aturan:
               <button onClick={() => setSelected([])} className="text-xs px-2 py-1 rounded-lg" style={{ background: "rgba(51,65,85,0.5)", color: "#94a3b8" }}>Batal Semua</button>
             </div>
           </div>
-
-          {/* Question preview cards */}
           <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1 mb-5" style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(99,102,241,0.3) transparent" }}>
             {generated.map((q, i) => {
               const isSel = selected.includes(i);
               return (
-                <div key={i} onClick={() => toggleSelect(i)} className="p-3.5 rounded-xl cursor-pointer transition-all" style={{ background: isSel ? "rgba(99,102,241,0.1)" : "rgba(15,23,42,0.5)", border: `1px solid ${isSel ? "rgba(99,102,241,0.35)" : "rgba(51,65,85,0.4)"}`, transform: isSel ? "none" : "none" }}>
+                <div key={i} onClick={() => toggleSelect(i)} className="p-3.5 rounded-xl cursor-pointer transition-all" style={{ background: isSel ? "rgba(99,102,241,0.1)" : "rgba(15,23,42,0.5)", border: `1px solid ${isSel ? "rgba(99,102,241,0.35)" : "rgba(51,65,85,0.4)"}` }}>
                   <div className="flex items-start gap-2.5">
                     <div className="flex-shrink-0 w-5 h-5 rounded-md mt-0.5 flex items-center justify-center" style={{ background: isSel ? "rgba(99,102,241,0.8)" : "rgba(51,65,85,0.5)", border: `1px solid ${isSel ? "rgba(99,102,241,0.8)" : "rgba(71,85,105,0.5)"}` }}>
                       {isSel && <CheckCircle size={12} color="white" />}
@@ -1466,7 +1432,6 @@ Aturan:
                       <div className="flex items-center gap-2 mb-1">
                         <span className="text-xs font-bold" style={{ color: "#6366f1" }}>#{i+1}</span>
                         <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: `${diffColor[q.difficulty || difficulty]}18`, color: diffColor[q.difficulty || difficulty] }}>{q.difficulty || difficulty}</span>
-                        <span className="text-xs">{qtypeIcon[q.type || qtype]}</span>
                       </div>
                       <p className="text-sm font-medium leading-relaxed" style={{ color: "#e2e8f0" }}>{q.text.substring(0, 130)}{q.text.length > 130 ? "…" : ""}</p>
                       {q.options?.length > 0 && (
@@ -1478,22 +1443,20 @@ Aturan:
                           ))}
                         </div>
                       )}
-                      {q.explanation && <p className="text-xs mt-2 leading-relaxed" style={{ color: "#818cf8" }}>💡 {q.explanation.substring(0, 100)}</p>}
+                      {q.explanation && <p className="text-xs mt-2" style={{ color: "#818cf8" }}>💡 {q.explanation.substring(0, 100)}</p>}
                     </div>
                   </div>
                 </div>
               );
             })}
           </div>
-
-          {/* Actions */}
           <div className="flex items-center gap-2">
-            <button onClick={() => { setStep(1); setGenerated([]); setSelected([]); }} className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-semibold transition" style={{ background: "rgba(51,65,85,0.5)", color: "#94a3b8" }}>
+            <button onClick={() => { setStep(1); setGenerated([]); setSelected([]); }} className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-semibold" style={{ background: "rgba(51,65,85,0.5)", color: "#94a3b8" }}>
               <RefreshCw size={14} /> Generate Ulang
             </button>
             <div className="ml-auto flex items-center gap-2">
               <span className="text-xs" style={{ color: "#64748b" }}>{selected.length} dari {generated.length} dipilih</span>
-              <button onClick={() => { if (selected.length === 0) return showToast("Pilih minimal 1 soal", "error"); onImport(selectedQuestions); onClose(); showToast(`${selectedQuestions.length} soal berhasil diimport!`); }} className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm transition-all" style={{ background: selected.length > 0 ? "linear-gradient(135deg, #059669, #10b981)" : "rgba(51,65,85,0.5)", color: selected.length > 0 ? "white" : "#475569", boxShadow: selected.length > 0 ? "0 4px 15px rgba(16,185,129,0.3)" : "none", cursor: selected.length > 0 ? "pointer" : "not-allowed" }}>
+              <button onClick={() => { if (selected.length === 0) return showToast("Pilih minimal 1 soal", "error"); onImport(selectedQuestions); onClose(); showToast(`${selectedQuestions.length} soal berhasil diimport!`); }} className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm" style={{ background: selected.length > 0 ? "linear-gradient(135deg, #059669, #10b981)" : "rgba(51,65,85,0.5)", color: selected.length > 0 ? "white" : "#475569", boxShadow: selected.length > 0 ? "0 4px 15px rgba(16,185,129,0.3)" : "none", cursor: selected.length > 0 ? "pointer" : "not-allowed" }}>
                 <Download size={15} /> Import {selected.length} Soal
               </button>
             </div>
@@ -2833,13 +2796,10 @@ function SettingsView({ data, dataRef, saveData, showToast }) {
           <div className="w-9 h-9 rounded-xl flex items-center justify-center text-lg" style={{ background: "linear-gradient(135deg,#6366f1,#a855f7)", boxShadow: "0 3px 12px rgba(99,102,241,0.35)" }}>✨</div>
           <div>
             <h3 className="font-bold" style={{ color: "inherit" }}>Integrasi AI — Gemini 2.5 Flash</h3>
-            <p className="text-xs" style={{ color: "rgba(165,180,252,0.7)" }}>Google AI · Model terbaru & tercepat</p>
+            <p className="text-xs" style={{ color: "rgba(165,180,252,0.7)" }}>Google AI · Model terbaru &amp; tercepat</p>
           </div>
         </div>
-        <p className="text-sm mb-4" style={{ color: "inherit", opacity: 0.7 }}>
-          API Key Google AI Studio untuk fitur <strong>Generate Soal otomatis</strong>. Gratis hingga batas tertentu — tidak perlu kartu kredit.
-          <a href="https://aistudio.google.com/app/apikey" target="_blank" className="ml-1 text-indigo-400 underline hover:text-indigo-300">Dapatkan di aistudio.google.com →</a>
-        </p>
+        <p className="text-sm mb-4" style={{ color: "inherit", opacity: 0.7 }}>API Key Google AI Studio untuk fitur <strong>Generate Soal otomatis</strong>. Gratis hingga batas tertentu — tidak perlu kartu kredit. <a href="https://aistudio.google.com/app/apikey" target="_blank" className="text-indigo-400 underline hover:text-indigo-300">Dapatkan di aistudio.google.com →</a></p>
         <div className="space-y-3 max-w-md">
           <div>
             <label className="text-sm font-semibold mb-1.5 block" style={{ color: "#a5b4fc" }}>Gemini API Key</label>

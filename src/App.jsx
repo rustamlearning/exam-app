@@ -2628,7 +2628,9 @@ function ResultsView({ data }) {
   const handlePrint = (exam, results) => {
     const subjectName = (data.subjects || []).find(s => s.id === exam?.subjectId)?.name || "";
     const totalQ = exam?.questionIds?.length || 0;
-    const avg = results.length > 0 ? (results.reduce((a, r) => a + r.score, 0) / results.length).toFixed(1) : 0;
+    const scoredResults = results.filter(r => r.score !== null && r.score !== undefined);
+    const avg = scoredResults.length > 0 ? (scoredResults.reduce((a, r) => a + (r.score || 0), 0) / scoredResults.length).toFixed(1) : "-";
+    const sorted = [...results].sort((a, b) => (b.score || 0) - (a.score || 0));
 
     const printContent = `
       <!DOCTYPE html><html><head>
@@ -2646,7 +2648,8 @@ function ResultsView({ data }) {
         table.results td { padding: 5px 8px; border-bottom: 1px solid #ddd; }
         table.results tr:nth-child(even) { background: #f5f5f5; }
         .pass { color: green; font-weight: bold; }
-        .fail { color: red; font-weight: bold; }
+        .fail { color: red; }
+        .pending { color: purple; }
         .summary { margin-top: 16px; font-size: 12px; border-top: 2px solid #333; padding-top: 8px; }
         @media print { body { margin: 10px; } }
       </style></head><body>
@@ -2662,25 +2665,30 @@ function ResultsView({ data }) {
       <table class="results">
         <thead><tr><th>No</th><th>Nama Siswa</th><th>Kelas</th><th>Benar</th><th>Nilai</th><th>Ket.</th></tr></thead>
         <tbody>
-          ${results.sort((a, b) => b.score - a.score).map((r, i) => {
+          ${sorted.map((r, i) => {
             const student = data.students.find(s => s.id === r.studentId);
-            return `<tr>
-              <td>${i+1}</td>
-              <td>${student?.name || "?"}</td>
-              <td>${student?.kelas || "-"}</td>
-              <td>${r.correct}/${totalQ}</td>
-              <td><strong>${r.score.toFixed(1)}</strong></td>
-              <td>${r.score === null ? 'Perlu Dinilai' : r.score.toFixed(1)}</td>
-            </tr>`;
+            const scoreNull = r.score === null || r.score === undefined;
+            const scoreVal = scoreNull ? "-" : Number(r.score).toFixed(1);
+            const ket = scoreNull ? "Perlu Dinilai" : Number(r.score) >= 75 ? "Lulus" : "Tidak Lulus";
+            const cls = scoreNull ? "pending" : Number(r.score) >= 75 ? "pass" : "fail";
+            return \`<tr>
+              <td>\${i+1}</td>
+              <td>\${student?.name || "?"}</td>
+              <td>\${student?.kelas || "-"}</td>
+              <td>\${r.correct || 0}/\${totalQ}</td>
+              <td><strong>\${scoreVal}</strong></td>
+              <td class="\${cls}">\${ket}</td>
+            </tr>\`;
           }).join("")}
         </tbody>
       </table>
       <div class="summary">
         <strong>Rata-rata: ${avg}</strong> &nbsp;|&nbsp;
-        Tertinggi: ${results.length > 0 ? Math.max(...results.map(r => r.score)).toFixed(1) : "-"} &nbsp;|&nbsp;
-        Terendah: ${results.length > 0 ? Math.min(...results.map(r => r.score)).toFixed(1) : "-"} &nbsp;|&nbsp;
-        ≥75: ${results.filter(r => r.score !== null && r.score >= 75).length} siswa &nbsp;|&nbsp;
-        &lt;75: ${results.filter(r => r.score !== null && r.score < 75).length} siswa
+        Tertinggi: ${scoredResults.length > 0 ? Math.max(...scoredResults.map(r => r.score)).toFixed(1) : "-"} &nbsp;|&nbsp;
+        Terendah: ${scoredResults.length > 0 ? Math.min(...scoredResults.map(r => r.score)).toFixed(1) : "-"} &nbsp;|&nbsp;
+        ≥75: ${results.filter(r => r.score !== null && r.score !== undefined && r.score >= 75).length} siswa &nbsp;|&nbsp;
+        &lt;75: ${results.filter(r => r.score !== null && r.score !== undefined && r.score < 75).length} siswa &nbsp;|&nbsp;
+        Perlu dinilai: ${results.filter(r => r.score === null || r.score === undefined).length} siswa
       </div>
       </body></html>`;
 
@@ -2792,9 +2800,11 @@ function ResultsView({ data }) {
   }
 
   const handleDownloadAllPDF = () => {
+    // Use getExamResults to merge Firebase + local for ALL exams
     const allRows = examsWithData.map(ex => {
-      const results = (data.results || []).filter(r => r.examId === ex.id);
-      const avg = results.length > 0 ? (results.reduce((a, r) => a + (r.score || 0), 0) / results.length).toFixed(1) : "-";
+      const results = getExamResults(ex.id);
+      const scoredResults = results.filter(r => r.score !== null && r.score !== undefined);
+      const avg = scoredResults.length > 0 ? (scoredResults.reduce((a, r) => a + (r.score || 0), 0) / scoredResults.length).toFixed(1) : "-";
       return { ex, results, avg };
     });
     const printContent = `<!DOCTYPE html><html><head><title>Rekap Semua Hasil Ujian</title>
@@ -2805,7 +2815,7 @@ function ResultsView({ data }) {
       th { background: #1e3a5f; color: white; padding: 5px 6px; text-align: left; }
       td { padding: 4px 6px; border-bottom: 1px solid #ddd; }
       tr:nth-child(even) { background: #f5f5f5; }
-      .pass { color: green; font-weight: bold; } .fail { color: red; font-weight: bold; }
+      .pass { color: green; font-weight: bold; } .fail { color: red; } .pending { color: purple; }
       @media print { body { margin: 8px; } }
     </style></head><body>
     <h1>${SCHOOL_NAME}</h1>
@@ -2813,16 +2823,18 @@ function ResultsView({ data }) {
     ${allRows.map(({ ex, results, avg }) => {
       const subj = (data.subjects || []).find(s => s.id === ex.subjectId)?.name || "";
       const totalQ = ex.questionIds?.length || 0;
-      return `<h2>${ex.title} <span style="font-weight:normal;font-size:11px;color:#666">(${subj} • ${results.length} peserta • Rata-rata: ${avg})</span></h2>
+      const sorted = [...results].sort((a, b) => (b.score || 0) - (a.score || 0));
+      return \`<h2>\${ex.title} <span style="font-weight:normal;font-size:11px;color:#666">(\${subj} • \${results.length} peserta • Rata-rata: \${avg})</span></h2>
       <table><thead><tr><th>No</th><th>Nama Siswa</th><th>Kelas</th><th>Benar</th><th>Nilai</th><th>Ket.</th></tr></thead><tbody>
-      ${results.sort((a, b) => (b.score || 0) - (a.score || 0)).map((r, i) => {
+      \${sorted.map((r, i) => {
         const st = data.students.find(s => s.id === r.studentId);
-        const scoreDisplay = r.score === null ? "Belum dinilai" : r.score.toFixed(1);
-        const ket = r.score === null ? "Perlu Dinilai" : `${r.score.toFixed(1)}`;
-        const cls = "";
-        return `<tr><td>${i+1}</td><td>${st?.name||"?"}</td><td>${st?.kelas||"-"}</td><td>${r.correct||0}/${totalQ}</td><td><strong>${scoreDisplay}</strong></td><td class="${cls}">${ket}</td></tr>`;
+        const scoreNull = r.score === null || r.score === undefined;
+        const scoreDisplay = scoreNull ? "-" : Number(r.score).toFixed(1);
+        const ket = scoreNull ? "Perlu Dinilai" : Number(r.score) >= 75 ? "Lulus" : "Tidak Lulus";
+        const cls = scoreNull ? "pending" : Number(r.score) >= 75 ? "pass" : "fail";
+        return \`<tr><td>\${i+1}</td><td>\${st?.name||"?"}</td><td>\${st?.kelas||"-"}</td><td>\${r.correct||0}/\${totalQ}</td><td><strong>\${scoreDisplay}</strong></td><td class="\${cls}">\${ket}</td></tr>\`;
       }).join("")}
-      </tbody></table>`;
+      </tbody></table>\`;
     }).join("")}
     </body></html>`;
     const w = window.open("", "_blank");

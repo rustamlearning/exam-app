@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo, createContext, useContext } from "react";
 import { BookOpen, Users, GraduationCap, Settings, LogOut, Plus, Trash2, Edit, Eye, Clock, AlertTriangle, CheckCircle, XCircle, Monitor, Upload, ChevronRight, Menu, X, Search, FileText, BarChart3, Shield, Lock, Save, RefreshCw, ChevronDown, ArrowLeft, Home, User, Hash, Layers, Play, Square, Award, Bell, AlertCircle, Printer, Camera, Key, Download } from "lucide-react";
 import { initializeApp } from "firebase/app";
-import { getFirestore, doc, getDoc, setDoc, onSnapshot } from "firebase/firestore";
+import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, query, where, getDocs } from "firebase/firestore";
 
 // ============= CONSTANTS =============
 const SCHOOL_NAME = "SMA Negeri 6 Pangkajene dan Kepulauan";
@@ -186,12 +186,22 @@ const store = {
   sessionKey(examId, studentId) { return examId + "_" + studentId; },
   async saveSession(examId, studentId, sessionData) {
     const key = this.sessionKey(examId, studentId);
-    try { await setDoc(doc(db, "sessions2", key), { ...sessionData, _key: key, ts: Date.now() }); }
+    try {
+      // Save individual student doc (no race condition)
+      await setDoc(doc(db, "sessions2", key), { ...sessionData, _key: key, ts: Date.now() });
+      // Also update index doc so MonitorView can listen to all sessions for this exam
+      const indexRef = doc(db, "examapp2", "sessions_" + examId);
+      const indexSnap = await getDoc(indexRef);
+      const existing = indexSnap.exists() ? (indexSnap.data().sessions || []) : [];
+      const idx = existing.findIndex(s => s.studentId === studentId);
+      const updated = [...existing];
+      if (idx >= 0) updated[idx] = sessionData;
+      else updated.push(sessionData);
+      await setDoc(indexRef, { sessions: updated, ts: Date.now() });
+    }
     catch(e) { console.error("saveSession", e); throw e; }
   },
   listenSessions(examId, cb) {
-    // Listen to all sessions for an exam using a collection query pattern
-    // We listen to the examapp2/sessions_meta doc which stores session keys
     return onSnapshot(doc(db, "examapp2", "sessions_" + examId),
       snap => { if (snap.exists()) cb(snap.data().sessions || []); },
       err => console.error("listenSessions", err)
@@ -233,11 +243,22 @@ const store = {
   },
   async saveResult(examId, studentId, resultData) {
     const key = examId + "_" + studentId;
-    try { await setDoc(doc(db, "results2", key), { ...resultData, _key: key, ts: Date.now() }); }
+    try {
+      // Save individual student result doc
+      await setDoc(doc(db, "results2", key), { ...resultData, _key: key, ts: Date.now() });
+      // Also update index doc so ResultsView and MonitorView can listen
+      const indexRef = doc(db, "examapp2", "results_" + examId);
+      const indexSnap = await getDoc(indexRef);
+      const existing = indexSnap.exists() ? (indexSnap.data().results || []) : [];
+      const idx = existing.findIndex(r => r.studentId === studentId);
+      const updated = [...existing];
+      if (idx >= 0) updated[idx] = resultData;
+      else updated.push(resultData);
+      await setDoc(indexRef, { results: updated, ts: Date.now() });
+    }
     catch(e) { console.error("saveResult", e); throw e; }
   },
   async getResults(examId) {
-    // Get results index for this exam
     try {
       const snap = await getDoc(doc(db, "examapp2", "results_" + examId));
       return snap.exists() ? (snap.data().results || []) : [];
@@ -2501,7 +2522,11 @@ function MonitorView({ data }) {
               const { status, session, result } = getStudentStatus(st);
               const answered = result ? Object.keys(result.answers || {}).length : Object.keys(session?.answers || {}).length;
               let statusText = "Belum mulai", statusColor = "#64748b", bgColor = "rgba(15,23,42,0.3)";
-              if (status === "active") { statusText = "Mengerjakan (" + answered + "/" + totalQ + ")"; statusColor = "#3b82f6"; bgColor = "rgba(59,130,246,0.07)"; }
+              if (status === "active") {
+                const curQ = session?.currentQuestion !== undefined ? session.currentQuestion + 1 : null;
+                statusText = "Mengerjakan — Soal " + (curQ || "?") + "/" + totalQ + " (" + answered + " dijawab)";
+                statusColor = "#3b82f6"; bgColor = "rgba(59,130,246,0.07)";
+              }
               else if (status === "submitted") {
                 const score = result?.score;
                 statusText = (score !== null && score !== undefined) ? "Selesai — Nilai: " + score.toFixed(1) : "Selesai";
@@ -3598,10 +3623,12 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
   const violationsRef = useRef(violations);
   const timeLeftRef = useRef(timeLeft);
   const submittedRef = useRef(submitted);
+  const currentQRef = useRef(0);
   useEffect(() => { answersRef.current = answers; }, [answers]);
   useEffect(() => { violationsRef.current = violations; }, [violations]);
   useEffect(() => { timeLeftRef.current = timeLeft; }, [timeLeft]);
   useEffect(() => { submittedRef.current = submitted; }, [submitted]);
+  useEffect(() => { currentQRef.current = currentQ; }, [currentQ]);
 
   // Per-student session save — no race condition with concurrent students
   const sessionIdRef = useRef(existingSession?.id || genId());
@@ -3617,6 +3644,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
       examId: exam.id, studentId: user.id,
       studentName: user.name, kelas: user.kelas,
       answers: { ...answersRef.current },
+      currentQuestion: currentQRef.current,
       status, violations: violationsRef.current,
       timeLeft: timeLeftRef.current,
       lastUpdate: now, startedAt: existingSession?.startedAt || now

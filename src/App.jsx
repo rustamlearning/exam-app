@@ -1370,8 +1370,11 @@ function AIGenerateModal({ data, onImport, onClose, showToast, userId, subjectFi
   ];
 
   const handleGenerate = async () => {
-    const apiKey = (() => { try { return localStorage.getItem("gemini_api_key") || ""; } catch { return ""; } })();
-    if (!apiKey.trim()) return showToast("API Key Gemini belum diatur — buka Pengaturan → Integrasi AI", "error");
+    // Read API key: Firestore meta (primary, works all devices) → localStorage (fallback)
+    const fromMeta = data?.meta?.geminiKey || "";
+    const fromStorage = (() => { try { return localStorage.getItem("gemini_api_key") || ""; } catch { return ""; } })();
+    const apiKey = (fromMeta || fromStorage).trim();
+    if (!apiKey) return showToast("API Key Gemini belum diatur — buka Pengaturan → Integrasi AI", "error");
     if (!topic.trim()) return showToast("Masukkan topik soal", "error");
     setLoading(true);
     let msgIdx = 0;
@@ -2895,6 +2898,93 @@ function ResultsView({ data }) {
 }
 
 // ============= SETTINGS (ADMIN) =============
+// ============= GEMINI API KEY SETTING =============
+function GeminiApiKeySetting({ data, dataRef, saveData, showToast }) {
+  // Read from Firestore meta first, then localStorage as fallback
+  const getStoredKey = () => {
+    const fromMeta = dataRef?.current?.meta?.geminiKey || data?.meta?.geminiKey || "";
+    if (fromMeta) return fromMeta;
+    try { return localStorage.getItem("gemini_api_key") || ""; } catch { return ""; }
+  };
+  const [keyVal, setKeyVal] = useState(getStoredKey);
+  const [show, setShow] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  // Sync from data when it loads (in case Firestore loads after component mount)
+  useEffect(() => {
+    const fromMeta = data?.meta?.geminiKey || "";
+    if (fromMeta && fromMeta !== keyVal) setKeyVal(fromMeta);
+  }, [data?.meta?.geminiKey]);
+
+  const handleSave = async () => {
+    const trimmed = keyVal.trim();
+    if (!trimmed) return showToast("Masukkan API Key terlebih dahulu", "error");
+    setSaving(true);
+    try {
+      // Save to Firestore meta (primary — works across devices & browsers)
+      const latest = dataRef?.current || data;
+      const newMeta = { ...(latest.meta || {}), geminiKey: trimmed };
+      await saveData({ ...latest, meta: newMeta }, ["meta"]);
+      // Also save to localStorage as cache
+      try { localStorage.setItem("gemini_api_key", trimmed); } catch {}
+      showToast("API Key berhasil disimpan ✓");
+    } catch (e) {
+      // If Firestore fails, at least save to localStorage
+      try { localStorage.setItem("gemini_api_key", trimmed); } catch {}
+      showToast("Tersimpan di browser (Firestore gagal: " + e.message + ")", "error");
+    }
+    setSaving(false);
+  };
+
+  const handleClear = () => {
+    setKeyVal("");
+    try { localStorage.removeItem("gemini_api_key"); } catch {}
+    const latest = dataRef?.current || data;
+    const newMeta = { ...(latest.meta || {}), geminiKey: "" };
+    saveData({ ...latest, meta: newMeta }, ["meta"]).catch(() => {});
+    showToast("API Key dihapus");
+  };
+
+  const isSet = !!(data?.meta?.geminiKey || (() => { try { return localStorage.getItem("gemini_api_key"); } catch { return ""; } })());
+
+  return (
+    <div className="space-y-2">
+      <div className="relative flex gap-2">
+        <input
+          type={show ? "text" : "password"}
+          value={keyVal}
+          onChange={e => setKeyVal(e.target.value)}
+          onKeyDown={e => e.key === "Enter" && handleSave()}
+          placeholder="AIzaSy..."
+          className="flex-1 py-2.5 px-3 rounded-xl text-white text-sm outline-none"
+          style={{ background: "rgba(15,23,42,0.8)", border: `1px solid ${isSet ? "rgba(99,102,241,0.5)" : "rgba(99,102,241,0.25)"}` }}
+        />
+        <button onClick={() => setShow(v => !v)} className="px-3 rounded-xl text-sm" style={{ background: "rgba(51,65,85,0.5)", color: "#94a3b8" }}>
+          {show ? "🙈" : "👁"}
+        </button>
+      </div>
+      {isSet && (
+        <p className="text-xs flex items-center gap-1" style={{ color: "#6ee7b7" }}>
+          ✓ API Key tersimpan{data?.meta?.geminiKey ? " di Firestore (semua perangkat)" : " di browser ini saja"}
+        </p>
+      )}
+      <p className="text-xs" style={{ color: "inherit", opacity: 0.4 }}>Disimpan ke Firestore — berlaku di semua perangkat & browser</p>
+      <div className="flex gap-2">
+        <button onClick={handleSave} disabled={saving}
+          className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition"
+          style={{ background: "linear-gradient(135deg, rgba(99,102,241,0.4), rgba(168,85,247,0.3))", color: "#c4b5fd", border: "1px solid rgba(99,102,241,0.4)", opacity: saving ? 0.6 : 1 }}>
+          <Save size={14} />{saving ? "Menyimpan..." : "Simpan API Key"}
+        </button>
+        {isSet && (
+          <button onClick={handleClear} className="px-3 py-2 rounded-xl text-xs" style={{ background: "rgba(220,38,38,0.15)", color: "#f87171", border: "1px solid rgba(220,38,38,0.2)" }}>
+            Hapus
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function SettingsView({ data, dataRef, saveData, showToast }) {
   const [pw, setPw] = useState({ old: "", new1: "", new2: "" });
   const [recovering, setRecovering] = useState(false);
@@ -3041,12 +3131,8 @@ function SettingsView({ data, dataRef, saveData, showToast }) {
         <div className="space-y-3 max-w-md">
           <div>
             <label className="text-sm font-semibold mb-1.5 block" style={{ color: "#a5b4fc" }}>Gemini API Key</label>
-            <input type="password" defaultValue={(() => { try { return localStorage.getItem("gemini_api_key") || ""; } catch { return ""; } })()} onChange={e => { try { localStorage.setItem("gemini_api_key", e.target.value); } catch {} }} placeholder="AIzaSy..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(99,102,241,0.25)" }} />
-            <p className="text-xs mt-1.5" style={{ color: "inherit", opacity: 0.5 }}>Tersimpan di browser (localStorage) — tidak dikirim ke server manapun</p>
+            <GeminiApiKeySetting data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} />
           </div>
-          <button onClick={() => showToast("API Key Gemini tersimpan di browser")} className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition" style={{ background: "linear-gradient(135deg, rgba(99,102,241,0.3), rgba(168,85,247,0.2))", color: "#c4b5fd", border: "1px solid rgba(99,102,241,0.3)" }}>
-            <Save size={14} /> Simpan API Key
-          </button>
         </div>
       </Card>
       <Card>

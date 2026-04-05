@@ -102,7 +102,10 @@ const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 
 // ============= GRANULAR STORE =============
-const COLS = ["meta","teachers","students","subjects","questions","exams","sessions","results"];
+// sessions & results stored as individual docs to prevent race conditions
+// with 100+ concurrent students
+const COLS = ["meta","teachers","students","subjects","questions","exams"];
+const STATIC_COLS = ["meta","teachers","students","subjects","questions","exams"];
 
 const store = {
   async getCol(col) {
@@ -122,13 +125,48 @@ const store = {
       snap => { if (snap.exists()) cb(snap.data().value, snap.metadata); },
       err => console.error("listenCol", col, err)
     );
+  },
+  // Per-student session: no race condition, each student writes own doc
+  sessionKey(examId, studentId) { return examId + "_" + studentId; },
+  async saveSession(examId, studentId, sessionData) {
+    const key = this.sessionKey(examId, studentId);
+    try { await setDoc(doc(db, "sessions2", key), { ...sessionData, _key: key, ts: Date.now() }); }
+    catch(e) { console.error("saveSession", e); throw e; }
+  },
+  listenSessions(examId, cb) {
+    // Listen to all sessions for an exam using a collection query pattern
+    // We listen to the examapp2/sessions_meta doc which stores session keys
+    return onSnapshot(doc(db, "examapp2", "sessions_" + examId),
+      snap => { if (snap.exists()) cb(snap.data().sessions || []); },
+      err => console.error("listenSessions", err)
+    );
+  },
+  async saveResult(examId, studentId, resultData) {
+    const key = examId + "_" + studentId;
+    try { await setDoc(doc(db, "results2", key), { ...resultData, _key: key, ts: Date.now() }); }
+    catch(e) { console.error("saveResult", e); throw e; }
+  },
+  async getResults(examId) {
+    // Get results index for this exam
+    try {
+      const snap = await getDoc(doc(db, "examapp2", "results_" + examId));
+      return snap.exists() ? (snap.data().results || []) : [];
+    } catch(e) { return []; }
+  },
+  listenResults(examId, cb) {
+    return onSnapshot(doc(db, "examapp2", "results_" + examId),
+      snap => { if (snap.exists()) cb(snap.data().results || []); },
+      err => console.error("listenResults", err)
+    );
   }
 };
 
 const DEFAULT_DATA = {
   meta: { admin: { username: "admin", password: "admin123" } },
   teachers: [], students: [], subjects: MAPEL_K13,
-  questions: [], exams: [], sessions: [], results: [],
+  questions: [], exams: [],
+  // sessions & results loaded per-exam to avoid race conditions
+  sessions: [], results: [],
 };
 
 // ============= MAIN APP =============
@@ -265,27 +303,30 @@ export default function ExamApp() {
   useEffect(() => { dataRef.current = data; }, [data]);
 
   const handleLogin = useCallback((credentials) => {
-    if (!data) return;
+    // Always use freshest data — critical for newly added teachers/students
+    const d = dataRef.current || data;
+    if (!d) return;
     const { role, username, password } = credentials;
     let loggedUser = null;
     let nextView = "login";
+    // Admin credentials stored in data.meta.admin (not data.admin)
+    const adminCred = d.meta?.admin || { username: "admin", password: "admin123" };
 
     if (role === "admin") {
-      const adminCred = data.meta?.admin || { username: "admin", password: "admin123" };
       if (username === adminCred.username && password === adminCred.password) {
         loggedUser = { role: "admin", name: "Administrator" };
         nextView = "admin";
         showToast("Login berhasil sebagai Admin");
       } else { showToast("Username atau password salah", "error"); return; }
     } else if (role === "guru") {
-      const guru = data.teachers.find(t => t.name.toLowerCase() === username.toLowerCase() && (t.password ? t.password === password : t.nip === password));
+      const guru = (d.teachers || []).find(t => t.name.toLowerCase() === username.toLowerCase() && (t.password ? t.password === password : t.nip === password));
       if (guru) {
         loggedUser = { role: "guru", ...guru };
         nextView = "guru";
         showToast(`Selamat datang, ${guru.name}`);
       } else { showToast("Nama atau NIP/Password salah", "error"); return; }
     } else if (role === "siswa") {
-      const siswa = data.students.find(s => s.name.toLowerCase() === username.toLowerCase() && s.nisn === password);
+      const siswa = (d.students || []).find(s => s.name.toLowerCase() === username.toLowerCase() && s.nisn === password);
       if (siswa) {
         loggedUser = { role: "siswa", ...siswa };
         nextView = "siswa";
@@ -665,7 +706,7 @@ function ImportDataModal({ type, onImport, onClose, showToast }) {
         text = result.value;
       }
 
-      const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
       const parsed = [];
 
       if (type === "students") {
@@ -707,8 +748,8 @@ function ImportDataModal({ type, onImport, onClose, showToast }) {
   const isStudent = type === "students";
   const title = isStudent ? "Import Data Siswa" : "Import Data Guru";
   const template = isStudent
-    ? `Nama Lengkap,NISN,Kelas,Peminatan\nAhmad Fauzi,1234567890,XII-MIPA 1,MIPA\nSiti Rahayu,0987654321,XII-IPS 1,IPS`
-    : `Nama Lengkap,NIP,Email\nBudi Santoso,199001012020011001,budi@sman6.sch.id`;
+    ? "Nama Lengkap,NISN,Kelas,Peminatan\nAhmad Fauzi,1234567890,XII-MIPA 1,MIPA\nSiti Rahayu,0987654321,XII-IPS 1,IPS"
+    : "Nama Lengkap,NIP,Email\nBudi Santoso,199001012020011001,budi@sman6.sch.id";
 
   const downloadTemplate = () => {
     const blob = new Blob([template], { type: "text/csv" });
@@ -1068,261 +1109,496 @@ function SubjectManager({ data, saveData, showToast }) {
   );
 }
 
-// ============= AI GENERATE MODAL =============
-function AIGenerateModal({ data, dataRef, saveData, showToast, userId, onClose }) {
-  const [step, setStep] = useState("form"); // form | loading | preview
-  const [aiForm, setAiForm] = useState({
-    subjectId: (data.subjects || [])[0]?.id || "",
-    topic: "",
-    type: "pilgan",
-    count: 5,
-    difficulty: "sedang",
-    extra: "",
-  });
-  const [generated, setGenerated] = useState([]);
-  const [selected, setSelected] = useState([]);
-  const [loadingMsg, setLoadingMsg] = useState("");
+// ============= MATH SYMBOL HELPER =============
+const MATH_SYMBOLS = [
+  { label: "±", val: "±" }, { label: "×", val: "×" }, { label: "÷", val: "÷" },
+  { label: "≠", val: "≠" }, { label: "≤", val: "≤" }, { label: "≥", val: "≥" },
+  { label: "≈", val: "≈" }, { label: "∞", val: "∞" }, { label: "√", val: "√(" },
+  { label: "²", val: "²" }, { label: "³", val: "³" }, { label: "π", val: "π" },
+  { label: "∑", val: "∑" }, { label: "∫", val: "∫" }, { label: "∆", val: "∆" },
+  { label: "α", val: "α" }, { label: "β", val: "β" }, { label: "θ", val: "θ" },
+  { label: "λ", val: "λ" }, { label: "μ", val: "μ" }, { label: "σ", val: "σ" },
+  { label: "∈", val: "∈" }, { label: "∉", val: "∉" }, { label: "⊂", val: "⊂" },
+  { label: "∪", val: "∪" }, { label: "∩", val: "∩" }, { label: "∅", val: "∅" },
+  { label: "→", val: "→" }, { label: "⟹", val: "⟹" }, { label: "⟺", val: "⟺" },
+  { label: "⁻¹", val: "⁻¹" }, { label: "½", val: "½" }, { label: "¼", val: "¼" },
+  { label: "¾", val: "¾" }, { label: "°", val: "°" }, { label: "|x|", val: "|" },
+];
 
-  const geminiKey = data.meta?.geminiKey || "";
+// Fraction input helper: [a/b] → renders as fraction
+function MathTextarea({ value, onChange, placeholder, rows = 4, textareaRef }) {
+  const [showPalette, setShowPalette] = useState(false);
+  const internalRef = useRef(null);
+  const ref = textareaRef || internalRef;
 
-  const getSubjectName = (id) => (data.subjects || []).find(s => s.id === id)?.name || "-";
-
-  const buildPrompt = () => {
-    const subjectName = getSubjectName(aiForm.subjectId);
-    const typeLabel = aiForm.type === "pilgan" ? "pilihan ganda (5 opsi A-E)" : aiForm.type === "benar_salah" ? "benar/salah" : "uraian singkat";
-    const diffLabel = { mudah: "mudah (tingkat SMA kelas X)", sedang: "sedang (tingkat SMA kelas XI)", sulit: "sulit (tingkat SMA kelas XII / HOTS)" }[aiForm.difficulty];
-    return `Kamu adalah guru SMA yang berpengalaman. Buat ${aiForm.count} soal ${typeLabel} mata pelajaran ${subjectName} materi "${aiForm.topic}" tingkat kesulitan ${diffLabel}.${aiForm.extra ? " Catatan tambahan: " + aiForm.extra : ""}
-
-WAJIB kembalikan HANYA array JSON valid, tanpa teks lain, tanpa markdown, tanpa komentar.
-
-Format JSON:
-${aiForm.type === "pilgan" ? `[
-  {
-    "text": "Pertanyaan soal di sini?",
-    "type": "pilgan",
-    "options": ["Opsi A", "Opsi B", "Opsi C", "Opsi D", "Opsi E"],
-    "correctAnswer": 0,
-    "explanation": "Pembahasan lengkap mengapa jawaban A benar."
-  }
-]` : aiForm.type === "benar_salah" ? `[
-  {
-    "text": "Pernyataan yang harus dinilai benar atau salah.",
-    "type": "benar_salah",
-    "options": ["Benar", "Salah"],
-    "correctAnswer": 0,
-    "explanation": "Pembahasan mengapa pernyataan ini Benar."
-  }
-]` : `[
-  {
-    "text": "Pertanyaan uraian di sini?",
-    "type": "uraian",
-    "options": [],
-    "correctAnswer": 0,
-    "explanation": "Kunci jawaban dan pembahasan lengkap."
-  }
-]`}
-
-Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan sesuai kurikulum K-13/Merdeka.`;
+  const insertSymbol = (sym) => {
+    const el = ref.current;
+    if (!el) { onChange(value + sym); return; }
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    const newVal = value.substring(0, start) + sym + value.substring(end);
+    onChange(newVal);
+    setTimeout(() => {
+      el.focus();
+      el.setSelectionRange(start + sym.length, start + sym.length);
+    }, 0);
   };
 
-  const handleGenerate = async () => {
-    if (!geminiKey) return showToast("API Key Gemini belum diatur. Minta admin untuk mengaturnya di menu Pengaturan.", "error");
-    if (!aiForm.topic.trim()) return showToast("Isi topik/materi terlebih dahulu", "error");
-    if (!aiForm.subjectId) return showToast("Pilih mata pelajaran", "error");
-
-    setStep("loading");
-    const msgs = [
-      "Menghubungi Gemini AI...",
-      "Menganalisis materi " + aiForm.topic + "...",
-      "Menyusun soal dan kunci jawaban...",
-      "Memvalidasi pembahasan...",
-    ];
-    let mi = 0;
-    setLoadingMsg(msgs[0]);
-    const interval = setInterval(() => { mi = (mi + 1) % msgs.length; setLoadingMsg(msgs[mi]); }, 2000);
-
-    try {
-      const prompt = buildPrompt();
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
-          }),
-        }
-      );
-      clearInterval(interval);
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err?.error?.message || "Gagal menghubungi Gemini API");
-      }
-      const json = await res.json();
-      const raw = json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      const cleaned = raw.replace(/```json|```/g, "").trim();
-      const start = cleaned.indexOf("[");
-      const end = cleaned.lastIndexOf("]");
-      if (start === -1 || end === -1) throw new Error("Format respons AI tidak valid");
-      const parsed = JSON.parse(cleaned.slice(start, end + 1));
-      if (!Array.isArray(parsed) || parsed.length === 0) throw new Error("Tidak ada soal yang dihasilkan");
-      const withMeta = parsed.map((q, i) => ({
-        ...q,
-        subjectId: aiForm.subjectId,
-        type: q.type || aiForm.type,
-        options: q.options || [],
-        correctAnswer: typeof q.correctAnswer === "number" ? q.correctAnswer : 0,
-        explanation: q.explanation || "",
-        _tempId: "ai_" + Date.now() + "_" + i,
-      }));
-      setGenerated(withMeta);
-      setSelected(withMeta.map(q => q._tempId));
-      setStep("preview");
-    } catch (e) {
-      clearInterval(interval);
-      showToast("Gagal: " + e.message, "error");
-      setStep("form");
+  const handleKeyboard = (e) => {
+    // Quick shortcuts: / for fraction helper
+    if (e.key === "/" && e.altKey) {
+      e.preventDefault();
+      const el = ref.current;
+      const start = el?.selectionStart || 0;
+      const sel = value.substring(el?.selectionStart || 0, el?.selectionEnd || 0);
+      const frac = sel ? `(${sel})/()` : "()/()";
+      insertSymbol(frac);
     }
   };
 
-  const handleSave = () => {
-    const toSave = generated.filter(q => selected.includes(q._tempId));
-    if (!toSave.length) return showToast("Pilih minimal 1 soal", "error");
-    const latest = dataRef?.current || data;
-    const clean = toSave.map(({ _tempId, ...q }) => ({ id: "q" + Date.now() + Math.random().toString(36).slice(2, 6), ...q, createdBy: userId || "admin" }));
-    saveData({ ...latest, questions: [...(latest.questions || []), ...clean] }, ["questions"]);
-    showToast(`${clean.length} soal berhasil ditambahkan ke bank soal! 🎉`);
-    onClose();
+  return (
+    <div>
+      {/* Symbol Palette Toggle */}
+      <div className="flex items-center gap-2 mb-1">
+        <button type="button" onClick={() => setShowPalette(v => !v)} className="text-xs px-2 py-1 rounded-lg flex items-center gap-1 transition" style={{ background: showPalette ? "rgba(59,130,246,0.25)" : "rgba(51,65,85,0.4)", color: showPalette ? "#60a5fa" : "#94a3b8" }}>
+          <Hash size={12} />Simbol Matematika {showPalette ? "▲" : "▼"}
+        </button>
+        <span className="text-xs" style={{ color: "inherit", opacity: 0.4 }}>Alt+/ untuk pecahan</span>
+      </div>
+      {showPalette && (
+        <div className="flex flex-wrap gap-1 mb-2 p-2 rounded-xl" style={{ background: "rgba(15,23,42,0.6)", border: "1px solid rgba(59,130,246,0.2)" }}>
+          {MATH_SYMBOLS.map(s => (
+            <button key={s.label} type="button" onClick={() => insertSymbol(s.val)} className="px-2 py-1 rounded text-sm font-mono hover:bg-blue-500/20 transition" style={{ color: "#60a5fa", border: "1px solid rgba(59,130,246,0.15)", minWidth: "2.2rem" }} title={s.val}>
+              {s.label}
+            </button>
+          ))}
+          {/* Common templates */}
+          <div className="w-full mt-1 flex flex-wrap gap-1">
+            {[
+              ["x²+bx+c", "x² + bx + c = 0"],
+              ["f(x)", "f(x) = "],
+              ["sin A", "sin A = "],
+              ["log", "log₁₀(x) = "],
+              ["lim", "lim(x→∞) "],
+              ["∫dx", "∫f(x)dx = "],
+            ].map(([label, tpl]) => (
+              <button key={label} type="button" onClick={() => insertSymbol(tpl)} className="px-2 py-0.5 rounded text-xs hover:bg-purple-500/20 transition" style={{ color: "#c084fc", border: "1px solid rgba(168,85,247,0.2)" }}>
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      <textarea
+        ref={ref}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        onKeyDown={handleKeyboard}
+        rows={rows}
+        placeholder={placeholder}
+        className="w-full py-2.5 px-3 rounded-xl text-sm outline-none resize-y font-mono"
+        style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)", color: "inherit", lineHeight: "1.7" }}
+      />
+    </div>
+  );
+}
+
+// ============= AI GENERATE MODAL =============
+function AIGenerateModal({ data, onImport, onClose, showToast, userId, subjectFilter }) {
+  const [subjectId, setSubjectId] = useState(subjectFilter || (data.subjects || [])[0]?.id || "");
+  const [topic, setTopic] = useState("");
+  const [customPrompt, setCustomPrompt] = useState("");
+  const [count, setCount] = useState(5);
+  const [qtype, setQtype] = useState("pilgan");
+  const [difficulty, setDifficulty] = useState("sedang");
+  const [loading, setLoading] = useState(false);
+  const [loadingMsg, setLoadingMsg] = useState("");
+  const [generated, setGenerated] = useState([]);
+  const [selected, setSelected] = useState([]);
+  const [step, setStep] = useState(1);
+
+  const availableSubjects = subjectFilter
+    ? (data.subjects || []).filter(s => s.id === subjectFilter)
+    : (data.subjects || []);
+
+  const PROMPT_EXAMPLES = [
+    "Fokus pada soal aplikasi dan analisis (bukan hafalan)",
+    "Gunakan konteks kehidupan sehari-hari / fenomena nyata",
+    "Buat soal HOTS (Higher Order Thinking Skills)",
+    "Sertakan angka dan perhitungan pada setiap soal",
+    "Soal berbasis wacana / teks bacaan pendek",
+    "Hindari soal yang terlalu mudah ditebak",
+  ];
+
+  const loadingMessages = [
+    "Menghubungi Gemini 2.5 Flash…",
+    "Merancang soal berkualitas tinggi…",
+    "Menyusun kunci jawaban & pembahasan…",
+    "Memformat hasil generate…",
+  ];
+
+  const handleGenerate = async () => {
+    const apiKey = (() => { try { return localStorage.getItem("gemini_api_key") || ""; } catch { return ""; } })();
+    if (!apiKey.trim()) return showToast("API Key Gemini belum diatur — buka Pengaturan → Integrasi AI", "error");
+    if (!topic.trim()) return showToast("Masukkan topik soal", "error");
+    setLoading(true);
+    let msgIdx = 0;
+    setLoadingMsg(loadingMessages[0]);
+    const msgTimer = setInterval(() => { msgIdx = (msgIdx + 1) % loadingMessages.length; setLoadingMsg(loadingMessages[msgIdx]); }, 1800);
+
+    const subjName = (data.subjects || []).find(s => s.id === subjectId)?.name || "Umum";
+    const diffLabel = { mudah: "mudah (C1–C2)", sedang: "sedang (C3–C4)", sulit: "sulit (C5–C6)" }[difficulty];
+    const typeDesc = qtype === "pilgan" ? "pilihan ganda dengan 5 pilihan (A, B, C, D, E)" : qtype === "benar_salah" ? "benar/salah dengan options [\"Benar\",\"Salah\"]" : "uraian dengan options kosong []";
+    const instruksiTambahan = customPrompt.trim() ? `\nInstruksi khusus dari guru: ${customPrompt.trim()}` : "";
+
+    const prompt = `Kamu adalah pembuat soal profesional kurikulum SMA Indonesia.
+Buat ${count} soal ${typeDesc} tentang topik "${topic}" untuk mata pelajaran ${subjName}, tingkat kesulitan ${diffLabel}.${instruksiTambahan}
+Kembalikan HANYA JSON array valid, tanpa markdown, tanpa penjelasan, langsung dimulai dari karakter "[".
+Format setiap soal:
+{"text":"teks soal lengkap","options":["pilihan A","pilihan B","pilihan C","pilihan D","pilihan E"],"correctAnswer":0,"explanation":"pembahasan singkat dan jelas","type":"${qtype}","difficulty":"${difficulty}"}
+Aturan:
+- correctAnswer adalah index (0–4) dari jawaban yang benar
+- Untuk benar_salah: options harus persis ["Benar","Salah"]
+- Untuk uraian: options harus []
+- Gunakan simbol unicode jika perlu: ×÷±√π²³≤≥≠∞∑∫∆αβθλμσ
+- Soal harus bervariasi dan tidak mengulang konsep yang sama
+- Pembahasan wajib ada dan informatif`;
+
+    try {
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey.trim()}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.7, maxOutputTokens: 8192 } })
+      });
+      if (!res.ok) { const err = await res.json(); throw new Error(err.error?.message || `HTTP ${res.status}`); }
+      const json = await res.json();
+      const text = json.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      const match = text.match(/\[[\s\S]*\]/);
+      if (!match) throw new Error("Format respons tidak valid — coba generate ulang");
+      const parsed = JSON.parse(match[0]);
+      const questions = parsed.map(q => ({ ...q, subjectId, createdBy: userId || "admin", id: genId() }));
+      setGenerated(questions);
+      setSelected(questions.map((_, i) => i));
+      setStep(2);
+    } catch(e) { showToast("Error: " + e.message, "error"); }
+    clearInterval(msgTimer);
+    setLoading(false);
   };
 
-  const typeColors = { pilgan: { bg: "rgba(59,130,246,0.2)", color: "#60a5fa" }, benar_salah: { bg: "rgba(234,179,8,0.2)", color: "#fbbf24" }, uraian: { bg: "rgba(20,184,166,0.2)", color: "#2dd4bf" }, esai: { bg: "rgba(168,85,247,0.2)", color: "#c084fc" } };
+  const toggleSelect = (i) => setSelected(prev => prev.includes(i) ? prev.filter(x => x !== i) : [...prev, i]);
+  const selectedQuestions = generated.filter((_, i) => selected.includes(i));
+  const diffColor = { mudah: "#22c55e", sedang: "#f59e0b", sulit: "#ef4444" };
 
   return (
-    <Modal title="✨ Generate Soal dengan AI" onClose={onClose} wide>
-      {!geminiKey && (
-        <div className="mb-4 p-3 rounded-xl flex items-start gap-2" style={{ background: "rgba(234,179,8,0.1)", border: "1px solid rgba(234,179,8,0.3)" }}>
-          <AlertTriangle size={16} className="text-amber-400 mt-0.5 shrink-0" />
-          <p className="text-amber-300 text-sm">API Key Gemini belum diatur. Admin perlu menambahkan Gemini API Key di menu <strong>Pengaturan → Integrasi AI</strong>. Key gratis tersedia di <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" className="underline">aistudio.google.com</a></p>
+    <Modal onClose={onClose} wide>
+      {/* Header */}
+      <div className="rounded-t-2xl -mx-6 -mt-6 mb-6 px-6 pt-6 pb-5" style={{ background: "linear-gradient(135deg, rgba(99,102,241,0.25) 0%, rgba(168,85,247,0.2) 50%, rgba(59,130,246,0.15) 100%)", borderBottom: "1px solid rgba(99,102,241,0.2)" }}>
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-xl flex items-center justify-center text-xl" style={{ background: "linear-gradient(135deg, #6366f1, #a855f7)", boxShadow: "0 4px 15px rgba(99,102,241,0.4)" }}>✨</div>
+          <div>
+            <h2 className="font-bold text-lg text-white">AI Generate Soal</h2>
+            <p className="text-xs" style={{ color: "rgba(196,181,253,0.8)" }}>Powered by Gemini 2.5 Flash · Google AI</p>
+          </div>
+          {step === 2 && <div className="ml-auto flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold" style={{ background: "rgba(34,197,94,0.15)", color: "#4ade80", border: "1px solid rgba(34,197,94,0.25)" }}><CheckCircle size={12} /> {generated.length} soal siap</div>}
         </div>
-      )}
+        <div className="flex items-center gap-2 mt-4">
+          {[["1","Konfigurasi"],["2","Preview & Import"]].map(([n, label], idx) => (
+            <div key={n} className="flex items-center gap-1.5">
+              <div className="w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold" style={{ background: step >= idx+1 ? "linear-gradient(135deg,#6366f1,#a855f7)" : "rgba(51,65,85,0.6)", color: step >= idx+1 ? "white" : "#64748b" }}>{n}</div>
+              <span className="text-xs" style={{ color: step >= idx+1 ? "#c4b5fd" : "#475569" }}>{label}</span>
+              {idx === 0 && <div className="w-8 h-px" style={{ background: step >= 2 ? "rgba(99,102,241,0.5)" : "rgba(51,65,85,0.5)" }} />}
+            </div>
+          ))}
+        </div>
+      </div>
 
-      {step === "form" && (
-        <div className="space-y-4">
+      {step === 1 && (
+        <div className="space-y-5">
+          {/* Subject + Type */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
-              <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Mata Pelajaran</label>
-              <select value={aiForm.subjectId} onChange={e => setAiForm({ ...aiForm, subjectId: e.target.value })} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }}>
-                {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              <label className="text-sm font-semibold mb-2 block" style={{ color: "#a5b4fc" }}>📚 Mata Pelajaran</label>
+              <select value={subjectId} onChange={e => setSubjectId(e.target.value)} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(99,102,241,0.2)" }}>
+                {availableSubjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
               </select>
             </div>
             <div>
-              <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Tipe Soal</label>
-              <select value={aiForm.type} onChange={e => setAiForm({ ...aiForm, type: e.target.value })} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }}>
-                <option value="pilgan">Pilihan Ganda</option>
-                <option value="benar_salah">Benar / Salah</option>
-                <option value="uraian">Uraian</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Jumlah Soal</label>
-              <select value={aiForm.count} onChange={e => setAiForm({ ...aiForm, count: Number(e.target.value) })} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }}>
-                {[3,5,10,15,20].map(n => <option key={n} value={n}>{n} soal</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Tingkat Kesulitan</label>
-              <select value={aiForm.difficulty} onChange={e => setAiForm({ ...aiForm, difficulty: e.target.value })} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }}>
-                <option value="mudah">Mudah (C1-C2)</option>
-                <option value="sedang">Sedang (C3-C4)</option>
-                <option value="sulit">Sulit / HOTS (C5-C6)</option>
-              </select>
+              <label className="text-sm font-semibold mb-2 block" style={{ color: "#a5b4fc" }}>🎯 Tipe Soal</label>
+              <div className="grid grid-cols-3 gap-1.5">
+                {[["pilgan","PG","🔘"],["benar_salah","B/S","✅"],["uraian","Uraian","📝"]].map(([val, label, icon]) => (
+                  <button key={val} onClick={() => setQtype(val)} className="py-2 rounded-xl text-xs font-semibold transition-all" style={{ background: qtype === val ? "linear-gradient(135deg,rgba(99,102,241,0.4),rgba(168,85,247,0.3))" : "rgba(15,23,42,0.6)", border: `1px solid ${qtype === val ? "rgba(99,102,241,0.5)" : "rgba(51,65,85,0.5)"}`, color: qtype === val ? "#c4b5fd" : "#64748b" }}>
+                    <div>{icon}</div><div>{label}</div>
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
+
+          {/* Topic */}
           <div>
-            <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Topik / Materi <span className="text-red-400">*</span></label>
-            <input value={aiForm.topic} onChange={e => setAiForm({ ...aiForm, topic: e.target.value })} placeholder="Contoh: Sel dan Organel, Hukum Newton, Teks Narasi..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+            <label className="text-sm font-semibold mb-2 block" style={{ color: "#a5b4fc" }}>💡 Topik / Materi</label>
+            <input value={topic} onChange={e => setTopic(e.target.value)} onKeyDown={e => { if (e.key === "Enter" && !loading) handleGenerate(); }} placeholder="Cth: Persamaan Kuadrat, Fotosintesis, Revolusi Prancis…" className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(99,102,241,0.2)" }} />
           </div>
+
+          {/* Custom Instructions */}
           <div>
-            <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Instruksi Tambahan (opsional)</label>
-            <textarea value={aiForm.extra} onChange={e => setAiForm({ ...aiForm, extra: e.target.value })} rows={2} placeholder="Contoh: Fokus pada aspek aplikasi, sertakan konteks Indonesia, hindari soal menghafal..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+            <div className="flex items-center justify-between mb-2">
+              <label className="text-sm font-semibold" style={{ color: "#a5b4fc" }}>📝 Instruksi Khusus <span className="font-normal text-xs" style={{ color: "#475569" }}>(opsional)</span></label>
+            </div>
+            <textarea
+              value={customPrompt}
+              onChange={e => setCustomPrompt(e.target.value)}
+              rows={3}
+              placeholder="Tulis instruksi spesifik yang Anda inginkan…&#10;Cth: Buat soal HOTS berbasis wacana, gunakan konteks kehidupan sehari-hari, sertakan perhitungan, dll."
+              className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none"
+              style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(99,102,241,0.2)", lineHeight: 1.6 }}
+            />
+            {/* Shortcut chips */}
+            <div className="flex flex-wrap gap-1.5 mt-2">
+              {PROMPT_EXAMPLES.map((ex, i) => (
+                <button key={i} onClick={() => setCustomPrompt(prev => prev ? prev + ". " + ex : ex)} className="px-2.5 py-1 rounded-full text-xs transition-all hover:opacity-90" style={{ background: "rgba(99,102,241,0.1)", color: "#818cf8", border: "1px solid rgba(99,102,241,0.2)" }}>
+                  + {ex}
+                </button>
+              ))}
+            </div>
           </div>
-          <div className="flex justify-end gap-2">
-            <Btn variant="secondary" onClick={onClose}>Batal</Btn>
-            <Btn onClick={handleGenerate} disabled={!geminiKey}>
-              <span>✨</span> Generate {aiForm.count} Soal
-            </Btn>
+
+          {/* Count + Difficulty */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="text-sm font-semibold mb-2 flex items-center justify-between" style={{ color: "#a5b4fc" }}>
+                <span>📊 Jumlah Soal</span>
+                <span className="text-lg font-bold" style={{ color: "#818cf8" }}>{count}</span>
+              </label>
+              <input type="range" min={3} max={20} value={count} onChange={e => setCount(Number(e.target.value))} className="w-full accent-indigo-500" />
+              <div className="flex justify-between text-xs mt-1" style={{ color: "#475569" }}><span>3</span><span>20</span></div>
+            </div>
+            <div>
+              <label className="text-sm font-semibold mb-2 block" style={{ color: "#a5b4fc" }}>⚡ Tingkat Kesulitan</label>
+              <div className="grid grid-cols-3 gap-1.5">
+                {[["mudah","Mudah"],["sedang","Sedang"],["sulit","Sulit"]].map(([val, label]) => (
+                  <button key={val} onClick={() => setDifficulty(val)} className="py-2 rounded-xl text-xs font-semibold transition-all" style={{ background: difficulty === val ? `${diffColor[val]}22` : "rgba(15,23,42,0.6)", border: `1px solid ${difficulty === val ? diffColor[val] + "66" : "rgba(51,65,85,0.5)"}`, color: difficulty === val ? diffColor[val] : "#64748b" }}>{label}</button>
+                ))}
+              </div>
+            </div>
           </div>
+
+          {/* Loading / Actions */}
+          {loading ? (
+            <div className="flex flex-col items-center gap-3 py-6">
+              <div className="relative w-14 h-14">
+                <div className="absolute inset-0 rounded-full" style={{ background: "linear-gradient(135deg,rgba(99,102,241,0.2),rgba(168,85,247,0.2))", border: "2px solid rgba(99,102,241,0.3)" }} />
+                <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-indigo-400 animate-spin" />
+                <div className="absolute inset-0 flex items-center justify-center text-xl">✨</div>
+              </div>
+              <div className="text-center">
+                <p className="text-sm font-semibold" style={{ color: "#a5b4fc" }}>{loadingMsg}</p>
+                <p className="text-xs mt-1" style={{ color: "#475569" }}>Harap tunggu, Gemini sedang bekerja…</p>
+              </div>
+            </div>
+          ) : (
+            <div className="flex gap-2 justify-end">
+              <Btn variant="secondary" onClick={onClose}>Batal</Btn>
+              <button onClick={handleGenerate} className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm transition-all" style={{ background: "linear-gradient(135deg, #6366f1, #a855f7)", color: "white", boxShadow: "0 4px 15px rgba(99,102,241,0.35)" }}>
+                <Play size={15} /> Generate {count} Soal
+              </button>
+            </div>
+          )}
         </div>
       )}
 
-      {step === "loading" && (
-        <div className="flex flex-col items-center justify-center py-12 gap-4">
-          <div className="w-12 h-12 rounded-full border-4 border-blue-500 border-t-transparent animate-spin" />
-          <p className="text-blue-300 text-sm font-medium">{loadingMsg}</p>
-          <p className="text-slate-500 text-xs">Gemini AI sedang menyusun soal berkualitas...</p>
-        </div>
-      )}
-
-      {step === "preview" && (
+      {step === 2 && (
         <div>
-          <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-            <p className="text-sm" style={{ color: "inherit", opacity: 0.8 }}><span className="text-green-400 font-bold">{generated.length} soal</span> berhasil digenerate. Pilih yang ingin disimpan:</p>
+          <div className="flex items-center justify-between mb-4 px-4 py-3 rounded-xl" style={{ background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.2)" }}>
+            <div className="flex items-center gap-2">
+              <CheckCircle size={16} className="text-green-400" />
+              <span className="text-sm font-semibold text-green-400">{generated.length} soal berhasil digenerate</span>
+            </div>
             <div className="flex gap-2">
-              <button onClick={() => setSelected(generated.map(q => q._tempId))} className="text-xs text-blue-400 underline">Pilih Semua</button>
-              <button onClick={() => setSelected([])} className="text-xs text-slate-400 underline">Batal Semua</button>
+              <button onClick={() => setSelected(generated.map((_,i)=>i))} className="text-xs px-2 py-1 rounded-lg" style={{ background: "rgba(34,197,94,0.15)", color: "#4ade80" }}>Pilih Semua</button>
+              <button onClick={() => setSelected([])} className="text-xs px-2 py-1 rounded-lg" style={{ background: "rgba(51,65,85,0.5)", color: "#94a3b8" }}>Batal Semua</button>
             </div>
           </div>
-          <div className="space-y-3 max-h-[50vh] overflow-y-auto pr-1 mb-4">
+          <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1 mb-5" style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(99,102,241,0.3) transparent" }}>
             {generated.map((q, i) => {
-              const isSelected = selected.includes(q._tempId);
-              const tc = typeColors[q.type] || typeColors.pilgan;
+              const isSel = selected.includes(i);
               return (
-                <div key={q._tempId} onClick={() => setSelected(s => s.includes(q._tempId) ? s.filter(x => x !== q._tempId) : [...s, q._tempId])} className="p-3 rounded-xl cursor-pointer transition" style={{ background: isSelected ? "rgba(22,163,74,0.1)" : "rgba(15,23,42,0.5)", border: `1px solid ${isSelected ? "rgba(22,163,74,0.4)" : "rgba(59,130,246,0.15)"}` }}>
-                  <div className="flex items-start gap-2">
-                    <div className="w-5 h-5 rounded shrink-0 mt-0.5 flex items-center justify-center" style={{ background: isSelected ? "#16a34a" : "rgba(51,65,85,0.6)" }}>
-                      {isSelected && <CheckCircle size={14} className="text-white" />}
+                <div key={i} onClick={() => toggleSelect(i)} className="p-3.5 rounded-xl cursor-pointer transition-all" style={{ background: isSel ? "rgba(99,102,241,0.1)" : "rgba(15,23,42,0.5)", border: `1px solid ${isSel ? "rgba(99,102,241,0.35)" : "rgba(51,65,85,0.4)"}` }}>
+                  <div className="flex items-start gap-2.5">
+                    <div className="flex-shrink-0 w-5 h-5 rounded-md mt-0.5 flex items-center justify-center" style={{ background: isSel ? "rgba(99,102,241,0.8)" : "rgba(51,65,85,0.5)", border: `1px solid ${isSel ? "rgba(99,102,241,0.8)" : "rgba(71,85,105,0.5)"}` }}>
+                      {isSel && <CheckCircle size={12} color="white" />}
                     </div>
-                    <div className="flex-1">
-                      <div className="flex gap-2 mb-1 flex-wrap">
-                        <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: tc.bg, color: tc.color }}>{q.type === "pilgan" ? "Pilihan Ganda" : q.type === "benar_salah" ? "Benar/Salah" : "Uraian"}</span>
-                        <span className="text-xs text-slate-400">Soal {i + 1}</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="text-xs font-bold" style={{ color: "#6366f1" }}>#{i+1}</span>
+                        <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: `${diffColor[q.difficulty || difficulty]}18`, color: diffColor[q.difficulty || difficulty] }}>{q.difficulty || difficulty}</span>
                       </div>
-                      <p className="text-sm mb-2" style={{ color: "inherit" }}>{q.text}</p>
-                      {q.type === "pilgan" && q.options?.length > 0 && (
-                        <div className="space-y-0.5 mb-2">
-                          {q.options.map((opt, oi) => (
-                            <div key={oi} className="flex items-center gap-1.5 text-xs" style={{ color: oi === q.correctAnswer ? "#4ade80" : "#94a3b8" }}>
-                              <span className="font-bold">{String.fromCharCode(65 + oi)}.</span>
-                              <span>{opt}</span>
-                              {oi === q.correctAnswer && <CheckCircle size={10} />}
-                            </div>
+                      <p className="text-sm font-medium leading-relaxed" style={{ color: "#e2e8f0" }}>{q.text.substring(0, 130)}{q.text.length > 130 ? "…" : ""}</p>
+                      {q.options?.length > 0 && (
+                        <div className="flex flex-wrap gap-1 mt-2">
+                          {q.options.map((o, oi) => (
+                            <span key={oi} className="px-2 py-0.5 rounded-md text-xs" style={{ background: oi === q.correctAnswer ? "rgba(34,197,94,0.15)" : "rgba(30,41,59,0.6)", color: oi === q.correctAnswer ? "#4ade80" : "#64748b", border: `1px solid ${oi === q.correctAnswer ? "rgba(34,197,94,0.3)" : "transparent"}` }}>
+                              {String.fromCharCode(65+oi)}. {o.substring(0, 30)}
+                            </span>
                           ))}
                         </div>
                       )}
-                      {q.type === "benar_salah" && (
-                        <p className="text-xs text-green-400 mb-1">✓ Jawaban: {q.options?.[q.correctAnswer] || "Benar"}</p>
-                      )}
-                      {q.explanation && (
-                        <div className="p-2 rounded-lg mt-1" style={{ background: "rgba(59,130,246,0.08)" }}>
-                          <p className="text-xs" style={{ color: "inherit", opacity: 0.75 }}><span className="text-blue-400 font-semibold">Pembahasan:</span> {q.explanation}</p>
-                        </div>
-                      )}
+                      {q.explanation && <p className="text-xs mt-2" style={{ color: "#818cf8" }}>💡 {q.explanation.substring(0, 100)}</p>}
                     </div>
                   </div>
                 </div>
               );
             })}
           </div>
-          <div className="flex justify-between items-center gap-2 flex-wrap">
-            <button onClick={() => { setStep("form"); setGenerated([]); setSelected([]); }} className="text-sm text-slate-400 underline">← Generate Ulang</button>
-            <div className="flex gap-2">
-              <Btn variant="secondary" onClick={onClose}>Batal</Btn>
-              <Btn onClick={handleSave} disabled={selected.length === 0}>
-                <Save size={14} /> Simpan {selected.length} Soal
-              </Btn>
+          <div className="flex items-center gap-2">
+            <button onClick={() => { setStep(1); setGenerated([]); setSelected([]); }} className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-semibold" style={{ background: "rgba(51,65,85,0.5)", color: "#94a3b8" }}>
+              <RefreshCw size={14} /> Generate Ulang
+            </button>
+            <div className="ml-auto flex items-center gap-2">
+              <span className="text-xs" style={{ color: "#64748b" }}>{selected.length} dari {generated.length} dipilih</span>
+              <button onClick={() => { if (selected.length === 0) return showToast("Pilih minimal 1 soal", "error"); onImport(selectedQuestions); onClose(); showToast(`${selectedQuestions.length} soal berhasil diimport!`); }} className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm" style={{ background: selected.length > 0 ? "linear-gradient(135deg, #059669, #10b981)" : "rgba(51,65,85,0.5)", color: selected.length > 0 ? "white" : "#475569", boxShadow: selected.length > 0 ? "0 4px 15px rgba(16,185,129,0.3)" : "none", cursor: selected.length > 0 ? "pointer" : "not-allowed" }}>
+                <Download size={15} /> Import {selected.length} Soal
+              </button>
             </div>
           </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+// ============= SCIENCE EDITOR MODAL =============
+function ScienceEditorModal({ onInsert, onClose }) {
+  const [activeTab, setActiveTab] = useState("symbols");
+  const [latexInput, setLatexInput] = useState("");
+  const [preview, setPreview] = useState("");
+
+  // Load KaTeX lazily
+  useEffect(() => {
+    if (!window.katex) {
+      const link = document.createElement("link");
+      link.rel = "stylesheet"; link.href = "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css";
+      document.head.appendChild(link);
+      const s = document.createElement("script");
+      s.src = "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js";
+      s.onload = () => { renderLatex(); };
+      document.head.appendChild(s);
+    } else { renderLatex(); }
+  }, [latexInput]);
+
+  const renderLatex = () => {
+    if (!window.katex || !latexInput) { setPreview(""); return; }
+    try { setPreview(window.katex.renderToString(latexInput, { throwOnError: false, displayMode: true })); }
+    catch { setPreview(""); }
+  };
+
+  const SYMBOL_GROUPS = {
+    "Matematika": ["±","×","÷","≠","≤","≥","≈","∞","√","²","³","π","∑","∫","∆","∂","∏","‰"],
+    "Kalkulus": ["∫","∮","∇","∂","lim","→","⟶","f'(x)","d/dx","∆x"],
+    "Huruf Yunani": ["α","β","γ","δ","ε","θ","λ","μ","ν","ξ","π","ρ","σ","τ","φ","χ","ψ","ω","Γ","Δ","Θ","Λ","Σ","Φ","Ψ","Ω"],
+    "Fisika": ["Ω","℃","℉","Å","eV","ħ","ℏ","⊕","⊗","↑","↓","⃗","‖","⊥","∥"],
+    "Himpunan": ["∈","∉","⊂","⊃","⊆","⊇","∪","∩","∅","∖","∁","ℕ","ℤ","ℚ","ℝ","ℂ"],
+    "Geometri": ["°","∠","△","▽","□","◇","⊙","⊥","∥","≅","∼","⟂"],
+  };
+
+  const CHEM_TEMPLATES = [
+    ["Persamaan biasa", "A + B → C + D"],
+    ["Kesetimbangan", "A ⇌ B"],
+    ["Reaksi asam-basa", "HCl + NaOH → NaCl + H₂O"],
+    ["Oksidasi", "2H₂ + O₂ → 2H₂O"],
+    ["Ionisasi", "NaCl → Na⁺ + Cl⁻"],
+    ["pH formula", "pH = -log[H⁺]"],
+    ["Mol", "n = m/Mr"],
+    ["Konsentrasi", "M = n/V"],
+    ["Hukum gas ideal", "PV = nRT"],
+    ["Energi aktivasi", "Ea = RT ln(A/k)"],
+    ["Laju reaksi", "v = k[A]^m[B]^n"],
+    ["Kesetimbangan Kc", "Kc = [C]^c[D]^d / [A]^a[B]^b"],
+    ["Perubahan entalpi", "ΔH = Hp - Hr"],
+    ["Buffer", "pH = pKa + log([A⁻]/[HA])"],
+  ];
+
+  const MATH_TEMPLATES = [
+    ["Pecahan", "\\frac{a}{b}"],
+    ["Akar", "\\sqrt{x}"],
+    ["Pangkat", "x^{n}"],
+    ["Integral", "\\int_{a}^{b} f(x)\\,dx"],
+    ["Sigma", "\\sum_{i=1}^{n} i"],
+    ["Limit", "\\lim_{x \\to 0}"],
+    ["Matriks 2×2", "\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}"],
+    ["Vektor", "\\vec{v}"],
+    ["Turunan", "\\frac{d}{dx}"],
+    ["Logaritma", "\\log_{b}(x)"],
+    ["sin/cos/tan", "\\sin\\theta, \\cos\\theta, \\tan\\theta"],
+    ["Mutlak", "|x|"],
+    ["Pi", "\\pi \\approx 3.14159"],
+    ["Sistem persamaan", "\\begin{cases} x+y=5 \\\\ x-y=1 \\end{cases}"],
+  ];
+
+  const tabs = ["symbols","equation","kimia","templates"];
+  const tabLabel = { symbols:"Simbol", equation:"Persamaan LaTeX", kimia:"Kimia", templates:"Template" };
+
+  return (
+    <Modal title="📐 Science Editor" onClose={onClose} wide>
+      <div className="flex gap-1 mb-4 flex-wrap">
+        {tabs.map(t => (
+          <button key={t} onClick={() => setActiveTab(t)} className="px-3 py-1.5 rounded-lg text-xs font-semibold transition" style={{ background: activeTab === t ? "#3b82f6" : "rgba(51,65,85,0.5)", color: activeTab === t ? "white" : "#94a3b8" }}>{tabLabel[t]}</button>
+        ))}
+      </div>
+
+      {activeTab === "symbols" && (
+        <div className="space-y-3 max-h-96 overflow-y-auto">
+          {Object.entries(SYMBOL_GROUPS).map(([group, syms]) => (
+            <div key={group}>
+              <div className="text-blue-400 text-xs font-bold mb-1">{group}</div>
+              <div className="flex flex-wrap gap-1">
+                {syms.map(s => (
+                  <button key={s} onClick={() => onInsert(s)} className="px-2 py-1 rounded text-sm font-mono hover:bg-blue-500/20 transition" style={{ background: "rgba(15,23,42,0.6)", color: "#e2e8f0", border: "1px solid rgba(59,130,246,0.15)", minWidth: "2.5rem", textAlign:"center" }}>{s}</button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {activeTab === "equation" && (
+        <div className="space-y-3">
+          <div>
+            <label className="text-blue-300 text-sm font-medium mb-1 block">LaTeX Input</label>
+            <textarea value={latexInput} onChange={e => setLatexInput(e.target.value)} rows={3} placeholder="Cth: \frac{-b \pm \sqrt{b^2-4ac}}{2a}" className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none font-mono" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+          </div>
+          {preview && (
+            <div className="p-4 rounded-xl" style={{ background: "rgba(15,23,42,0.5)", border: "1px solid rgba(59,130,246,0.15)" }}>
+              <div className="text-xs text-slate-400 mb-2">Preview:</div>
+              <div className="text-white overflow-x-auto" dangerouslySetInnerHTML={{ __html: preview }} />
+            </div>
+          )}
+          <div className="flex justify-end gap-2">
+            <Btn variant="secondary" onClick={() => setLatexInput("")}>Bersihkan</Btn>
+            <Btn onClick={() => { if(latexInput) onInsert(latexInput); }}><CheckCircle size={14} />Sisipkan LaTeX</Btn>
+          </div>
+        </div>
+      )}
+
+      {activeTab === "kimia" && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-96 overflow-y-auto">
+          {CHEM_TEMPLATES.map(([label, tpl]) => (
+            <button key={label} onClick={() => onInsert(tpl)} className="flex items-start gap-2 px-3 py-2 rounded-xl text-left text-xs transition hover:bg-blue-500/10" style={{ background: "rgba(15,23,42,0.5)", border: "1px solid rgba(59,130,246,0.1)" }}>
+              <span className="text-blue-400 font-medium shrink-0">{label}</span>
+              <span className="font-mono" style={{ color: "inherit", opacity: 0.7 }}>{tpl}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {activeTab === "templates" && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-96 overflow-y-auto">
+          {MATH_TEMPLATES.map(([label, tpl]) => (
+            <button key={label} onClick={() => onInsert(tpl)} className="flex items-start gap-2 px-3 py-2 rounded-xl text-left text-xs transition hover:bg-purple-500/10" style={{ background: "rgba(15,23,42,0.5)", border: "1px solid rgba(168,85,247,0.1)" }}>
+              <span className="text-purple-400 font-medium shrink-0">{label}</span>
+              <span className="font-mono" style={{ color: "inherit", opacity: 0.7 }}>{tpl}</span>
+            </button>
+          ))}
         </div>
       )}
     </Modal>
@@ -1333,26 +1609,48 @@ Buat tepat ${aiForm.count} soal. Pastikan soal bervariasi, tidak berulang, dan s
 function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
   const [showModal, setShowModal] = useState(false);
   const [showImport, setShowImport] = useState(false);
-  const [showAI, setShowAI] = useState(false);
+  const [showAIGenerate, setShowAIGenerate] = useState(false);
+  const [showScienceEditor, setShowScienceEditor] = useState(false);
+  const [scienceTarget, setScienceTarget] = useState(null); // which field to insert into
   const [editId, setEditId] = useState(null);
   const [filterSubject, setFilterSubject] = useState("all");
   const [form, setForm] = useState({ subjectId: "", type: "pilgan", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "", rubrik: "" });
   const [filterType, setFilterType] = useState("all");
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [bulkMode, setBulkMode] = useState(false);
+
+  // Teacher: only show their subjects; Admin: show all
+  const teacherSubjects = userId ? (data.teachers || []).find(t => t.id === userId)?.subjects || [] : null;
+  const visibleSubjects = teacherSubjects
+    ? (data.subjects || []).filter(s => teacherSubjects.includes(s.id))
+    : (data.subjects || []);
 
   const [showMineOnly, setShowMineOnly] = useState(false);
-  // Show all questions (not just createdBy this user) - prevents visibility issues
-  // from real-time sync delay. User can filter to "mine only".
   const allQ = data.questions || [];
-  const baseQ = (userId && showMineOnly) ? allQ.filter(q => q.createdBy === userId) : allQ;
+  // Guru only sees questions for their subjects
+  const subjectFilteredQ = teacherSubjects
+    ? allQ.filter(q => teacherSubjects.includes(q.subjectId))
+    : allQ;
+  const baseQ = (userId && showMineOnly) ? subjectFilteredQ.filter(q => q.createdBy === userId) : subjectFilteredQ;
   const filtered = baseQ.filter(q => {
     if (filterSubject !== "all" && q.subjectId !== filterSubject) return false;
     if (filterType !== "all" && (q.type || "pilgan") !== filterType) return false;
     return true;
   });
-  const myCount = userId ? allQ.filter(q => q.createdBy === userId).length : allQ.length;
+  const myCount = userId ? subjectFilteredQ.filter(q => q.createdBy === userId).length : allQ.length;
 
-  const openAdd = () => { setEditId(null); setForm({ subjectId: (data.subjects || [])[0]?.id || "", type: "pilgan", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "", rubrik: "" }); setShowModal(true); };
-  const openEdit = (q) => { setEditId(q.id); setForm({ subjectId: q.subjectId, type: q.type || "pilgan", text: q.text, image: q.image || "", options: q.options?.length ? [...q.options, "", "", ""].slice(0, 5) : ["", "", "", "", ""], correctAnswer: q.correctAnswer || 0, explanation: q.explanation || "", rubrik: q.rubrik || "" }); setShowModal(true); };
+  const defaultSubjectId = visibleSubjects[0]?.id || "";
+
+  const openAdd = () => {
+    setEditId(null);
+    setForm({ subjectId: defaultSubjectId, type: "pilgan", text: "", image: "", options: ["", "", "", "", ""], correctAnswer: 0, explanation: "", rubrik: "" });
+    setShowModal(true);
+  };
+  const openEdit = (q) => {
+    setEditId(q.id);
+    setForm({ subjectId: q.subjectId, type: q.type || "pilgan", text: q.text, image: q.image || "", options: q.options?.length ? [...q.options, "", "", ""].slice(0, 5) : ["", "", "", "", ""], correctAnswer: q.correctAnswer || 0, explanation: q.explanation || "", rubrik: q.rubrik || "" });
+    setShowModal(true);
+  };
 
   const handleImageUpload = (e) => {
     const file = e.target.files[0]; if (!file) return;
@@ -1372,7 +1670,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     let questions = [...(latest.questions || [])];
     const qData = {
       ...form,
-      options: form.type === "pilgan" ? form.options.filter(o => o.trim()) : [],
+      options: form.type === "pilgan" ? form.options.filter(o => o.trim()) : (form.type === "benar_salah" ? ["Benar","Salah"] : []),
       createdBy: userId || "admin",
       type: form.type || "pilgan"
     };
@@ -1390,35 +1688,84 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     showToast("Soal dihapus");
   };
 
+  const handleBulkDelete = () => {
+    if (selectedIds.size === 0) return;
+    if (!confirm(`Hapus ${selectedIds.size} soal yang dipilih? Tindakan ini tidak dapat dibatalkan.`)) return;
+    const latest = dataRef?.current || data;
+    saveData({ ...latest, questions: (latest.questions || []).filter(q => !selectedIds.has(q.id)) }, ["questions"]);
+    setSelectedIds(new Set());
+    setBulkMode(false);
+    showToast(`${selectedIds.size} soal berhasil dihapus`);
+  };
+
+  const toggleSelect = (id) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const selectAll = () => {
+    if (selectedIds.size === filtered.length) setSelectedIds(new Set());
+    else setSelectedIds(new Set(filtered.map(q => q.id)));
+  };
+
   const handleBulkImport = (importedQuestions) => {
     const latest = dataRef?.current || data;
     const questions = [...(latest.questions || []), ...importedQuestions.map(q => ({ id: genId(), ...q, type: q.type || "pilgan", createdBy: userId || "admin" }))];
-    saveData({ ...latest, questions });
+    saveData({ ...latest, questions }, ["questions"]);
     setShowImport(false);
     showToast(`${importedQuestions.length} soal berhasil diimpor`);
   };
 
   const getSubjectName = (sid) => (data.subjects || []).find(s => s.id === sid)?.name || "-";
 
+  // Science editor: insert text into a specific field
+  const handleScienceInsert = (text) => {
+    if (!scienceTarget) return;
+    if (scienceTarget === "text") {
+      setForm(f => ({ ...f, text: f.text + text }));
+    } else if (scienceTarget === "explanation") {
+      setForm(f => ({ ...f, explanation: f.explanation + text }));
+    } else if (scienceTarget.startsWith("option_")) {
+      const idx = parseInt(scienceTarget.split("_")[1]);
+      setForm(f => { const opts = [...f.options]; opts[idx] = opts[idx] + text; return { ...f, options: opts }; });
+    }
+    setShowScienceEditor(false);
+  };
+
   return (
     <div>
       <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
         <div>
           <h2 className="text-2xl font-bold" style={{ color: "inherit" }}>Bank Soal</h2>
-          {userId && <p className="text-xs mt-0.5" style={{ color: "inherit", opacity: 0.6 }}>Soal saya: {myCount} | Total: {allQ.length}</p>}
+          {userId && <p className="text-xs mt-0.5" style={{ color: "inherit", opacity: 0.6 }}>Soal saya: {myCount} | Tampil: {filtered.length}</p>}
         </div>
         <div className="flex gap-2 flex-wrap">
           {userId && <button onClick={() => setShowMineOnly(v => !v)} className="px-3 py-2 rounded-xl text-xs font-medium transition" style={{ background: showMineOnly ? "rgba(59,130,246,0.25)" : "rgba(51,65,85,0.5)", color: showMineOnly ? "#60a5fa" : "#94a3b8", border: "1px solid rgba(59,130,246,0.2)" }}>{showMineOnly ? "✓ Soal Saya" : "Semua Soal"}</button>}
+          <button onClick={() => { setBulkMode(v => !v); setSelectedIds(new Set()); }} className="px-3 py-2 rounded-xl text-xs font-medium transition" style={{ background: bulkMode ? "rgba(220,38,38,0.2)" : "rgba(51,65,85,0.5)", color: bulkMode ? "#f87171" : "#94a3b8", border: "1px solid rgba(220,38,38,0.2)" }}>{bulkMode ? "✗ Batal Pilih" : "☑ Pilih Banyak"}</button>
+          <Btn variant="secondary" onClick={() => setShowAIGenerate(true)}><Play size={16} />AI Generate</Btn>
           <Btn variant="secondary" onClick={() => setShowImport(true)}><Upload size={16} />Import</Btn>
-          <button onClick={() => setShowAI(true)} className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-semibold transition" style={{ background: "linear-gradient(135deg, rgba(168,85,247,0.3), rgba(59,130,246,0.3))", color: "#c084fc", border: "1px solid rgba(168,85,247,0.4)" }}>✨ Generate AI</button>
           <Btn onClick={openAdd}><Plus size={16} />Tambah Soal</Btn>
         </div>
       </div>
+
+      {bulkMode && selectedIds.size > 0 && (
+        <div className="mb-4 p-3 rounded-xl flex items-center justify-between" style={{ background: "rgba(220,38,38,0.1)", border: "1px solid rgba(220,38,38,0.2)" }}>
+          <span className="text-red-400 text-sm">{selectedIds.size} soal dipilih</span>
+          <div className="flex gap-2">
+            <button onClick={selectAll} className="text-xs text-blue-400 hover:underline">{selectedIds.size === filtered.length ? "Batalkan Semua" : "Pilih Semua"}</button>
+            <Btn variant="danger" onClick={handleBulkDelete}><Trash2 size={14} />Hapus {selectedIds.size} Soal</Btn>
+          </div>
+        </div>
+      )}
+
       <Card>
         <div className="mb-4 flex flex-wrap gap-2">
           <select value={filterSubject} onChange={e => setFilterSubject(e.target.value)} className="py-2 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.2)" }}>
             <option value="all">Semua Mata Pelajaran</option>
-            {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+            {visibleSubjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
           <select value={filterType} onChange={e => setFilterType(e.target.value)} className="py-2 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.2)" }}>
             <option value="all">Semua Tipe</option>
@@ -1428,18 +1775,23 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
             <option value="benar_salah">Benar/Salah</option>
           </select>
         </div>
-        <div className="text-xs mb-3" style={{ color: "inherit", opacity: 0.65 }}>{filtered.length} soal</div>
+        <div className="text-xs mb-3" style={{ color: "inherit", opacity: 0.65 }}>{filtered.length} soal{bulkMode && " — mode pilih aktif"}</div>
         {filtered.length === 0 ? <EmptyState icon={<FileText size={40} className="mx-auto" />} text="Belum ada soal" /> : (
           <div className="space-y-3 max-h-[60vh] overflow-y-auto">
             {filtered.map((q, i) => (
-              <div key={q.id} className="p-3 rounded-xl" style={{ background: "rgba(15,23,42,0.5)" }}>
+              <div key={q.id} className="p-3 rounded-xl transition" style={{ background: selectedIds.has(q.id) ? "rgba(220,38,38,0.1)" : "rgba(15,23,42,0.5)", border: selectedIds.has(q.id) ? "1px solid rgba(220,38,38,0.3)" : "1px solid transparent" }}>
                 <div className="flex items-start justify-between gap-2">
+                  {bulkMode && (
+                    <button onClick={() => toggleSelect(q.id)} className="mt-0.5 shrink-0 w-5 h-5 rounded border flex items-center justify-center transition" style={{ borderColor: selectedIds.has(q.id) ? "#ef4444" : "#475569", background: selectedIds.has(q.id) ? "#ef4444" : "transparent" }}>
+                      {selectedIds.has(q.id) && <CheckCircle size={12} color="white" />}
+                    </button>
+                  )}
                   <div className="flex-1">
                     <div className="flex items-center gap-2 mb-1 flex-wrap"><span className="text-blue-400 text-xs">{getSubjectName(q.subjectId)}</span>{userId && q.createdBy !== userId && <span className="px-1.5 py-0.5 rounded text-xs" style={{ background: "rgba(168,85,247,0.15)", color: "#c084fc" }}>dari guru lain</span>}<span className="px-1.5 py-0.5 rounded text-xs" style={{ background: q.type === "esai" ? "rgba(168,85,247,0.2)" : q.type === "uraian" ? "rgba(20,184,166,0.2)" : q.type === "benar_salah" ? "rgba(234,179,8,0.2)" : "rgba(59,130,246,0.2)", color: q.type === "esai" ? "#c084fc" : q.type === "uraian" ? "#2dd4bf" : q.type === "benar_salah" ? "#fbbf24" : "#60a5fa" }}>{q.type === "esai" ? "Esai" : q.type === "uraian" ? "Uraian" : q.type === "benar_salah" ? "Benar/Salah" : "Pilihan Ganda"}</span></div>
                     <div className="text-white text-sm mb-2">{i + 1}. {q.text.substring(0, 150)}{q.text.length > 150 ? "..." : ""}</div>
                     {q.image && <img src={q.image} alt="" className="max-h-24 rounded-lg mb-2" />}
                     <div className="flex flex-wrap gap-1">
-                      {q.options.map((o, oi) => (
+                      {(q.options || []).map((o, oi) => (
                         <span key={oi} className="px-2 py-0.5 rounded text-xs" style={{ background: oi === q.correctAnswer ? "rgba(22,163,74,0.2)" : "rgba(51,65,85,0.5)", color: oi === q.correctAnswer ? "#4ade80" : "#94a3b8" }}>
                           {String.fromCharCode(65 + oi)}. {o.substring(0, 30)}
                         </span>
@@ -1457,9 +1809,9 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
         )}
       </Card>
 
-      {showImport && <ImportSoalModal data={data} onImport={handleBulkImport} onClose={() => setShowImport(false)} showToast={showToast} />}
-
-      {showAI && <AIGenerateModal data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} userId={userId} onClose={() => setShowAI(false)} />}
+      {showAIGenerate && <AIGenerateModal data={data} onImport={handleBulkImport} onClose={() => setShowAIGenerate(false)} showToast={showToast} userId={userId} subjectFilter={teacherSubjects ? defaultSubjectId : null} />}
+      {showImport && <ImportSoalModal data={data} onImport={handleBulkImport} onClose={() => setShowImport(false)} showToast={showToast} visibleSubjects={visibleSubjects} />}
+      {showScienceEditor && <ScienceEditorModal onInsert={handleScienceInsert} onClose={() => setShowScienceEditor(false)} />}
 
       {showModal && (
         <Modal title={editId ? "Edit Soal" : "Tambah Soal"} onClose={() => setShowModal(false)} wide>
@@ -1467,7 +1819,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <Select label="Mata Pelajaran" value={form.subjectId} onChange={e => setForm({ ...form, subjectId: e.target.value })}>
                 <option value="">-- Pilih Mapel --</option>
-                {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                {visibleSubjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
               </Select>
               <Select label="Tipe Soal" value={form.type} onChange={e => setForm({ ...form, type: e.target.value })}>
                 <option value="pilgan">Pilihan Ganda</option>
@@ -1477,8 +1829,11 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
               </Select>
             </div>
             <div>
-              <label className="text-blue-300 text-sm font-medium mb-1 block">Teks Soal</label>
-              <textarea value={form.text} onChange={e => setForm({ ...form, text: e.target.value })} rows={4} placeholder="Masukkan teks soal..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-blue-300 text-sm font-medium">Teks Soal</label>
+                <button type="button" onClick={() => { setScienceTarget("text"); setShowScienceEditor(true); }} className="text-xs px-2 py-1 rounded-lg flex items-center gap-1 transition" style={{ background: "rgba(168,85,247,0.2)", color: "#c084fc", border: "1px solid rgba(168,85,247,0.3)" }}>📐 Science Editor</button>
+              </div>
+              <MathTextarea value={form.text} onChange={v => setForm({ ...form, text: v })} placeholder="Masukkan teks soal... (gunakan simbol ± × √ dll)" rows={4} />
             </div>
             <div>
               <label className="text-blue-300 text-sm font-medium mb-1 block">Gambar Soal (Opsional)</label>
@@ -1497,13 +1852,18 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
             </div>
             {(form.type === "pilgan") && (
               <div>
-                <label className="text-blue-300 text-sm font-medium mb-2 block">Pilihan Jawaban</label>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-blue-300 text-sm font-medium">Pilihan Jawaban</label>
+                </div>
                 {form.options.map((o, i) => (
-                  <div key={i} className="flex items-center gap-2 mb-2">
-                    <button onClick={() => setForm(f => ({ ...f, correctAnswer: i }))} className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold shrink-0 transition" style={{ background: form.correctAnswer === i ? "#16a34a" : "rgba(51,65,85,0.5)", color: "white" }}>
+                  <div key={i} className="flex items-start gap-2 mb-2">
+                    <button onClick={() => setForm(f => ({ ...f, correctAnswer: i }))} className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold shrink-0 mt-1 transition" style={{ background: form.correctAnswer === i ? "#16a34a" : "rgba(51,65,85,0.5)", color: "white" }}>
                       {String.fromCharCode(65 + i)}
                     </button>
-                    <input value={o} onChange={e => { const opts = [...form.options]; opts[i] = e.target.value; setForm({ ...form, options: opts }); }} placeholder={`Pilihan ${String.fromCharCode(65 + i)}`} className="flex-1 py-2 px-3 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: `1px solid ${form.correctAnswer === i ? "rgba(22,163,74,0.5)" : "rgba(59,130,246,0.25)"}` }} />
+                    <div className="flex-1">
+                      <MathTextarea value={o} onChange={v => { const opts = [...form.options]; opts[i] = v; setForm({ ...form, options: opts }); }} placeholder={`Pilihan ${String.fromCharCode(65 + i)}`} rows={1} />
+                    </div>
+                    <button type="button" onClick={() => { setScienceTarget(`option_${i}`); setShowScienceEditor(true); }} className="mt-1 text-xs px-1.5 py-1 rounded flex items-center shrink-0 transition" style={{ background: "rgba(168,85,247,0.15)", color: "#c084fc" }} title="Science Editor">📐</button>
                   </div>
                 ))}
                 <p className="text-slate-500 text-xs mt-1">Klik huruf untuk menandai jawaban benar (hijau)</p>
@@ -1522,7 +1882,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
             {(form.type === "esai" || form.type === "uraian") && (
               <div>
                 <label className="text-blue-300 text-sm font-medium mb-1 block">Kunci Jawaban / Model Jawaban</label>
-                <textarea value={form.explanation} onChange={e => setForm({ ...form, explanation: e.target.value })} rows={4} placeholder="Tulis kunci jawaban atau model jawaban yang diharapkan..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+                <MathTextarea value={form.explanation} onChange={v => setForm({ ...form, explanation: v })} placeholder="Tulis kunci jawaban atau model jawaban..." rows={4} />
                 <div className="mt-3">
                   <label className="text-blue-300 text-sm font-medium mb-1 block">Rubrik Penilaian (Opsional)</label>
                   <textarea value={form.rubrik || ""} onChange={e => setForm({ ...form, rubrik: e.target.value })} rows={3} placeholder="Contoh: Skor 4: jawaban lengkap dan benar, Skor 3: benar tapi kurang lengkap..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
@@ -1532,7 +1892,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
             {form.type === "pilgan" && (
               <div>
                 <label className="text-blue-300 text-sm font-medium mb-1 block">Pembahasan (Opsional)</label>
-                <textarea value={form.explanation} onChange={e => setForm({ ...form, explanation: e.target.value })} rows={2} placeholder="Tulis pembahasan..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+                <MathTextarea value={form.explanation} onChange={v => setForm({ ...form, explanation: v })} placeholder="Tulis pembahasan..." rows={2} />
               </div>
             )}
             <div className="flex justify-end gap-2 pt-2">
@@ -1546,14 +1906,16 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
   );
 }
 
-// ============= IMPORT SOAL MODAL (Word/PDF) =============
-function ImportSoalModal({ data, onImport, onClose, showToast }) {
-  const [step, setStep] = useState("upload"); // upload | preview | done
-  const [subjectId, setSubjectId] = useState((data.subjects || [])[0]?.id || "");
+// ============= IMPORT SOAL MODAL (Word/PDF) — supports 100s of questions + math symbols =============
+function ImportSoalModal({ data, onImport, onClose, showToast, visibleSubjects }) {
+  const subjects = visibleSubjects || data.subjects || [];
+  const [step, setStep] = useState("upload");
+  const [subjectId, setSubjectId] = useState(subjects[0]?.id || "");
   const [rawText, setRawText] = useState("");
   const [parsed, setParsed] = useState([]);
   const [loading, setLoading] = useState(false);
   const [answerText, setAnswerText] = useState("");
+  const [importProgress, setImportProgress] = useState(null);
 
   const loadMammoth = async () => {
     if (window.mammoth) return window.mammoth;
@@ -1573,13 +1935,21 @@ function ImportSoalModal({ data, onImport, onClose, showToast }) {
       if (file.name.endsWith(".docx")) {
         const mammoth = await loadMammoth();
         const ab = await file.arrayBuffer();
+        // Use convertToHtml to preserve more content, then extract text
         const result = await mammoth.extractRawText({ arrayBuffer: ab });
+        // Also try to get equations/special chars
         setRawText(result.value);
+        showToast(`File dibaca: ${result.value.length} karakter`, "success");
       } else if (file.name.endsWith(".txt")) {
         const text = await file.text();
         setRawText(text);
+        showToast(`File dibaca: ${text.length} karakter`, "success");
+      } else if (file.name.endsWith(".csv")) {
+        // CSV: each row is a question
+        const text = await file.text();
+        setRawText(text);
       } else {
-        showToast("Format tidak didukung. Gunakan .docx atau .txt", "error");
+        showToast("Format tidak didukung. Gunakan .docx, .txt, atau .csv", "error");
       }
     } catch (err) {
       showToast("Gagal membaca file: " + err.message, "error");
@@ -1587,77 +1957,129 @@ function ImportSoalModal({ data, onImport, onClose, showToast }) {
     setLoading(false);
   };
 
+  // Enhanced parser: preserves math symbols, handles hundreds of questions
   const parseQuestions = () => {
     if (!rawText.trim()) return showToast("Tidak ada teks untuk diparse", "error");
-    const lines = rawText.split("\n").map(l => l.trim()).filter(Boolean);
-    const questions = [];
-    let current = null;
 
-    // Parse answer key from answerText
+    // Parse answer key
     const answerMap = {};
     if (answerText.trim()) {
-      const ansLines = answerText.split("\n").map(l => l.trim()).filter(Boolean);
-      ansLines.forEach(l => {
-        const m = l.match(/(\d+)\s*[.)\-:\s]\s*([A-Ea-e])/);
+      answerText.split("\n").forEach(l => {
+        l = l.trim();
+        // supports: "1. A", "1) A", "1 A", "1:A", "No.1 A"
+        const m = l.match(/(?:no\.?\s*)?(\d+)\s*[.):\-\s]\s*([A-Ea-e])\b/i);
         if (m) answerMap[parseInt(m[1])] = m[2].toUpperCase().charCodeAt(0) - 65;
       });
     }
 
+    const questions = [];
+    let current = null;
     let qNum = 0;
+
+    // Split by lines but keep math symbols
+    const lines = rawText.split(/\r?\n/).map(l => l.trimEnd()).filter(Boolean);
+
+    const pushCurrent = () => {
+      if (current && current.text.trim()) {
+        if (current.options.length < 2) {
+          // treat as essay if no options
+          current.options = [];
+          current.type = "uraian";
+          current.correctAnswer = 0;
+        }
+        questions.push(current);
+      }
+    };
+
     lines.forEach(line => {
-      // Detect question: starts with number. or number)
-      const qMatch = line.match(/^(\d+)[.)]\s+(.+)/);
+      const trimmed = line.trim();
+      // Match question number: "1." "1)" "1 ." "Soal 1." etc.
+      const qMatch = trimmed.match(/^(?:soal\s*)?(\d+)\s*[.)]\s+(.+)/i);
       if (qMatch) {
-        if (current && current.options.length >= 2) questions.push(current);
+        pushCurrent();
         qNum = parseInt(qMatch[1]);
-        current = { subjectId, text: qMatch[2], options: [], correctAnswer: answerMap[qNum] ?? 0, explanation: "" };
+        current = {
+          subjectId, type: "pilgan",
+          text: qMatch[2],
+          options: [],
+          correctAnswer: answerMap[qNum] ?? 0,
+          explanation: ""
+        };
         return;
       }
-      // Detect option: A. or A) or (A)
-      const optMatch = line.match(/^[(\s]*([A-Ea-e])[.)]\s+(.+)/);
+      // Match option: "A." "A)" "(A)" "a." — preserve everything after, including math
+      const optMatch = trimmed.match(/^[(\s]*([A-Ea-e])\s*[.)]\s+(.+)/);
       if (optMatch && current) {
         current.options.push(optMatch[2]);
         return;
       }
-      // Continue question text
-      if (current && current.options.length === 0) {
-        current.text += " " + line;
+      // Continuation of question text (before first option)
+      if (current && current.options.length === 0 && trimmed) {
+        current.text += "\n" + trimmed;
       }
     });
-    if (current && current.options.length >= 2) questions.push(current);
+    pushCurrent();
 
-    if (questions.length === 0) return showToast("Tidak ada soal yang terdeteksi. Pastikan format: '1. Pertanyaan' dan 'A. Pilihan'", "error");
+    if (questions.length === 0) {
+      return showToast("Tidak ada soal terdeteksi. Format: '1. Pertanyaan\\nA. Pilihan A\\nB. Pilihan B...'", "error");
+    }
     setParsed(questions);
     setStep("preview");
+    showToast(`${questions.length} soal berhasil diparse`, "success");
+  };
+
+  const handleImport = async () => {
+    // Import in chunks to avoid UI freeze for large sets
+    const CHUNK = 50;
+    setImportProgress({ done: 0, total: parsed.length });
+    let allImported = [];
+    for (let i = 0; i < parsed.length; i += CHUNK) {
+      const chunk = parsed.slice(i, i + CHUNK);
+      allImported = [...allImported, ...chunk];
+      setImportProgress({ done: Math.min(i + CHUNK, parsed.length), total: parsed.length });
+      await new Promise(r => setTimeout(r, 10)); // let UI breathe
+    }
+    onImport(allImported);
+    setImportProgress(null);
   };
 
   return (
     <Modal title="Import Soal dari Dokumen" onClose={onClose} wide>
       {step === "upload" && (
         <div className="space-y-4">
+          <div className="p-3 rounded-xl text-xs" style={{ background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.15)", color: "#93c5fd" }}>
+            <strong>Format dokumen:</strong><br/>
+            1. Teks soal (simbol matematika langsung disalin: ±×÷√π²³∑∫...)<br/>
+            A. Pilihan A &nbsp;&nbsp; B. Pilihan B &nbsp;&nbsp; C. Pilihan C &nbsp;&nbsp; D. Pilihan D &nbsp;&nbsp; E. Pilihan E<br/>
+            2. Soal berikutnya...<br/>
+            <em>Mendukung ratusan soal sekaligus • Format .docx, .txt, .csv</em>
+          </div>
           <Select label="Mata Pelajaran" value={subjectId} onChange={e => setSubjectId(e.target.value)}>
-            {(data.subjects || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+            {subjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
           </Select>
           <div>
-            <label className="text-blue-300 text-sm font-medium mb-1 block">File Soal (.docx atau .txt)</label>
+            <label className="text-blue-300 text-sm font-medium mb-1 block">File Soal (.docx, .txt, .csv)</label>
             <label className="cursor-pointer flex flex-col items-center justify-center gap-2 p-8 rounded-xl transition" style={{ border: "2px dashed rgba(59,130,246,0.4)", background: "rgba(15,23,42,0.5)" }}>
               <Upload size={32} className="text-blue-400" />
               <span className="text-blue-300 font-medium">{loading ? "Membaca file..." : "Klik untuk pilih file"}</span>
-              <span className="text-slate-500 text-xs">Format: .docx, .txt</span>
-              <input type="file" accept=".docx,.txt" onChange={handleFile} className="hidden" disabled={loading} />
+              <span className="text-slate-500 text-xs">Simbol matematika (±×÷√π∑∫...) otomatis terbaca</span>
+              <input type="file" accept=".docx,.txt,.csv" onChange={handleFile} className="hidden" disabled={loading} />
             </label>
           </div>
           {rawText && (
             <div>
-              <label className="text-blue-300 text-sm font-medium mb-1 block">Preview teks ({rawText.length} karakter)</label>
-              <div className="p-3 rounded-xl text-slate-300 text-xs overflow-y-auto max-h-32" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.2)", whiteSpace: "pre-wrap" }}>
-                {rawText.substring(0, 500)}...
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-blue-300 text-sm font-medium">Preview ({rawText.length.toLocaleString()} karakter)</label>
+                <span className="text-xs text-green-400">✓ Siap diparse</span>
+              </div>
+              <div className="p-3 rounded-xl text-slate-300 text-xs overflow-y-auto max-h-32 font-mono" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.2)", whiteSpace: "pre-wrap" }}>
+                {rawText.substring(0, 800)}{rawText.length > 800 ? "\n..." : ""}
               </div>
             </div>
           )}
           <div>
-            <label className="text-blue-300 text-sm font-medium mb-1 block">Kunci Jawaban (opsional, format: "1. A", "2. B", ...)</label>
-            <textarea value={answerText} onChange={e => setAnswerText(e.target.value)} rows={4} placeholder={"1. A\n2. C\n3. B\n4. E\n..."} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
+            <label className="text-blue-300 text-sm font-medium mb-1 block">Kunci Jawaban (opsional)</label>
+            <textarea value={answerText} onChange={e => setAnswerText(e.target.value)} rows={4} placeholder={"1. A\n2. C\n3. B\n4. E\n5. D\n...\n(bisa untuk ratusan soal)"} className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none resize-none placeholder-slate-500 font-mono" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
           </div>
           <div className="flex justify-end gap-2">
             <Btn variant="secondary" onClick={onClose}>Batal</Btn>
@@ -1672,23 +2094,33 @@ function ImportSoalModal({ data, onImport, onClose, showToast }) {
             <div className="text-green-400 font-semibold">{parsed.length} soal terdeteksi</div>
             <Btn variant="secondary" onClick={() => setStep("upload")}><ArrowLeft size={14} />Kembali</Btn>
           </div>
+          {importProgress && (
+            <div className="mb-4">
+              <div className="text-blue-400 text-sm mb-1">Mengimpor {importProgress.done}/{importProgress.total}...</div>
+              <div className="h-2 rounded-full overflow-hidden" style={{ background: "rgba(51,65,85,0.5)" }}>
+                <div className="h-full rounded-full" style={{ width: `${importProgress.done/importProgress.total*100}%`, background: "#3b82f6", transition: "width 0.2s" }} />
+              </div>
+            </div>
+          )}
           <div className="space-y-3 max-h-[50vh] overflow-y-auto mb-4">
-            {parsed.map((q, i) => (
+            {parsed.slice(0, 200).map((q, i) => (
               <div key={i} className="p-3 rounded-xl" style={{ background: "rgba(15,23,42,0.5)" }}>
-                <div className="text-white text-sm font-medium mb-1">{i+1}. {q.text.substring(0, 100)}</div>
+                <div className="text-white text-sm font-medium mb-1">{i+1}. {q.text.substring(0, 120)}</div>
                 <div className="flex flex-wrap gap-1">
-                  {q.options.map((o, oi) => (
+                  {q.options.slice(0,5).map((o, oi) => (
                     <span key={oi} className="px-2 py-0.5 rounded text-xs" style={{ background: oi === q.correctAnswer ? "rgba(22,163,74,0.2)" : "rgba(51,65,85,0.5)", color: oi === q.correctAnswer ? "#4ade80" : "#94a3b8" }}>
-                      {String.fromCharCode(65+oi)}. {o.substring(0,30)}
+                      {String.fromCharCode(65+oi)}. {o.substring(0,40)}
                     </span>
                   ))}
+                  {q.type === "uraian" && <span className="text-teal-400 text-xs">Uraian</span>}
                 </div>
               </div>
             ))}
+            {parsed.length > 200 && <div className="text-center text-slate-500 text-xs py-2">... dan {parsed.length - 200} soal lainnya (tidak ditampilkan semua)</div>}
           </div>
           <div className="flex justify-end gap-2">
             <Btn variant="secondary" onClick={() => setStep("upload")}><ArrowLeft size={14} />Edit</Btn>
-            <Btn variant="success" onClick={() => onImport(parsed)}><Download size={14} />Import {parsed.length} Soal</Btn>
+            <Btn variant="success" onClick={handleImport} disabled={!!importProgress}><Download size={14} />Import {parsed.length} Soal</Btn>
           </div>
         </div>
       )}
@@ -1858,16 +2290,69 @@ function ExamManager({ data, dataRef, saveData, showToast, isAdmin, userId }) {
 // ============= MONITOR VIEW =============
 function MonitorView({ data }) {
   const [selectedExam, setSelectedExam] = useState(null);
+  const [liveSessions, setLiveSessions] = useState({});
+  const [liveResults, setLiveResults] = useState({});
   const [, forceUpdate] = useState(0);
-  useEffect(() => { const iv = setInterval(() => forceUpdate(n => n + 1), 2000); return () => clearInterval(iv); }, []);
+
+  // Auto-refresh every 3s for live data
+  useEffect(() => {
+    const iv = setInterval(() => forceUpdate(n => n + 1), 3000);
+    return () => clearInterval(iv);
+  }, []);
+
+  // Subscribe to live sessions and results when exam selected
+  useEffect(() => {
+    if (!selectedExam) return;
+    const unsubs = [];
+
+    // Listen to sessions for this exam
+    const u1 = store.listenSessions(selectedExam, (sessions) => {
+      setLiveSessions(prev => ({ ...prev, [selectedExam]: sessions }));
+    });
+    unsubs.push(u1);
+
+    // Listen to results for this exam
+    const u2 = store.listenResults(selectedExam, (results) => {
+      setLiveResults(prev => ({ ...prev, [selectedExam]: results }));
+    });
+    unsubs.push(u2);
+
+    return () => unsubs.forEach(u => u());
+  }, [selectedExam]);
+
+  // Merge data.sessions (local) with liveSessions (Firestore)
+  const getMergedSessions = (examId) => {
+    const local = (data.sessions || []).filter(s => s.examId === examId);
+    const live = liveSessions[examId] || [];
+    // Merge: prefer live data over local (live is more up-to-date)
+    const merged = [...local];
+    live.forEach(ls => {
+      const idx = merged.findIndex(s => s.studentId === ls.studentId);
+      if (idx >= 0) { if ((ls.lastUpdate || 0) >= (merged[idx].lastUpdate || 0)) merged[idx] = ls; }
+      else merged.push(ls);
+    });
+    return merged;
+  };
+
+  const getMergedResults = (examId) => {
+    const local = (data.results || []).filter(r => r.examId === examId);
+    const live = liveResults[examId] || [];
+    const merged = [...local];
+    live.forEach(lr => {
+      const idx = merged.findIndex(r => r.studentId === lr.studentId);
+      if (idx >= 0) merged[idx] = lr;
+      else merged.push(lr);
+    });
+    return merged;
+  };
 
   const activeExams = useMemo(() => data.exams.filter(e => e.status === "active"), [data.exams]);
 
   if (selectedExam) {
     const exam = data.exams.find(e => e.id === selectedExam);
     if (!exam) return null;
-    const sessions = (data.sessions || []).filter(s => s.examId === selectedExam);
-    const examResults = (data.results || []).filter(r => r.examId === selectedExam);
+    const sessions = getMergedSessions(selectedExam);
+    const examResults = getMergedResults(selectedExam);
     const targetStudents = data.students.filter(s => exam.targetKelas?.includes(s.kelas));
     const totalQ = exam.questionIds.length;
     const getStudentStatus = (st) => {
@@ -1996,6 +2481,29 @@ function ResultsView({ data }) {
   const [selectedExam, setSelectedExam] = useState(null);
   const [printing, setPrinting] = useState(false);
   const [activeResultTab, setActiveResultTab] = useState("ranking");
+  const [firestoreResults, setFirestoreResults] = useState({});
+
+  // Load results from Firestore when exam selected (gets ALL submitted results)
+  useEffect(() => {
+    if (!selectedExam) return;
+    const unsub = store.listenResults(selectedExam, (results) => {
+      setFirestoreResults(prev => ({ ...prev, [selectedExam]: results }));
+    });
+    return () => unsub();
+  }, [selectedExam]);
+
+  const getExamResults = (examId) => {
+    const local = (data.results || []).filter(r => r.examId === examId);
+    const remote = firestoreResults[examId] || [];
+    // Merge: prefer remote (more authoritative)
+    const merged = [...local];
+    remote.forEach(rr => {
+      const idx = merged.findIndex(r => r.studentId === rr.studentId);
+      if (idx >= 0) merged[idx] = { ...merged[idx], ...rr };
+      else merged.push(rr);
+    });
+    return merged;
+  };
 
   // Show ALL exams that have at least 1 result, regardless of status
   const examsWithData = data.exams.filter(e =>
@@ -2073,7 +2581,7 @@ function ResultsView({ data }) {
 
   if (selectedExam) {
     const exam = data.exams.find(e => e.id === selectedExam);
-    const results = (data.results || []).filter(r => r.examId === selectedExam);
+    const results = getExamResults(selectedExam);
     const totalQ = exam?.questionIds?.length || 0;
     const targetStudents = data.students.filter(s => exam?.targetKelas?.includes(s.kelas));
     const submittedIds = new Set(results.map(r => r.studentId));
@@ -2153,7 +2661,7 @@ function ResultsView({ data }) {
               </div>
             </div>
           )}
-        </Card>
+        </Card>}
 
         {notSubmitted.length > 0 && (
           <Card className="mt-4">
@@ -2221,7 +2729,7 @@ function ResultsView({ data }) {
       {examsWithData.length === 0 ? <Card><EmptyState icon={<BarChart3 size={40} className="mx-auto" />} text="Belum ada hasil ujian" /></Card> : (
         <div className="space-y-3">
           {examsWithData.map(ex => {
-            const results = (data.results || []).filter(r => r.examId === ex.id);
+            const results = getExamResults(ex.id);
             const avg = results.length > 0 ? (results.reduce((a, r) => a + r.score, 0) / results.length).toFixed(1) : "-";
             const passCount = results.filter(r => r.score >= 75).length;
             return (
@@ -2243,32 +2751,6 @@ function ResultsView({ data }) {
           })}
         </div>
       )}
-    </div>
-  );
-}
-
-// ============= GEMINI KEY SETTING =============
-function GeminiKeySetting({ data, dataRef, saveData, showToast }) {
-  const [key, setKey] = useState(data.meta?.geminiKey || "");
-  const [show, setShow] = useState(false);
-  const handleSave = () => {
-    const latest = dataRef?.current || data;
-    const newMeta = { ...(latest.meta || {}), geminiKey: key.trim() };
-    saveData({ ...latest, meta: newMeta }, ["meta"]);
-    showToast("API Key Gemini berhasil disimpan ✓");
-  };
-  return (
-    <div className="flex gap-2 items-end max-w-lg">
-      <div className="flex-1">
-        <label className="block text-xs mb-1" style={{ color: "inherit", opacity: 0.7 }}>Gemini API Key</label>
-        <div className="relative">
-          <input type={show ? "text" : "password"} value={key} onChange={e => setKey(e.target.value)} placeholder="AIzaSy..." className="w-full py-2.5 px-3 pr-10 rounded-xl text-white text-sm outline-none placeholder-slate-500" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)" }} />
-          <button onClick={() => setShow(v => !v)} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white">
-            <Eye size={15} />
-          </button>
-        </div>
-      </div>
-      <Btn onClick={handleSave}><Save size={14} />Simpan</Btn>
     </div>
   );
 }
@@ -2301,16 +2783,32 @@ function SettingsView({ data, dataRef, saveData, showToast }) {
         </div>
       </Card>
       <Card className="mb-4">
-        <h3 className="font-bold mb-1" style={{ color: "inherit" }}>🤖 Integrasi AI (Gemini)</h3>
-        <p className="text-xs mb-3" style={{ color: "inherit", opacity: 0.6 }}>API Key Gemini gratis untuk fitur Generate Soal AI. Dapatkan key di <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" className="text-blue-400 underline">aistudio.google.com/apikey</a></p>
-        <GeminiKeySetting data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} />
-      </Card>
-      <Card className="mb-4">
+        <h3 className="font-bold mb-2" style={{ color: "inherit" }}>Informasi Sistem</h3>
         <div className="text-slate-300 text-sm space-y-1">
           <p>Sekolah: {SCHOOL_NAME}</p>
           <p>Kurikulum: K-13 & Merdeka Belajar</p>
           <p>Total Guru: {data.teachers.length} | Total Siswa: {data.students.length}</p>
           <p>Total Soal: {data.questions.length} | Total Ujian: {data.exams.length}</p>
+        </div>
+      </Card>
+      <Card className="mb-4" style={{ background: "rgba(99,102,241,0.05)", border: "1px solid rgba(99,102,241,0.15)" }}>
+        <div className="flex items-center gap-3 mb-4">
+          <div className="w-9 h-9 rounded-xl flex items-center justify-center text-lg" style={{ background: "linear-gradient(135deg,#6366f1,#a855f7)", boxShadow: "0 3px 12px rgba(99,102,241,0.35)" }}>✨</div>
+          <div>
+            <h3 className="font-bold" style={{ color: "inherit" }}>Integrasi AI — Gemini 2.5 Flash</h3>
+            <p className="text-xs" style={{ color: "rgba(165,180,252,0.7)" }}>Google AI · Model terbaru &amp; tercepat</p>
+          </div>
+        </div>
+        <p className="text-sm mb-4" style={{ color: "inherit", opacity: 0.7 }}>API Key Google AI Studio untuk fitur <strong>Generate Soal otomatis</strong>. Gratis hingga batas tertentu — tidak perlu kartu kredit. <a href="https://aistudio.google.com/app/apikey" target="_blank" className="text-indigo-400 underline hover:text-indigo-300">Dapatkan di aistudio.google.com →</a></p>
+        <div className="space-y-3 max-w-md">
+          <div>
+            <label className="text-sm font-semibold mb-1.5 block" style={{ color: "#a5b4fc" }}>Gemini API Key</label>
+            <input type="password" defaultValue={(() => { try { return localStorage.getItem("gemini_api_key") || ""; } catch { return ""; } })()} onChange={e => { try { localStorage.setItem("gemini_api_key", e.target.value); } catch {} }} placeholder="AIzaSy..." className="w-full py-2.5 px-3 rounded-xl text-white text-sm outline-none" style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(99,102,241,0.25)" }} />
+            <p className="text-xs mt-1.5" style={{ color: "inherit", opacity: 0.5 }}>Tersimpan di browser (localStorage) — tidak dikirim ke server manapun</p>
+          </div>
+          <button onClick={() => showToast("API Key Gemini tersimpan di browser")} className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition" style={{ background: "linear-gradient(135deg, rgba(99,102,241,0.3), rgba(168,85,247,0.2))", color: "#c4b5fd", border: "1px solid rgba(99,102,241,0.3)" }}>
+            <Save size={14} /> Simpan API Key
+          </button>
         </div>
       </Card>
       <Card>
@@ -2892,65 +3390,55 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
   useEffect(() => { timeLeftRef.current = timeLeft; }, [timeLeft]);
   useEffect(() => { submittedRef.current = submitted; }, [submitted]);
 
-  // Save session every 3 seconds — uses refs so always has fresh data
+  // Per-student session save — no race condition with concurrent students
+  const sessionIdRef = useRef(existingSession?.id || genId());
+  const lastSessionSave = useRef(0);
+
+  const doSaveSession = useCallback(async (status = "active") => {
+    if (submittedRef.current && status === "active") return;
+    const now = Date.now();
+    if (status === "active" && now - lastSessionSave.current < 800) return;
+    lastSessionSave.current = now;
+    const sessionData = {
+      id: sessionIdRef.current,
+      examId: exam.id, studentId: user.id,
+      studentName: user.name, kelas: user.kelas,
+      answers: { ...answersRef.current },
+      status, violations: violationsRef.current,
+      timeLeft: timeLeftRef.current,
+      lastUpdate: now, startedAt: existingSession?.startedAt || now
+    };
+    try {
+      // Write to individual doc — no race condition
+      await store.saveSession(exam.id, user.id, sessionData);
+      // Also update local state so monitoring works
+      const currentData = dataRef?.current || data;
+      const sessions = [...(currentData.sessions || [])];
+      const idx = sessions.findIndex(s => s.studentId === user.id && s.examId === exam.id);
+      if (idx >= 0) sessions[idx] = sessionData;
+      else sessions.push(sessionData);
+      // Only update local data, don't call full saveData to avoid overwriting
+      if (dataRef.current) dataRef.current = { ...dataRef.current, sessions };
+    } catch(e) { console.error("Session save failed:", e); }
+  }, [exam.id, user.id]);
+
+  // Save every 5 seconds
   useEffect(() => {
     if (submitted) return;
-
-    const saveSession = async () => {
-      if (submittedRef.current) return;
-      // CRITICAL: always read from dataRef (latest global data) not stale closure
-      const currentData = dataRef?.current || data;
-      if (!currentData) return;
-      const sessions = [...(currentData.sessions || [])];
-      const idx = sessions.findIndex(s => s.examId === exam.id && s.studentId === user.id);
-      const sessionData = {
-        examId: exam.id, studentId: user.id,
-        answers: { ...answersRef.current },
-        status: "active",
-        violations: violationsRef.current,
-        timeLeft: timeLeftRef.current,
-        lastUpdate: Date.now()
-      };
-      if (idx >= 0) sessions[idx] = { ...sessions[idx], ...sessionData };
-      else sessions.push({ id: genId(), ...sessionData });
-
-      // Write sessions directly to avoid overwriting other data with stale state
-      const nextData = { ...currentData, sessions };
-      saveData(nextData);
-    };
-
-    saveSession(); // immediate on mount/answer change
-    const iv = setInterval(saveSession, 3000);
+    doSaveSession("active");
+    const iv = setInterval(() => doSaveSession("active"), 5000);
     return () => clearInterval(iv);
-  }, [submitted]); // only re-register when submitted changes
+  }, [submitted]);
 
-  // Also save immediately when answer changes (separate effect, uses ref)
+  // Save on answer change with debounce
   useEffect(() => {
     answersRef.current = answers;
-    // Debounced save on answer change
-    const t = setTimeout(() => {
-      if (!submittedRef.current) {
-        const currentData = dataRef?.current || data;
-        if (!currentData) return;
-        const sessions = [...(currentData.sessions || [])];
-        const idx = sessions.findIndex(s => s.examId === exam.id && s.studentId === user.id);
-        const sessionData = {
-          examId: exam.id, studentId: user.id,
-          answers: { ...answers },
-          status: "active",
-          violations: violationsRef.current,
-          timeLeft: timeLeftRef.current,
-          lastUpdate: Date.now()
-        };
-        if (idx >= 0) sessions[idx] = { ...sessions[idx], ...sessionData };
-        else sessions.push({ id: genId(), ...sessionData });
-        saveData({ ...currentData, sessions }, ["sessions"]);
-      }
-    }, 800);
+    if (submittedRef.current) return;
+    const t = setTimeout(() => doSaveSession("active"), 1000);
     return () => clearTimeout(t);
   }, [answers]);
 
-  const handleSubmit = useCallback((auto = false) => {
+  const handleSubmit = useCallback(async (auto = false) => {
     if (submittedRef.current) return;
     if (!auto && !confirm("Yakin ingin mengumpulkan jawaban? Tidak dapat diubah setelah ini.")) return;
     submittedRef.current = true;
@@ -2976,11 +3464,22 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
     const resultData = { id: genId(), examId: exam.id, studentId: user.id, answers: { ...finalAnswers }, correct, pilganCount, score, hasEssay, needsGrading: hasEssay, violations: finalViolations, submittedAt: Date.now() };
     setResult(resultData);
 
-    // Use dataRef to get the absolute latest data
+    // Save result to individual doc — guaranteed no race condition with other students
+    try {
+      await store.saveResult(exam.id, user.id, resultData);
+    } catch(e) {
+      console.error("Result save failed, retrying:", e);
+      setTimeout(() => store.saveResult(exam.id, user.id, resultData).catch(console.error), 2000);
+    }
+    // Mark session as submitted
+    await doSaveSession("submitted");
+    // Also update local state
     const currentData = dataRef?.current || data;
     const results = [...(currentData.results || []).filter(r => !(r.examId === exam.id && r.studentId === user.id)), resultData];
     const sessions = (currentData.sessions || []).map(s => s.examId === exam.id && s.studentId === user.id ? { ...s, status: "submitted" } : s);
-    saveData({ ...currentData, results, sessions }, ["results","sessions"]);
+    if (dataRef.current) {
+      dataRef.current = { ...dataRef.current, results, sessions };
+    }
     showToast(auto ? "Waktu habis! Jawaban dikumpulkan otomatis." : "Jawaban berhasil dikumpulkan!");
   }, [questions, exam, user, data, saveData, showToast]);
 

@@ -12,6 +12,62 @@ const THEME_KEY = "sman6_theme";
 const SESSION_KEY = "sman6_user_session";
 const BACKUP_KEY = "sman6_data_backup";
 const CACHE_KEY = "sman6_data_cache";
+const BACKUP_LS_KEYS = ["sman6_backup_1","sman6_backup_2","sman6_backup_3"]; // rotating local backups
+let backupLsIdx = 0;
+
+// ============= BACKUP SYSTEM =============
+// Saves 3 rotating local backups + 1 Firebase backup
+const backupSystem = {
+  // Save to all 3 rotating localStorage slots
+  saveLocal(data) {
+    try {
+      const payload = JSON.stringify({ data, ts: Date.now(), v: 1 });
+      localStorage.setItem(BACKUP_LS_KEYS[backupLsIdx % 3], payload);
+      backupLsIdx++;
+    } catch(e) { console.warn("Backup local failed", e); }
+  },
+  // Read best available local backup (most recent valid one)
+  loadBestLocal() {
+    let best = null;
+    for (const key of BACKUP_LS_KEYS) {
+      try {
+        const raw = localStorage.getItem(key);
+        if (!raw) continue;
+        const parsed = JSON.parse(raw);
+        if (!parsed?.data) continue;
+        const d = parsed.data;
+        const hasRealData = (d.teachers?.length > 0) || (d.students?.length > 0) || (d.questions?.length > 0);
+        if (!hasRealData) continue;
+        if (!best || parsed.ts > best.ts) best = parsed;
+      } catch {}
+    }
+    return best?.data || null;
+  },
+  // Download backup as JSON file
+  downloadJSON(data) {
+    try {
+      const blob = new Blob([JSON.stringify({ data, ts: Date.now(), exported: new Date().toISOString() }, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `backup-sman6-${new Date().toISOString().slice(0,10)}.json`; a.click();
+      URL.revokeObjectURL(url);
+    } catch(e) { console.error("Download backup failed", e); }
+  },
+  // Import from JSON file
+  async importJSON(file) {
+    return new Promise((res, rej) => {
+      const reader = new FileReader();
+      reader.onload = e => {
+        try {
+          const parsed = JSON.parse(e.target.result);
+          res(parsed?.data || parsed);
+        } catch { rej(new Error("File tidak valid")); }
+      };
+      reader.onerror = () => rej(new Error("Gagal membaca file"));
+      reader.readAsText(file);
+    });
+  }
+};
 
 // Safe deep-merge: never overwrites non-empty arrays with empty ones
 function safeMerge(base, remote) {
@@ -141,6 +197,40 @@ const store = {
       err => console.error("listenSessions", err)
     );
   },
+  // ---- BACKUP to Firebase (separate collection, never overwritten by reset) ----
+  async saveBackup(data) {
+    try {
+      const snapshot = {
+        teachers: data.teachers || [],
+        students: data.students || [],
+        questions: data.questions || [],
+        exams: data.exams || [],
+        subjects: data.subjects || [],
+        meta: data.meta || {},
+        ts: Date.now(),
+        date: new Date().toISOString(),
+      };
+      // Only backup if there's real data
+      const hasData = snapshot.teachers.length > 0 || snapshot.students.length > 0 || snapshot.questions.length > 0;
+      if (!hasData) return;
+      await setDoc(doc(db, "backups2", "latest"), snapshot);
+      // Also save a timestamped slot (keep last 3)
+      const slot = "slot_" + (Math.floor(Date.now() / 1000) % 3);
+      await setDoc(doc(db, "backups2", slot), snapshot);
+    } catch(e) { console.warn("Firebase backup failed (non-critical):", e); }
+  },
+  async loadBackup() {
+    try {
+      const snap = await getDoc(doc(db, "backups2", "latest"));
+      if (snap.exists()) return snap.data();
+      // Try slots
+      for (const slot of ["slot_0","slot_1","slot_2"]) {
+        const s = await getDoc(doc(db, "backups2", slot));
+        if (s.exists()) return s.data();
+      }
+      return null;
+    } catch(e) { console.warn("Load Firebase backup failed:", e); return null; }
+  },
   async saveResult(examId, studentId, resultData) {
     const key = examId + "_" + studentId;
     try { await setDoc(doc(db, "results2", key), { ...resultData, _key: key, ts: Date.now() }); }
@@ -217,9 +307,16 @@ export default function ExamApp() {
     (async () => {
       // 1. Instant cache load
       const cached = ls.get(CACHE_KEY);
-      if (cached && (cached.teachers || cached.questions || cached.exams)) {
+      if (cached && (cached.teachers?.length || cached.questions?.length || cached.exams?.length)) {
         setData({ ...DEFAULT_DATA, ...cached });
         setLoading(false);
+      } else {
+        // Try rotating backups before showing empty state
+        const localBackup = backupSystem.loadBestLocal();
+        if (localBackup) {
+          setData({ ...DEFAULT_DATA, ...localBackup });
+          setLoading(false);
+        }
       }
 
       // 2. Load all collections in parallel
@@ -247,6 +344,16 @@ export default function ExamApp() {
         });
       } catch(e) {
         console.error("Load error:", e);
+        // Try Firebase backup first
+        const fbBackup = await store.loadBackup().catch(() => null);
+        if (fbBackup && (fbBackup.teachers?.length || fbBackup.students?.length || fbBackup.questions?.length)) {
+          setData({ ...DEFAULT_DATA, ...fbBackup });
+          setLoading(false);
+          return;
+        }
+        // Fall back to rotating localStorage backups
+        const localBest = backupSystem.loadBestLocal();
+        if (localBest) { setData({ ...DEFAULT_DATA, ...localBest }); setLoading(false); return; }
         const backup = ls.get(BACKUP_KEY) || ls.get(CACHE_KEY);
         if (backup) setData({ ...DEFAULT_DATA, ...backup });
         setLoading(false);
@@ -282,6 +389,8 @@ export default function ExamApp() {
     setData(newData);
     ls.set(CACHE_KEY, newData);
     ls.set(BACKUP_KEY, newData);
+    // --- BACKUP SYSTEM: save to rotating localStorage slots ---
+    backupSystem.saveLocal(newData);
     const toSave = hints || COLS.filter(col => {
       const prev = dataRef.current;
       return newData[col] !== undefined && (!prev || JSON.stringify(newData[col]) !== JSON.stringify(prev[col]));
@@ -295,6 +404,8 @@ export default function ExamApp() {
         store.setCol(col, newData[col]).catch(console.error);
       }
     }));
+    // --- BACKUP SYSTEM: async Firebase backup (non-blocking) ---
+    store.saveBackup(newData).catch(console.warn);
   }, []);
 
 
@@ -2758,6 +2869,9 @@ function ResultsView({ data }) {
 // ============= SETTINGS (ADMIN) =============
 function SettingsView({ data, dataRef, saveData, showToast }) {
   const [pw, setPw] = useState({ old: "", new1: "", new2: "" });
+  const [recovering, setRecovering] = useState(false);
+  const [backupInfo, setBackupInfo] = useState(null);
+
   const handleChangePw = () => {
     const latest = dataRef?.current || data;
     const adminCred2 = latest.meta?.admin || latest.admin || {};
@@ -2768,6 +2882,45 @@ function SettingsView({ data, dataRef, saveData, showToast }) {
     saveData({ ...latest, meta: newMeta2 }, ["meta"]);
     setPw({ old: "", new1: "", new2: "" });
     showToast("Password admin berhasil diubah");
+  };
+
+  const handleDownloadBackup = () => {
+    const latest = dataRef?.current || data;
+    backupSystem.downloadJSON(latest);
+    showToast("Backup berhasil diunduh");
+  };
+
+  const handleImportBackup = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const imported = await backupSystem.importJSON(file);
+      if (!imported || typeof imported !== "object") return showToast("Format file tidak valid", "error");
+      const merged = { ...DEFAULT_DATA, ...imported };
+      await saveData(merged, COLS);
+      showToast("Data berhasil dipulihkan dari file! Guru: " + (merged.teachers?.length||0) + ", Siswa: " + (merged.students?.length||0) + ", Soal: " + (merged.questions?.length||0));
+    } catch(err) { showToast("Gagal import: " + err.message, "error"); }
+    e.target.value = "";
+  };
+
+  const handleCheckBackups = async () => {
+    setRecovering(true);
+    try {
+      const info = { local: null, firebase: null };
+      info.local = backupSystem.loadBestLocal();
+      info.firebase = await store.loadBackup().catch(() => null);
+      setBackupInfo(info);
+    } catch(e) { showToast("Gagal cek backup: " + e.message, "error"); }
+    setRecovering(false);
+  };
+
+  const handleRestoreFrom = async (source) => {
+    const d = source === "firebase" ? backupInfo?.firebase : backupInfo?.local;
+    if (!d) return showToast("Tidak ada data backup", "error");
+    const merged = { ...DEFAULT_DATA, ...d };
+    await saveData(merged, COLS);
+    showToast("Data berhasil dipulihkan dari " + (source === "firebase" ? "Firebase Backup" : "Backup Lokal") + "! Guru: " + (merged.teachers?.length||0) + ", Siswa: " + (merged.students?.length||0) + ", Soal: " + (merged.questions?.length||0));
+    setBackupInfo(null);
   };
 
   return (
@@ -2791,6 +2944,63 @@ function SettingsView({ data, dataRef, saveData, showToast }) {
           <p>Total Soal: {data.questions.length} | Total Ujian: {data.exams.length}</p>
         </div>
       </Card>
+      <Card className="mb-4" style={{ background: "rgba(16,185,129,0.05)", border: "1px solid rgba(16,185,129,0.2)" }}>
+        <div className="flex items-center gap-3 mb-4">
+          <div className="w-9 h-9 rounded-xl flex items-center justify-center text-lg" style={{ background: "linear-gradient(135deg,#10b981,#059669)", boxShadow: "0 3px 12px rgba(16,185,129,0.35)" }}>🛡️</div>
+          <div>
+            <h3 className="font-bold" style={{ color: "inherit" }}>Backup &amp; Recovery</h3>
+            <p className="text-xs" style={{ color: "rgba(110,231,183,0.7)" }}>Sistem backup otomatis aktif — data aman saat crash</p>
+          </div>
+        </div>
+        <div className="text-sm mb-4 p-3 rounded-xl" style={{ background: "rgba(16,185,129,0.1)", color: "#6ee7b7" }}>
+          ✅ Backup otomatis berjalan setiap kali data berubah ke:<br />
+          &nbsp;&nbsp;• 3 slot backup lokal (browser) — rotasi otomatis<br />
+          &nbsp;&nbsp;• Firebase backup collection (terpisah dari data utama)<br />
+          &nbsp;&nbsp;• localStorage cache &amp; backup key
+        </div>
+        <div className="flex flex-wrap gap-2 mb-4">
+          <Btn onClick={handleDownloadBackup} style={{ background: "linear-gradient(135deg,#10b981,#059669)", color: "white" }}>
+            <Download size={14} />Download Backup JSON
+          </Btn>
+          <label className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold cursor-pointer transition" style={{ background: "rgba(16,185,129,0.2)", color: "#6ee7b7", border: "1px solid rgba(16,185,129,0.3)" }}>
+            <Upload size={14} />Import dari File JSON
+            <input type="file" accept=".json" className="hidden" onChange={handleImportBackup} />
+          </label>
+          <Btn onClick={handleCheckBackups} disabled={recovering} style={{ background: "rgba(16,185,129,0.15)", color: "#6ee7b7", border: "1px solid rgba(16,185,129,0.3)" }}>
+            <RefreshCw size={14} />{recovering ? "Mengecek..." : "Cek Backup Tersedia"}
+          </Btn>
+        </div>
+        {backupInfo && (
+          <div className="space-y-3">
+            <div className="p-3 rounded-xl" style={{ background: "rgba(15,23,42,0.5)", border: "1px solid rgba(16,185,129,0.2)" }}>
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div>
+                  <p className="font-semibold text-sm" style={{ color: "#6ee7b7" }}>🔥 Firebase Backup</p>
+                  {backupInfo.firebase ? (
+                    <p className="text-xs text-slate-400">Guru: {backupInfo.firebase.teachers?.length||0} | Siswa: {backupInfo.firebase.students?.length||0} | Soal: {backupInfo.firebase.questions?.length||0}{backupInfo.firebase.date ? " | " + new Date(backupInfo.firebase.date).toLocaleString("id-ID") : ""}</p>
+                  ) : <p className="text-xs text-red-400">Tidak ada backup di Firebase</p>}
+                </div>
+                {backupInfo.firebase && (backupInfo.firebase.teachers?.length > 0 || backupInfo.firebase.students?.length > 0 || backupInfo.firebase.questions?.length > 0) && (
+                  <Btn onClick={() => handleRestoreFrom("firebase")} style={{ background: "#10b981", color: "white", fontSize: "12px", padding: "6px 12px" }}>Pulihkan</Btn>
+                )}
+              </div>
+            </div>
+            <div className="p-3 rounded-xl" style={{ background: "rgba(15,23,42,0.5)", border: "1px solid rgba(59,130,246,0.2)" }}>
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div>
+                  <p className="font-semibold text-sm" style={{ color: "#93c5fd" }}>💾 Backup Lokal (Browser)</p>
+                  {backupInfo.local ? (
+                    <p className="text-xs text-slate-400">Guru: {backupInfo.local.teachers?.length||0} | Siswa: {backupInfo.local.students?.length||0} | Soal: {backupInfo.local.questions?.length||0}</p>
+                  ) : <p className="text-xs text-red-400">Tidak ada backup lokal di browser ini</p>}
+                </div>
+                {backupInfo.local && (backupInfo.local.teachers?.length > 0 || backupInfo.local.students?.length > 0 || backupInfo.local.questions?.length > 0) && (
+                  <Btn onClick={() => handleRestoreFrom("local")} style={{ background: "#3b82f6", color: "white", fontSize: "12px", padding: "6px 12px" }}>Pulihkan</Btn>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </Card>
       <Card className="mb-4" style={{ background: "rgba(99,102,241,0.05)", border: "1px solid rgba(99,102,241,0.15)" }}>
         <div className="flex items-center gap-3 mb-4">
           <div className="w-9 h-9 rounded-xl flex items-center justify-center text-lg" style={{ background: "linear-gradient(135deg,#6366f1,#a855f7)", boxShadow: "0 3px 12px rgba(99,102,241,0.35)" }}>✨</div>
@@ -2813,7 +3023,7 @@ function SettingsView({ data, dataRef, saveData, showToast }) {
       </Card>
       <Card>
         <h3 className="text-red-400 font-bold mb-2">Zona Bahaya</h3>
-        <p className="text-sm mb-3" style={{ color: "inherit", opacity: 0.7 }}>Reset seluruh data ke kondisi awal. Tidak dapat dibatalkan.</p>
+        <p className="text-sm mb-3" style={{ color: "inherit", opacity: 0.7 }}>Reset seluruh data ke kondisi awal. Tidak dapat dibatalkan. Backup tetap aman di Firebase.</p>
         <Btn variant="danger" onClick={() => { if (!confirm("PERINGATAN: Ini akan menghapus SEMUA data!")) return; if (!confirm("Yakin benar-benar ingin reset?")) return; saveData(DEFAULT_DATA, COLS); showToast("Data telah direset"); }}><AlertTriangle size={14} />Reset Semua Data</Btn>
       </Card>
     </div>

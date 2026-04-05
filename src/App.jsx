@@ -2671,14 +2671,7 @@ function ResultsView({ data }) {
             const scoreVal = scoreNull ? "-" : Number(r.score).toFixed(1);
             const ket = scoreNull ? "Perlu Dinilai" : Number(r.score) >= 75 ? "Lulus" : "Tidak Lulus";
             const cls = scoreNull ? "pending" : Number(r.score) >= 75 ? "pass" : "fail";
-            return \`<tr>
-              <td>\${i+1}</td>
-              <td>\${student?.name || "?"}</td>
-              <td>\${student?.kelas || "-"}</td>
-              <td>\${r.correct || 0}/\${totalQ}</td>
-              <td><strong>\${scoreVal}</strong></td>
-              <td class="\${cls}">\${ket}</td>
-            </tr>\`;
+            return "<tr><td>" + (i+1) + "</td><td>" + (student?.name || "?") + "</td><td>" + (student?.kelas || "-") + "</td><td>" + (r.correct || 0) + "/" + totalQ + "</td><td><strong>" + scoreVal + "</strong></td><td class=\"" + cls + "\">" + ket + "</td></tr>";
           }).join("")}
         </tbody>
       </table>
@@ -2824,17 +2817,15 @@ function ResultsView({ data }) {
       const subj = (data.subjects || []).find(s => s.id === ex.subjectId)?.name || "";
       const totalQ = ex.questionIds?.length || 0;
       const sorted = [...results].sort((a, b) => (b.score || 0) - (a.score || 0));
-      return \`<h2>\${ex.title} <span style="font-weight:normal;font-size:11px;color:#666">(\${subj} • \${results.length} peserta • Rata-rata: \${avg})</span></h2>
-      <table><thead><tr><th>No</th><th>Nama Siswa</th><th>Kelas</th><th>Benar</th><th>Nilai</th><th>Ket.</th></tr></thead><tbody>
-      \${sorted.map((r, i) => {
+      const rows = sorted.map((r, i) => {
         const st = data.students.find(s => s.id === r.studentId);
         const scoreNull = r.score === null || r.score === undefined;
         const scoreDisplay = scoreNull ? "-" : Number(r.score).toFixed(1);
         const ket = scoreNull ? "Perlu Dinilai" : Number(r.score) >= 75 ? "Lulus" : "Tidak Lulus";
         const cls = scoreNull ? "pending" : Number(r.score) >= 75 ? "pass" : "fail";
-        return \`<tr><td>\${i+1}</td><td>\${st?.name||"?"}</td><td>\${st?.kelas||"-"}</td><td>\${r.correct||0}/\${totalQ}</td><td><strong>\${scoreDisplay}</strong></td><td class="\${cls}">\${ket}</td></tr>\`;
-      }).join("")}
-      </tbody></table>\`;
+        return "<tr><td>" + (i+1) + "</td><td>" + (st?.name||"?") + "</td><td>" + (st?.kelas||"-") + "</td><td>" + (r.correct||0) + "/" + totalQ + "</td><td><strong>" + scoreDisplay + "</strong></td><td class=\"" + cls + "\">" + ket + "</td></tr>";
+      }).join("");
+      return "<h2>" + ex.title + " <span style=\"font-weight:normal;font-size:11px;color:#666\">(" + subj + " • " + results.length + " peserta • Rata-rata: " + avg + ")</span></h2><table><thead><tr><th>No</th><th>Nama Siswa</th><th>Kelas</th><th>Benar</th><th>Nilai</th><th>Ket.</th></tr></thead><tbody>" + rows + "</tbody></table>";
     }).join("")}
     </body></html>`;
     const w = window.open("", "_blank");

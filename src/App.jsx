@@ -347,7 +347,7 @@ export default function ExamApp() {
       // 2. Load all collections in parallel
       try {
         const vals = await Promise.all(COLS.map(col => store.getCol(col)));
-        const d = {
+        const fbD = {
           meta: vals[0] || DEFAULT_DATA.meta,
           teachers: vals[1] || [],
           students: vals[2] || [],
@@ -357,6 +357,20 @@ export default function ExamApp() {
           sessions: vals[6] || [],
           results: vals[7] || [],
         };
+        // FIX BUG 3: If localStorage has MORE data than Firestore, it means
+        // a previous Firestore write failed silently (Bug 2 scenario).
+        // Keep the local version for those collections to prevent data loss on reload.
+        const localCached = ls.get(CACHE_KEY);
+        const d = { ...fbD };
+        if (localCached) {
+          if ((localCached.questions?.length || 0) > (fbD.questions?.length || 0)) {
+            d.questions = localCached.questions;
+            console.warn("[data-merge] localStorage has more questions than Firestore. Keeping local. A previous write may have failed.");
+          }
+          if ((localCached.teachers?.length || 0) > (fbD.teachers?.length || 0)) d.teachers = localCached.teachers;
+          if ((localCached.students?.length || 0) > (fbD.students?.length || 0)) d.students = localCached.students;
+          if ((localCached.exams?.length || 0) > (fbD.exams?.length || 0)) d.exams = localCached.exams;
+        }
         setData(d);
         setLoading(false);
         ls.set(CACHE_KEY, d);
@@ -412,6 +426,9 @@ export default function ExamApp() {
   const saveData = useCallback(async (newData, hints) => {
     if (!newData) return;
     setData(newData);
+    // FIX BUG 1: Update dataRef immediately so rapid consecutive saves
+    // always read the latest data, not stale data from previous render cycle.
+    if (dataRef.current !== undefined) dataRef.current = newData;
     ls.set(CACHE_KEY, newData);
     ls.set(BACKUP_KEY, newData);
     // --- BACKUP SYSTEM: save to rotating localStorage slots ---
@@ -420,18 +437,32 @@ export default function ExamApp() {
       const prev = dataRef.current;
       return newData[col] !== undefined && (!prev || JSON.stringify(newData[col]) !== JSON.stringify(prev[col]));
     });
+    // FIX BUG 2: Track which columns fail to write so we can alert the user.
+    const failedCols = [];
     await Promise.all(toSave.map(async col => {
       if (newData[col] === undefined) return;
       writeTimesRef.current[col] = Date.now();
       try { await store.setCol(col, newData[col]); }
       catch(e) {
+        console.error("saveData first attempt failed for col:", col, e);
+        // Retry once after a short delay
         await new Promise(r => setTimeout(r, 1500));
-        store.setCol(col, newData[col]).catch(console.error);
+        try { await store.setCol(col, newData[col]); }
+        catch(e2) {
+          console.error("saveData retry also failed for col:", col, e2);
+          failedCols.push(col);
+        }
       }
     }));
+    if (failedCols.length > 0) {
+      // Show visible error so teacher knows the save did NOT reach the server.
+      // Data is still in localStorage so it won't be lost on this device,
+      // but it will be gone after a hard reload if Firestore never gets updated.
+      showToast("⚠️ Gagal menyimpan ke server! Data tersimpan sementara di perangkat ini saja. Coba lagi atau periksa koneksi internet.", "error");
+    }
     // --- BACKUP SYSTEM: async Firebase backup (non-blocking) ---
     store.saveBackup(newData).catch(console.warn);
-  }, []);
+  }, [showToast]);
 
 
   // Expose dataRef so ExamTaker can always access latest data
@@ -2080,7 +2111,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     reader.readAsDataURL(file);
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!form.subjectId || !form.text.trim()) return showToast("Mapel dan teks soal wajib diisi", "error");
     if (form.type === "pilgan") {
       const validOpts = form.options.filter(o => o.trim());
@@ -2096,9 +2127,11 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     };
     if (editId) questions = questions.map(q => q.id === editId ? { ...q, ...qData } : q);
     else questions.push({ id: genId(), ...qData });
-    saveData({ ...latest, questions }, ["questions"]);
+    // FIX: await saveData so error toast from failed Firestore write is shown
+    // AFTER the success toast (saveData will override with error if write fails).
     setShowModal(false);
-    showToast(editId ? "Soal diperbarui" : "Soal berhasil ditambahkan");
+    showToast(editId ? "Soal diperbarui" : "Soal berhasil ditambahkan ke bank soal");
+    await saveData({ ...latest, questions }, ["questions"]);
   };
 
   const handleDelete = (id) => {

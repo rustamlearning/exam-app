@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo, createContext, useContext } from "react";
 import { BookOpen, Users, GraduationCap, Settings, LogOut, Plus, Trash2, Edit, Eye, Clock, AlertTriangle, CheckCircle, XCircle, Monitor, Upload, ChevronRight, Menu, X, Search, FileText, BarChart3, Shield, Lock, Save, RefreshCw, ChevronDown, ArrowLeft, Home, User, Hash, Layers, Play, Square, Award, Bell, AlertCircle, Printer, Camera, Key, Download } from "lucide-react";
 import { initializeApp } from "firebase/app";
-import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, query, where, getDocs, runTransaction } from "firebase/firestore";
+import { getFirestore, doc, getDoc, setDoc, onSnapshot, runTransaction } from "firebase/firestore";
 
 // ============= CONSTANTS =============
 const SCHOOL_NAME = "SMA Negeri 6 Pangkajene dan Kepulauan";
@@ -68,23 +68,6 @@ const backupSystem = {
     });
   }
 };
-
-// Safe deep-merge: never overwrites non-empty arrays with empty ones
-function safeMerge(base, remote) {
-  if (!remote || typeof remote !== "object") return base;
-  const result = { ...base };
-  for (const key of Object.keys(remote)) {
-    const rv = remote[key];
-    const bv = base[key];
-    // Never replace non-empty array with empty array (data loss protection)
-    if (Array.isArray(bv) && Array.isArray(rv) && bv.length > 0 && rv.length === 0) {
-      result[key] = bv;
-    } else if (rv !== undefined && rv !== null) {
-      result[key] = rv;
-    }
-  }
-  return result;
-}
 
 // LocalStorage helpers with error handling
 const ls = {
@@ -161,8 +144,6 @@ const db = getFirestore(app);
 // sessions & results stored as individual docs to prevent race conditions
 // with 100+ concurrent students
 const COLS = ["meta","teachers","students","subjects","questions","exams"];
-const STATIC_COLS = ["meta","teachers","students","subjects","questions","exams"];
-
 const store = {
   async getCol(col) {
     try {
@@ -300,7 +281,7 @@ export default function ExamApp() {
     setTheme(t => { const next = t === "dark" ? "light" : "dark"; ls.set(THEME_KEY, next); return next; });
   }, []);
   const isDark = theme === "dark";
-  const T = {
+  const T = useMemo(() => ({
     bg: isDark ? "linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%)" : "linear-gradient(135deg, #f8fafc 0%, #e2e8f0 50%, #f8fafc 100%)",
     card: isDark ? "rgba(30,41,59,0.9)" : "rgba(255,255,255,0.98)",
     cardBorder: isDark ? "rgba(59,130,246,0.15)" : "rgba(59,130,246,0.25)",
@@ -316,10 +297,8 @@ export default function ExamApp() {
     navActive: isDark ? "rgba(59,130,246,0.2)" : "rgba(59,130,246,0.15)",
     navText: isDark ? "#60a5fa" : "#1d4ed8",
     badge: isDark ? "rgba(51,65,85,0.8)" : "rgba(226,232,240,0.9)",
-  };
-  const lastSaveRef = useRef(0);
-  const isWritingRef = useRef(false);
-
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [isDark]);
   const showToast = useCallback((msg, type = "success") => {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 3500);
@@ -354,8 +333,8 @@ export default function ExamApp() {
           subjects: vals[3]?.length ? vals[3] : MAPEL_K13,
           questions: vals[4] || [],
           exams: vals[5] || [],
-          sessions: vals[6] || [],
-          results: vals[7] || [],
+          sessions: [], // loaded per-exam via store.listenSessions
+          results: [], // loaded per-exam via store.listenResults
         };
         setData(d);
         setLoading(false);
@@ -395,8 +374,7 @@ export default function ExamApp() {
         const u = store.listenCol(col, (val, meta) => {
           if (val === null || val === undefined) return;
           if (meta.hasPendingWrites) return;
-          // Guard: ignore Firestore snapshots for 8s after a local write
-          // Prevents slow-network round-trips from overwriting freshly saved data
+          // 8s guard: prevents Firestore snapshot from overwriting a recent local write on slow connections
           if (Date.now() - (writeTimesRef.current[col] || 0) < 8000) return;
           setData(prev => {
             if (!prev) return prev;
@@ -413,19 +391,18 @@ export default function ExamApp() {
 
   const saveData = useCallback(async (newData, hints) => {
     if (!newData) return;
-    // Update dataRef synchronously FIRST so subsequent rapid saves use fresh data
+    // Sync dataRef FIRST so rapid consecutive saves use fresh data (prevents stale closure overwrite)
     dataRef.current = newData;
     setData(newData);
     ls.set(CACHE_KEY, newData);
     ls.set(BACKUP_KEY, newData);
-    // --- BACKUP SYSTEM: save to rotating localStorage slots ---
     backupSystem.saveLocal(newData);
     const toSave = hints || COLS.filter(col => {
-      const prev = dataRef.current;
-      return newData[col] !== undefined && (!prev || JSON.stringify(newData[col]) !== JSON.stringify(prev[col]));
+      return newData[col] !== undefined;
     });
     await Promise.all(toSave.map(async col => {
       if (newData[col] === undefined) return;
+      // Mark write time BEFORE the async call so the Firestore listener guard fires immediately
       writeTimesRef.current[col] = Date.now();
       try { await store.setCol(col, newData[col]); }
       catch(e) {
@@ -433,14 +410,12 @@ export default function ExamApp() {
         store.setCol(col, newData[col]).catch(console.error);
       }
     }));
-    // --- BACKUP SYSTEM: async Firebase backup (non-blocking) ---
     store.saveBackup(newData).catch(console.warn);
   }, []);
 
 
-  // Expose dataRef so ExamTaker can always access latest data
-  // NOTE: saveData already sets dataRef.current synchronously.
-  // This effect only catches external updates (e.g. from Firestore realtime listener).
+  // dataRef: kept in sync with state. saveData() updates it synchronously (above).
+  // This effect catches external changes (e.g. Firestore realtime listener updates).
   const dataRef = useRef(null);
   useEffect(() => { dataRef.current = data; }, [data]);
 
@@ -481,7 +456,7 @@ export default function ExamApp() {
       setView(nextView);
       try { localStorage.setItem(SESSION_KEY, JSON.stringify({ user: loggedUser, view: nextView })); } catch {}
     }
-  }, [data, showToast]);
+  }, [showToast]); // intentionally omit `data` — always reads from dataRef.current for freshest state
 
   const handleLogout = useCallback(() => {
     setUser(null);
@@ -759,7 +734,7 @@ function AdminDashboard({ data, dataRef, saveData, user, onLogout, showToast }) 
 
 function AdminHome({ data }) {
   const activeExams = data.exams.filter(e => e.status === "active").length;
-  const activeSessions = (data.sessions || []).filter(s => s.status === "active").length;
+  const activeSessions = 0; // sessions are per-exam in Firestore, not in top-level data
   return (
     <div>
       <h2 className="text-2xl font-bold mb-6" style={{ color: "inherit" }}>Dashboard Admin</h2>
@@ -2053,8 +2028,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
 
   const [showMineOnly, setShowMineOnly] = useState(false);
   const allQ = data.questions || [];
-  // Guru sees: questions for their subjects OR questions they personally created
-  // (prevents own questions from disappearing when subjectId doesn't match teacherSubjects)
+  // Guru sees: questions for their subjects OR questions they personally created/imported
   const subjectFilteredQ = teacherSubjects
     ? allQ.filter(q => teacherSubjects.includes(q.subjectId) || (userId && q.createdBy === userId))
     : allQ;
@@ -2064,7 +2038,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     if (filterType !== "all" && (q.type || "pilgan") !== filterType) return false;
     return true;
   });
-  const myCount = userId ? subjectFilteredQ.filter(q => q.createdBy === userId).length : allQ.length;
+  const myCount = userId ? allQ.filter(q => q.createdBy === userId).length : allQ.length;
 
   const defaultSubjectId = visibleSubjects[0]?.id || "";
 
@@ -2092,10 +2066,6 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     if (form.type === "pilgan") {
       const validOpts = form.options.filter(o => o.trim());
       if (validOpts.length < 2) return showToast("Minimal 2 pilihan jawaban", "error");
-    }
-    // Warn if teacher's subjectId is not in their assigned subjects (would make question invisible to filter)
-    if (userId && teacherSubjects && form.subjectId && !teacherSubjects.includes(form.subjectId)) {
-      showToast("Perhatian: mapel ini bukan mapel yang Anda ampu. Soal tetap disimpan.", "warning");
     }
     const latest = dataRef?.current || data;
     let questions = [...(latest.questions || [])];
@@ -2150,7 +2120,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     showToast(`${importedQuestions.length} soal berhasil diimpor`);
   };
 
-  const getSubjectName = (sid) => (data.subjects || []).find(s => s.id === sid)?.name || "-";
+  const getSubjectName = (sid) => { if (!sid) return "—"; return (data.subjects || []).find(s => s.id === sid)?.name || "—"; };
 
   // Science editor: insert text into a specific field
   const handleScienceInsert = (text) => {
@@ -2568,7 +2538,8 @@ function ExamManager({ data, dataRef, saveData, showToast, isAdmin, userId }) {
   const openAdd = () => {
     setEditId(null);
     const now = new Date(); const later = new Date(now.getTime() + 2 * 3600000);
-    setForm({ title: "", subjectId: (data.subjects || [])[0]?.id || "", targetKelas: [], duration: 90, startTime: now.toISOString().slice(0, 16), endTime: later.toISOString().slice(0, 16), shuffleQuestions: true, shuffleOptions: false, showResult: true, questionIds: [] });
+    const latest = dataRef?.current || data;
+    setForm({ title: "", subjectId: (latest.subjects || [])[0]?.id || "", targetKelas: [], duration: 90, startTime: now.toISOString().slice(0, 16), endTime: later.toISOString().slice(0, 16), shuffleQuestions: true, shuffleOptions: false, showResult: true, questionIds: [] });
     setShowModal(true);
   };
   const openEdit = (ex) => { setEditId(ex.id); setForm({ ...ex }); setShowModal(true); };
@@ -2610,7 +2581,7 @@ function ExamManager({ data, dataRef, saveData, showToast, isAdmin, userId }) {
     showToast("Ujian dihapus");
   };
 
-  const getSubjectName = (sid) => (data.subjects || []).find(s => s.id === sid)?.name || "-";
+  const getSubjectName = (sid) => { if (!sid) return "—"; return (data.subjects || []).find(s => s.id === sid)?.name || "—"; };
   const myExams = isAdmin ? data.exams : data.exams.filter(e => e.createdBy === userId);
   const statusColors = { draft: { bg: "rgba(100,116,139,0.2)", text: "#94a3b8" }, active: { bg: "rgba(22,163,74,0.2)", text: "#4ade80" }, ended: { bg: "rgba(220,38,38,0.2)", text: "#f87171" } };
   const statusLabels = { draft: "Draft", active: "Aktif", ended: "Selesai" };
@@ -2725,11 +2696,12 @@ function MonitorView({ data }) {
   const [liveResults, setLiveResults] = useState({});
   const [, forceUpdate] = useState(0);
 
-  // Auto-refresh every 3s for live data
+  // Auto-refresh every 5s for live data (only when viewing an exam to reduce renders)
   useEffect(() => {
-    const iv = setInterval(() => forceUpdate(n => n + 1), 3000);
+    if (!selectedExam) return;
+    const iv = setInterval(() => forceUpdate(n => n + 1), 5000);
     return () => clearInterval(iv);
-  }, []);
+  }, [selectedExam]);
 
   // Subscribe to live sessions and results when exam selected
   useEffect(() => {
@@ -3168,7 +3140,8 @@ function ResultsView({ data }) {
         <div className="space-y-3">
           {examsWithData.map(ex => {
             const results = getExamResults(ex.id);
-            const avg = results.length > 0 ? (results.reduce((a, r) => a + r.score, 0) / results.length).toFixed(1) : "-";
+            const scoredR = results.filter(r => r.score != null);
+          const avg = scoredR.length > 0 ? (scoredR.reduce((a, r) => a + r.score, 0) / scoredR.length).toFixed(1) : "-";
             const passCount = results.filter(r => r.score >= 75).length;
             return (
               <Card key={ex.id} className="cursor-pointer hover:border-blue-500/40 transition" onClick={() => setSelectedExam(ex.id)}>
@@ -3494,7 +3467,7 @@ function TeacherProfile({ data, saveData, user, showToast, updateUserSession }) 
     if (pw.old !== currentPassword) return showToast("Password/NIP lama salah", "error");
     if (pw.new1.length < 4) return showToast("Password baru minimal 4 karakter", "error");
     if (pw.new1 !== pw.new2) return showToast("Konfirmasi tidak cocok", "error");
-    const teachers = data.teachers.map(t => t.id === user.id ? { ...t, password: pw.new1 } : t);
+    const teachers = (data.teachers || []).map(t => t.id === user.id ? { ...t, password: pw.new1 } : t);
     saveData({ ...data, teachers }, ["teachers"]);
     const updatedUser = { ...user, password: pw.new1 };
     updateUserSession(updatedUser);
@@ -3503,7 +3476,7 @@ function TeacherProfile({ data, saveData, user, showToast, updateUserSession }) 
   };
 
   const handleSavePhoto = () => {
-    const teachers = data.teachers.map(t => t.id === user.id ? { ...t, photo } : t);
+    const teachers = (data.teachers || []).map(t => t.id === user.id ? { ...t, photo } : t);
     saveData({ ...data, teachers }, ["teachers"]);
     updateUserSession({ ...user, photo });
     showToast("Foto profil disimpan");
@@ -3666,10 +3639,13 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
                         {r.submittedAt && <div className="text-slate-500 text-xs mt-0.5">{new Date(r.submittedAt).toLocaleString("id-ID")}</div>}
                       </div>
                       <div className="text-right">
-                        <span className="px-3 py-1 rounded-full text-lg font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
-                          {r.score.toFixed(1)}
-                        </span>
-
+                        {r.score != null ? (
+                          <span className="px-3 py-1 rounded-full text-lg font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
+                            {r.score.toFixed(1)}
+                          </span>
+                        ) : (
+                          <span className="px-2 py-1 rounded-full text-xs font-semibold" style={{ background: "rgba(168,85,247,0.2)", color: "#c084fc" }}>Dinilai</span>
+                        )}
                       </div>
                     </div>
                   </Card>
@@ -3732,7 +3708,7 @@ function TryoutView({ data, user, showToast }) {
                   </div>
                   {(qType === "pilgan" || qType === "benar_salah") && (
                     <div className="text-xs space-y-1 ml-6">
-                      {userAns !== undefined && userAns !== q.correctAnswer && <div style={{ color: "#f87171" }}>Jawaban kamu: {qType === "benar_salah" ? (userAns === 0 ? "Benar" : "Salah") : (q.options?.[userAns] ? String.fromCharCode(65+userAns)+". "+q.options[userAns] : "-")}</div>}
+                      {userAns !== undefined && userAns !== q.correctAnswer && <div style={{ color: "#f87171" }}>Jawaban kamu: {qType === "benar_salah" ? (userAns === 0 ? "Benar" : "Salah") : (q.options?.[userAns] != null ? String.fromCharCode(65+userAns)+". "+q.options[userAns] : "—")}</div>}
                       <div style={{ color: "#4ade80" }}>Kunci: {qType === "benar_salah" ? (q.correctAnswer === 0 ? "Benar" : "Salah") : (q.options?.[q.correctAnswer] ? String.fromCharCode(65+q.correctAnswer)+". "+q.options[q.correctAnswer] : "-")}</div>
                       {q.explanation && <div className="text-blue-300 mt-1">💡 {q.explanation}</div>}
                     </div>
@@ -4093,11 +4069,10 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
     return () => clearInterval(iv);
   }, [submitted]);
 
-  // Save on answer change with debounce
+  // Save on answer change with debounce (answersRef is kept current by its own effect above)
   useEffect(() => {
-    answersRef.current = answers;
     if (submittedRef.current) return;
-    const t = setTimeout(() => doSaveSession("active"), 1000);
+    const t = setTimeout(() => doSaveSession("active"), 1200);
     return () => clearTimeout(t);
   }, [answers]);
 
@@ -4123,7 +4098,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
       // essay/uraian: marked as "answered" if non-empty, scored by teacher later
     });
     const hasEssay = questions.some(q => q.type === "esai" || q.type === "uraian");
-    const score = pilganCount > 0 ? (correct / pilganCount) * 100 : (hasEssay ? null : 0);
+    const score = pilganCount > 0 ? Math.round((correct / pilganCount) * 1000) / 10 : (hasEssay ? null : 0);
     const resultData = { id: genId(), examId: exam.id, studentId: user.id, answers: { ...finalAnswers }, correct, pilganCount, score, hasEssay, needsGrading: hasEssay, violations: finalViolations, submittedAt: Date.now() };
     setResult(resultData);
 
@@ -4162,8 +4137,10 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
           <p className="text-slate-400 mb-4">{exam.title}</p>
           {exam.showResult ? (
             <div className="space-y-3 mb-6">
-              <div className="text-6xl font-bold" style={{ color: result.score >= 75 ? "#4ade80" : result.score >= 50 ? "#fbbf24" : "#f87171" }}>{result.score.toFixed(1)}</div>
-              <div className="text-slate-300">Benar: {result.correct} dari {questions.length} soal</div>
+              <div className="text-6xl font-bold" style={{ color: (result.score ?? 0) >= 75 ? "#4ade80" : (result.score ?? 0) >= 50 ? "#fbbf24" : "#f87171" }}>
+                {result.score != null ? result.score.toFixed(1) : "—"}
+              </div>
+              <div className="text-slate-300">Benar: {result.correct} dari {questions.filter(q => !q.type || q.type === "pilgan" || q.type === "benar_salah").length || questions.length} soal objektif</div>
 
               {violations > 0 && <div className="text-red-400 text-sm flex items-center justify-center gap-1"><AlertTriangle size={14} />Pelanggaran: {violations}x</div>}
             </div>

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo, createContext, useContext } from "react";
-import { BookOpen, Users, GraduationCap, Settings, LogOut, Plus, Trash2, Edit, Eye, Clock, AlertTriangle, CheckCircle, XCircle, Monitor, Upload, ChevronRight, Menu, X, Search, FileText, BarChart3, Shield, Lock, Save, RefreshCw, ArrowLeft, Home, User, Hash, Layers, Play, Square, Award, Printer, Camera, Key, Download } from "lucide-react";
+import { BookOpen, Users, GraduationCap, Settings, LogOut, Plus, Trash2, Edit, Eye, Clock, AlertTriangle, CheckCircle, XCircle, Monitor, Upload, ChevronRight, Menu, X, Search, FileText, BarChart3, Shield, Lock, Save, RefreshCw, ChevronDown, ArrowLeft, Home, User, Hash, Layers, Play, Square, Award, Bell, AlertCircle, Printer, Camera, Key, Download } from "lucide-react";
 import { initializeApp } from "firebase/app";
-import { getFirestore, doc, getDoc, setDoc, onSnapshot, runTransaction } from "firebase/firestore";
+import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, query, where, getDocs, runTransaction } from "firebase/firestore";
 
 // ============= CONSTANTS =============
 const SCHOOL_NAME = "SMA Negeri 6 Pangkajene dan Kepulauan";
@@ -68,6 +68,23 @@ const backupSystem = {
     });
   }
 };
+
+// Safe deep-merge: never overwrites non-empty arrays with empty ones
+function safeMerge(base, remote) {
+  if (!remote || typeof remote !== "object") return base;
+  const result = { ...base };
+  for (const key of Object.keys(remote)) {
+    const rv = remote[key];
+    const bv = base[key];
+    // Never replace non-empty array with empty array (data loss protection)
+    if (Array.isArray(bv) && Array.isArray(rv) && bv.length > 0 && rv.length === 0) {
+      result[key] = bv;
+    } else if (rv !== undefined && rv !== null) {
+      result[key] = rv;
+    }
+  }
+  return result;
+}
 
 // LocalStorage helpers with error handling
 const ls = {
@@ -144,6 +161,8 @@ const db = getFirestore(app);
 // sessions & results stored as individual docs to prevent race conditions
 // with 100+ concurrent students
 const COLS = ["meta","teachers","students","subjects","questions","exams"];
+const STATIC_COLS = ["meta","teachers","students","subjects","questions","exams"];
+
 const store = {
   async getCol(col) {
     try {
@@ -281,7 +300,7 @@ export default function ExamApp() {
     setTheme(t => { const next = t === "dark" ? "light" : "dark"; ls.set(THEME_KEY, next); return next; });
   }, []);
   const isDark = theme === "dark";
-  const T = useMemo(() => ({
+  const T = {
     bg: isDark ? "linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%)" : "linear-gradient(135deg, #f8fafc 0%, #e2e8f0 50%, #f8fafc 100%)",
     card: isDark ? "rgba(30,41,59,0.9)" : "rgba(255,255,255,0.98)",
     cardBorder: isDark ? "rgba(59,130,246,0.15)" : "rgba(59,130,246,0.25)",
@@ -297,8 +316,10 @@ export default function ExamApp() {
     navActive: isDark ? "rgba(59,130,246,0.2)" : "rgba(59,130,246,0.15)",
     navText: isDark ? "#60a5fa" : "#1d4ed8",
     badge: isDark ? "rgba(51,65,85,0.8)" : "rgba(226,232,240,0.9)",
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [isDark]);
+  };
+  const lastSaveRef = useRef(0);
+  const isWritingRef = useRef(false);
+
   const showToast = useCallback((msg, type = "success") => {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 3500);
@@ -333,8 +354,8 @@ export default function ExamApp() {
           subjects: vals[3]?.length ? vals[3] : MAPEL_K13,
           questions: vals[4] || [],
           exams: vals[5] || [],
-          sessions: [], // loaded per-exam via store.listenSessions
-          results: [], // loaded per-exam via store.listenResults
+          sessions: vals[6] || [],
+          results: vals[7] || [],
         };
         setData(d);
         setLoading(false);
@@ -374,8 +395,7 @@ export default function ExamApp() {
         const u = store.listenCol(col, (val, meta) => {
           if (val === null || val === undefined) return;
           if (meta.hasPendingWrites) return;
-          // 8s guard: prevents Firestore snapshot from overwriting a recent local write on slow connections
-          if (Date.now() - (writeTimesRef.current[col] || 0) < 8000) return;
+          if (Date.now() - (writeTimesRef.current[col] || 0) < 1500) return;
           setData(prev => {
             if (!prev) return prev;
             const next = { ...prev, [col]: val };
@@ -391,18 +411,17 @@ export default function ExamApp() {
 
   const saveData = useCallback(async (newData, hints) => {
     if (!newData) return;
-    // Sync dataRef FIRST so rapid consecutive saves use fresh data (prevents stale closure overwrite)
-    dataRef.current = newData;
     setData(newData);
     ls.set(CACHE_KEY, newData);
     ls.set(BACKUP_KEY, newData);
+    // --- BACKUP SYSTEM: save to rotating localStorage slots ---
     backupSystem.saveLocal(newData);
     const toSave = hints || COLS.filter(col => {
-      return newData[col] !== undefined;
+      const prev = dataRef.current;
+      return newData[col] !== undefined && (!prev || JSON.stringify(newData[col]) !== JSON.stringify(prev[col]));
     });
     await Promise.all(toSave.map(async col => {
       if (newData[col] === undefined) return;
-      // Mark write time BEFORE the async call so the Firestore listener guard fires immediately
       writeTimesRef.current[col] = Date.now();
       try { await store.setCol(col, newData[col]); }
       catch(e) {
@@ -410,12 +429,12 @@ export default function ExamApp() {
         store.setCol(col, newData[col]).catch(console.error);
       }
     }));
+    // --- BACKUP SYSTEM: async Firebase backup (non-blocking) ---
     store.saveBackup(newData).catch(console.warn);
   }, []);
 
 
-  // dataRef: kept in sync with state. saveData() updates it synchronously (above).
-  // This effect catches external changes (e.g. Firestore realtime listener updates).
+  // Expose dataRef so ExamTaker can always access latest data
   const dataRef = useRef(null);
   useEffect(() => { dataRef.current = data; }, [data]);
 
@@ -456,7 +475,7 @@ export default function ExamApp() {
       setView(nextView);
       try { localStorage.setItem(SESSION_KEY, JSON.stringify({ user: loggedUser, view: nextView })); } catch {}
     }
-  }, [showToast]); // intentionally omit `data` — always reads from dataRef.current for freshest state
+  }, [data, showToast]);
 
   const handleLogout = useCallback(() => {
     setUser(null);
@@ -479,7 +498,7 @@ export default function ExamApp() {
   if (loading) return <LoadingScreen />;
 
   return (
-    <ThemeCtx.Provider value={useMemo(() => ({ theme, toggleTheme, isDark, T }), [theme, toggleTheme, isDark, T])}>
+    <ThemeCtx.Provider value={{ theme, toggleTheme, isDark, T }}>
     <div className="min-h-screen" style={{ background: T.bg }}>
       {toast && <Toast msg={toast.msg} type={toast.type} />}
       {view === "login" && <LoginScreen onLogin={handleLogin} />}
@@ -734,7 +753,7 @@ function AdminDashboard({ data, dataRef, saveData, user, onLogout, showToast }) 
 
 function AdminHome({ data }) {
   const activeExams = data.exams.filter(e => e.status === "active").length;
-  const activeSessions = 0; // sessions are per-exam in Firestore, not in top-level data
+  const activeSessions = (data.sessions || []).filter(s => s.status === "active").length;
   return (
     <div>
       <h2 className="text-2xl font-bold mb-6" style={{ color: "inherit" }}>Dashboard Admin</h2>
@@ -771,436 +790,155 @@ function AdminHome({ data }) {
   );
 }
 
-// ============= IMPORT DATA MODAL (Excel/CSV/Word/PDF — Smart & Robust) =============
+// ============= IMPORT DATA MODAL (Excel/CSV/Word) =============
 function ImportDataModal({ type, onImport, onClose, showToast }) {
   const [rows, setRows] = useState([]);
-  const [editRows, setEditRows] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [loadingMsg, setLoadingMsg] = useState("");
   const [step, setStep] = useState("upload");
-  const [dragOver, setDragOver] = useState(false);
-  const [errors, setErrors] = useState([]);
-  const [colMap, setColMap] = useState({});
-  const [headers, setHeaders] = useState([]);
-  const [fileName, setFileName] = useState("");
-  const [pasteMode, setPasteMode] = useState(false);
-  const [pasteText, setPasteText] = useState("");
 
-  const isStudent = type === "students";
-  const title = isStudent ? "Import Data Siswa" : "Import Data Guru";
-
-  const FIELDS_STUDENT = [
-    { key: "name",      label: "Nama Lengkap", required: true },
-    { key: "nisn",      label: "NISN",         required: true },
-    { key: "kelas",     label: "Kelas",        required: false },
-    { key: "peminatan", label: "Peminatan",    required: false },
-  ];
-  const FIELDS_TEACHER = [
-    { key: "name",  label: "Nama Lengkap", required: true },
-    { key: "nip",   label: "NIP",          required: true },
-    { key: "email", label: "Email",        required: false },
-  ];
-  const FIELDS = isStudent ? FIELDS_STUDENT : FIELDS_TEACHER;
-
-  const guessField = (header) => {
-    const h = header.toLowerCase().replace(/[^a-z0-9]/g, "");
-    if (/^(nama|name|fullname|namalengkap|namasiswa|namaguru)/.test(h)) return "name";
-    if (/^(nisn|nomornisn)/.test(h)) return "nisn";
-    if (/^(nip|nomornip)/.test(h)) return "nip";
-    if (/^(kelas|class|tingkat)/.test(h)) return "kelas";
-    if (/^(peminatan|jurusan|program|major)/.test(h)) return "peminatan";
-    if (/^(email|surel|mail)/.test(h)) return "email";
-    return "";
-  };
-
-  const loadXLSX = () => new Promise((res, rej) => {
-    if (window.XLSX) return res(window.XLSX);
-    const s = document.createElement("script");
-    s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
-    s.onload = () => res(window.XLSX);
-    s.onerror = () => rej(new Error("Gagal memuat library Excel. Cek koneksi internet."));
-    document.head.appendChild(s);
-  });
-
-  const loadMammoth = () => new Promise((res, rej) => {
-    if (window.mammoth) return res(window.mammoth);
-    const s = document.createElement("script");
-    s.src = "https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js";
-    s.onload = () => res(window.mammoth);
-    s.onerror = () => rej(new Error("Gagal memuat library Word. Cek koneksi internet."));
-    document.head.appendChild(s);
-  });
-
-  const parseCSVLine = (line, sep) => {
-    if (sep === "\t") return line.split("\t").map(s => s.replace(/^["']|["']$/g, "").trim());
+  const parseCSVLine = (line) => {
     const result = []; let cur = ""; let inQ = false;
-    for (const c of line) {
-      if (c === '"' || c === "'") { inQ = !inQ; }
-      else if (c === sep && !inQ) { result.push(cur.trim()); cur = ""; }
+    for (let c of line) {
+      if (c === '"') { inQ = !inQ; }
+      else if (c === "," && !inQ) { result.push(cur.trim()); cur = ""; }
       else cur += c;
     }
     result.push(cur.trim());
-    return result.map(s => s.replace(/^["']|["']$/g, "").trim());
+    return result;
   };
 
-  const detectSep = (text) => {
-    const sample = text.split("\n").slice(0, 5).join("\n");
-    const tabs = (sample.match(/\t/g) || []).length;
-    const semis = (sample.match(/;/g) || []).length;
-    const commas = (sample.match(/,/g) || []).length;
-    if (tabs >= semis && tabs >= commas) return "\t";
-    if (semis > commas) return ";";
-    return ",";
-  };
-
-  const parseTextToMatrix = (text) => {
-    const lines = text.split(/\r?\n/).map(l => l.trimEnd()).filter(l => l.trim());
-    if (!lines.length) return { matrix: [], hdrs: [] };
-    const sep = detectSep(text);
-    const matrix = lines.map(l => parseCSVLine(l, sep));
-    const firstRow = matrix[0];
-    const isHeader = firstRow.some(cell => /^(nama|name|nisn|nip|kelas|peminatan|email|no\.?|nomor)/i.test(cell.trim()));
-    let dataRows, hdrs;
-    if (isHeader) {
-      hdrs = firstRow;
-      dataRows = matrix.slice(1).filter(r => r.some(c => c.trim()));
-    } else {
-      hdrs = isStudent ? ["Nama Lengkap","NISN","Kelas","Peminatan"] : ["Nama Lengkap","NIP","Email"];
-      dataRows = matrix.filter(r => r.some(c => c.trim()));
-    }
-    return { matrix: dataRows, hdrs };
-  };
-
-  const buildRows = (matrix, map, hdrs) => {
-    const result = []; const errs = [];
-    for (let i = 0; i < matrix.length; i++) {
-      const cols = matrix[i];
-      const row = {};
-      for (const [hdr, field] of Object.entries(map)) {
-        const colIdx = hdrs.indexOf(hdr);
-        const val = colIdx >= 0 ? (cols[colIdx] || "").toString().trim() : "";
-        if (val) row[field] = val;
-      }
-      const rowErrors = [];
-      if (!row.name) rowErrors.push("Nama kosong");
-      if (isStudent && !row.nisn) rowErrors.push("NISN kosong");
-      if (!isStudent && !row.nip) rowErrors.push("NIP kosong");
-      if (rowErrors.length) { errs.push({ row: i, errors: rowErrors }); continue; }
-      if (isStudent) result.push({ name: row.name, nisn: row.nisn || "", kelas: row.kelas || "", peminatan: row.peminatan || "MIPA" });
-      else result.push({ name: row.name, nip: row.nip || "", email: row.email || "", subjects: [], photo: "" });
-    }
-    return { result, errs };
-  };
-
-  const processFile = async (file) => {
-    setLoading(true); setLoadingMsg("Membaca file..."); setFileName(file.name);
+  const parseFile = async (file) => {
+    setLoading(true);
     try {
       const ext = file.name.split(".").pop().toLowerCase();
       let text = "";
       if (ext === "csv" || ext === "txt") {
-        try { text = await file.text(); } catch {
-          const ab = await file.arrayBuffer();
-          text = new TextDecoder("utf-8").decode(ab);
-        }
-        text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        text = await file.text();
       } else if (ext === "xlsx" || ext === "xls") {
-        setLoadingMsg("Memuat library Excel...");
-        const XLSX = await loadXLSX();
-        setLoadingMsg("Membaca sheet Excel...");
-        const ab = await file.arrayBuffer();
-        const wb = XLSX.read(ab, { type: "array", cellText: true, cellDates: false });
-        let bestSheet = wb.SheetNames[0]; let bestCount = 0;
-        for (const name of wb.SheetNames) {
-          const ws = wb.Sheets[name];
-          const range = XLSX.utils.decode_range(ws["!ref"] || "A1:A1");
-          const count = (range.e.r - range.s.r) * (range.e.c - range.s.c);
-          if (count > bestCount) { bestCount = count; bestSheet = name; }
+        // Load SheetJS from CDN
+        if (!window.XLSX) {
+          await new Promise((res, rej) => {
+            const s = document.createElement("script");
+            s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+            s.onload = res; s.onerror = rej;
+            document.head.appendChild(s);
+          });
         }
-        text = XLSX.utils.sheet_to_csv(wb.Sheets[bestSheet], { rawNumbers: false });
-      } else if (ext === "docx" || ext === "doc") {
-        setLoadingMsg("Memuat library Word...");
-        const mammoth = await loadMammoth();
-        setLoadingMsg("Mengekstrak teks dari Word...");
         const ab = await file.arrayBuffer();
-        const result = await mammoth.extractRawText({ arrayBuffer: ab });
+        const wb = window.XLSX.read(ab, { type: "array" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        text = window.XLSX.utils.sheet_to_csv(ws);
+      } else if (ext === "docx") {
+        if (!window.mammoth) {
+          await new Promise((res, rej) => {
+            const s = document.createElement("script");
+            s.src = "https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js";
+            s.onload = res; s.onerror = rej;
+            document.head.appendChild(s);
+          });
+        }
+        const ab = await file.arrayBuffer();
+        const result = await window.mammoth.extractRawText({ arrayBuffer: ab });
         text = result.value;
-      } else if (ext === "pdf") {
-        setLoading(false); setPasteMode(true);
-        showToast("PDF tidak bisa dibaca langsung. Silakan copy-paste isi tabel dari PDF.", "warning");
-        return;
-      } else {
-        throw new Error(`Format .${ext} tidak didukung. Gunakan Excel (.xlsx), CSV, atau Word (.docx).`);
       }
-      if (!text || !text.trim()) throw new Error("File kosong atau tidak ada data yang bisa dibaca.");
-      setLoadingMsg("Menganalisis kolom...");
-      const { matrix, hdrs } = parseTextToMatrix(text);
-      if (!matrix.length) throw new Error("Tidak ada baris data ditemukan.");
-      setHeaders(hdrs);
-      const autoMap = {};
-      hdrs.forEach(h => { const f = guessField(h); if (f) autoMap[h] = f; });
-      if (!Object.keys(autoMap).length) {
-        FIELDS.forEach((f, i) => { if (hdrs[i]) autoMap[hdrs[i]] = f.key; });
+
+      const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+      const parsed = [];
+
+      if (type === "students") {
+        for (const line of lines) {
+          const cols = line.includes(",") ? parseCSVLine(line) : line.split(/	|;/).map(s => s.trim());
+          if (cols.length >= 2) {
+            const name = cols[0]?.replace(/^["']|["']$/g, "").trim();
+            const nisn = cols[1]?.replace(/^["']|["']$/g, "").trim();
+            const kelas = cols[2]?.replace(/^["']|["']$/g, "").trim() || "";
+            const peminatan = cols[3]?.replace(/^["']|["']$/g, "").trim() || "MIPA";
+            if (name && nisn && !/^(nama|name|siswa)/i.test(name)) {
+              parsed.push({ name, nisn, kelas, peminatan });
+            }
+          }
+        }
+      } else if (type === "teachers") {
+        for (const line of lines) {
+          const cols = line.includes(",") ? parseCSVLine(line) : line.split(/	|;/).map(s => s.trim());
+          if (cols.length >= 2) {
+            const name = cols[0]?.replace(/^["']|["']$/g, "").trim();
+            const nip = cols[1]?.replace(/^["']|["']$/g, "").trim();
+            const email = cols[2]?.replace(/^["']|["']$/g, "").trim() || "";
+            if (name && nip && !/^(nama|name|guru)/i.test(name)) {
+              parsed.push({ name, nip, email, subjects: [], photo: "" });
+            }
+          }
+        }
       }
-      setColMap(autoMap);
-      const requiredMapped = FIELDS.filter(f => f.required).every(f => Object.values(autoMap).includes(f.key));
-      if (requiredMapped) {
-        const { result, errs } = buildRows(matrix, autoMap, hdrs);
-        if (result.length) {
-          setRows(matrix); setEditRows(result.map(r => ({ ...r }))); setErrors(errs);
-          setStep("preview");
-          showToast(`${result.length} data berhasil dibaca!`);
-        } else { setRows(matrix); setStep("map"); showToast("Data terbaca tapi kolom perlu dipetakan manual.", "warning"); }
-      } else {
-        setRows(matrix); setStep("map");
-        showToast(`File terbaca (${matrix.length} baris). Petakan kolom di bawah.`, "warning");
-      }
-    } catch(e) { showToast("❌ " + e.message, "error"); }
-    setLoading(false); setLoadingMsg("");
-  };
 
-  const handlePaste = () => {
-    if (!pasteText.trim()) return showToast("Teks kosong", "error");
-    const { matrix, hdrs } = parseTextToMatrix(pasteText);
-    if (!matrix.length) return showToast("Tidak ada data yang terdeteksi", "error");
-    setHeaders(hdrs);
-    const autoMap = {};
-    hdrs.forEach(h => { const f = guessField(h); if (f) autoMap[h] = f; });
-    FIELDS.forEach((f, i) => { if (hdrs[i] && !Object.values(autoMap).includes(f.key)) autoMap[hdrs[i]] = f.key; });
-    setColMap(autoMap);
-    const { result, errs } = buildRows(matrix, autoMap, hdrs);
-    setRows(matrix); setEditRows(result.map(r => ({ ...r }))); setErrors(errs);
-    setPasteMode(false); setStep("preview");
-    showToast(`${result.length} data terdeteksi dari teks!`);
-  };
-
-  const applyColMap = () => {
-    const missing = FIELDS.filter(f => f.required && !Object.values(colMap).includes(f.key)).map(f => f.label);
-    if (missing.length) return showToast("Kolom wajib belum dipilih: " + missing.join(", "), "error");
-    const { result, errs } = buildRows(rows, colMap, headers);
-    if (!result.length) return showToast("Tidak ada data valid setelah mapping.", "error");
-    setEditRows(result.map(r => ({ ...r }))); setErrors(errs); setStep("preview");
-  };
-
-  const handleDrop = (e) => { e.preventDefault(); setDragOver(false); const file = e.dataTransfer.files[0]; if (file) processFile(file); };
-  const updateCell = (rowIdx, field, val) => setEditRows(prev => prev.map((r, i) => i === rowIdx ? { ...r, [field]: val } : r));
-
-  const downloadTemplate = async () => {
-    try {
-      const XLSX = await loadXLSX();
-      const data = isStudent
-        ? [["Nama Lengkap","NISN","Kelas","Peminatan"],["Ahmad Fauzi","1234567890","XII-MIPA 1","MIPA"],["Siti Rahayu","0987654321","XII-IPS 1","IPS"]]
-        : [["Nama Lengkap","NIP","Email"],["Budi Santoso","199001012020011001","budi@sman6.sch.id"]];
-      const ws = XLSX.utils.aoa_to_sheet(data);
-      ws["!cols"] = [{ wch: 30 },{ wch: 20 },{ wch: 15 },{ wch: 12 }];
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, isStudent ? "Data Siswa" : "Data Guru");
-      XLSX.writeFile(wb, (isStudent ? "template_siswa" : "template_guru") + ".xlsx");
-      showToast("Template Excel berhasil diunduh!");
-    } catch {
-      const csv = isStudent
-        ? "Nama Lengkap,NISN,Kelas,Peminatan\nAhmad Fauzi,1234567890,XII-MIPA 1,MIPA"
-        : "Nama Lengkap,NIP,Email\nBudi Santoso,199001012020011001,budi@sman6.sch.id";
-      const a = document.createElement("a");
-      a.href = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
-      a.download = (isStudent ? "template_siswa" : "template_guru") + ".csv";
-      a.click();
+      if (!parsed.length) return showToast("Tidak ada data valid ditemukan. Periksa format file.", "error");
+      setRows(parsed);
+      setStep("preview");
+    } catch(e) {
+      showToast("Gagal membaca file: " + e.message, "error");
     }
+    setLoading(false);
   };
 
-  const validRows = editRows.filter(r => r.name && (isStudent ? r.nisn : r.nip));
+  const isStudent = type === "students";
+  const title = isStudent ? "Import Data Siswa" : "Import Data Guru";
+  const template = isStudent
+    ? "Nama Lengkap,NISN,Kelas,Peminatan\nAhmad Fauzi,1234567890,XII-MIPA 1,MIPA\nSiti Rahayu,0987654321,XII-IPS 1,IPS"
+    : "Nama Lengkap,NIP,Email\nBudi Santoso,199001012020011001,budi@sman6.sch.id";
+
+  const downloadTemplate = () => {
+    const blob = new Blob([template], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = (isStudent ? "template_siswa" : "template_guru") + ".csv";
+    a.click();
+  };
 
   return (
     <Modal title={title} onClose={onClose} wide>
-
-      {/* UPLOAD STEP */}
-      {step === "upload" && !pasteMode && (
+      {step === "upload" && (
         <div className="space-y-4">
-          <div className="p-3 rounded-xl text-sm" style={{ background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.18)" }}>
-            <p className="text-blue-300 font-semibold mb-1">📋 Kolom yang dibutuhkan:</p>
-            <p className="text-xs" style={{ color: "inherit", opacity: 0.8 }}>
-              {isStudent ? "Wajib: Nama Lengkap, NISN — Opsional: Kelas, Peminatan" : "Wajib: Nama Lengkap, NIP — Opsional: Email"}
-            </p>
-            <p className="text-xs mt-1" style={{ color: "inherit", opacity: 0.5 }}>
-              Urutan kolom bebas — header tidak harus persis sama, sistem deteksi otomatis.
-            </p>
-          </div>
-          <div
-            onDragOver={e => { e.preventDefault(); setDragOver(true); }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={handleDrop}
-            className="rounded-2xl transition-all"
-            style={{ border: dragOver ? "2px solid #3b82f6" : "2px dashed rgba(59,130,246,0.35)", background: dragOver ? "rgba(59,130,246,0.1)" : "rgba(15,23,42,0.35)", padding: "2rem" }}
-          >
-            {loading ? (
-              <div className="flex flex-col items-center gap-3 py-2">
-                <div className="w-10 h-10 rounded-full border-2 border-blue-400 border-t-transparent" style={{ animation: "spin 1s linear infinite" }} />
-                <p className="text-blue-300 text-sm font-medium">{loadingMsg || "Memproses..."}</p>
-                <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
-              </div>
-            ) : (
-              <label className="flex flex-col items-center gap-3 cursor-pointer">
-                <div className="w-14 h-14 rounded-2xl flex items-center justify-center" style={{ background: "rgba(59,130,246,0.15)" }}>
-                  <Upload size={28} className="text-blue-400" />
-                </div>
-                <div className="text-center">
-                  <p className="text-white font-semibold mb-1">Seret file ke sini atau klik untuk pilih</p>
-                  <p className="text-xs" style={{ color: "inherit", opacity: 0.5 }}>Excel (.xlsx .xls) · CSV · Word (.docx) · TXT</p>
-                </div>
-                <input type="file" accept=".xlsx,.xls,.csv,.txt,.docx,.doc" onChange={e => { if (e.target.files[0]) processFile(e.target.files[0]); }} className="hidden" />
-              </label>
-            )}
-          </div>
-          <div className="flex items-center gap-3">
-            <div className="flex-1 h-px" style={{ background: "rgba(59,130,246,0.15)" }} />
-            <span className="text-xs" style={{ color: "inherit", opacity: 0.4 }}>atau</span>
-            <div className="flex-1 h-px" style={{ background: "rgba(59,130,246,0.15)" }} />
-          </div>
-          <div className="flex gap-2 flex-wrap">
-            <button onClick={() => setPasteMode(true)} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 transition" style={{ background: "rgba(51,65,85,0.5)", color: "#94a3b8", border: "1px solid rgba(59,130,246,0.15)" }}>
-              📋 Tempel teks / dari PDF
-            </button>
-            <button onClick={downloadTemplate} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 transition" style={{ background: "rgba(22,163,74,0.12)", color: "#4ade80", border: "1px solid rgba(22,163,74,0.2)" }}>
-              <Download size={14} /> Download Template Excel
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* PASTE MODE */}
-      {step === "upload" && pasteMode && (
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <p className="text-blue-300 font-semibold">📋 Tempel teks dari PDF / tabel lain</p>
-            <button onClick={() => setPasteMode(false)} className="text-xs text-slate-400 hover:text-white">← Kembali</button>
-          </div>
-          <p className="text-xs" style={{ color: "inherit", opacity: 0.55 }}>Buka PDF → blok semua teks tabel → Ctrl+C → paste di sini. Kolom bisa dipisah tab, spasi ganda, atau koma.</p>
-          <textarea
-            value={pasteText}
-            onChange={e => setPasteText(e.target.value)}
-            rows={10}
-            placeholder={"Tempel teks di sini...\nContoh:\nAhmad Fauzi\t1234567890\tXII-MIPA 1\nSiti Rahayu\t0987654321\tXII-IPS 1"}
-            className="w-full py-3 px-3 rounded-xl text-sm outline-none font-mono resize-y"
-            style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.3)", color: "inherit" }}
-          />
-          <div className="flex justify-end gap-2">
-            <Btn variant="secondary" onClick={() => setPasteMode(false)}>Batal</Btn>
-            <Btn onClick={handlePaste}><CheckCircle size={14} />Proses Teks</Btn>
-          </div>
-        </div>
-      )}
-
-      {/* COLUMN MAPPING STEP */}
-      {step === "map" && (
-        <div className="space-y-4">
-          <div className="p-3 rounded-xl" style={{ background: "rgba(217,119,6,0.1)", border: "1px solid rgba(217,119,6,0.25)" }}>
-            <p className="text-amber-400 font-semibold mb-1">⚠️ Kolom tidak terdeteksi otomatis</p>
-            <p className="text-xs" style={{ color: "inherit", opacity: 0.75 }}>File <strong>{fileName}</strong> terbaca tapi header tidak dikenali. Petakan kolom secara manual:</p>
-          </div>
-          <div className="space-y-3">
-            {FIELDS.map(f => (
-              <div key={f.key} className="flex items-center gap-3">
-                <div className="w-36 text-sm shrink-0" style={{ color: f.required ? "#60a5fa" : "#94a3b8" }}>
-                  {f.label} {f.required && <span className="text-red-400">*</span>}
-                </div>
-                <select
-                  value={Object.keys(colMap).find(k => colMap[k] === f.key) || ""}
-                  onChange={e => {
-                    const newMap = { ...colMap };
-                    Object.keys(newMap).forEach(k => { if (newMap[k] === f.key) delete newMap[k]; });
-                    if (e.target.value) newMap[e.target.value] = f.key;
-                    setColMap(newMap);
-                  }}
-                  className="flex-1 py-2 px-3 rounded-xl text-sm outline-none"
-                  style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)", color: "inherit" }}
-                >
-                  <option value="">-- Pilih kolom --</option>
-                  {headers.map(h => <option key={h} value={h}>{h}</option>)}
-                </select>
-              </div>
-            ))}
-          </div>
-          {Array.isArray(rows) && rows.length > 0 && (
-            <div>
-              <p className="text-xs text-slate-400 mb-2">Preview 3 baris pertama:</p>
-              <div className="rounded-xl overflow-x-auto" style={{ border: "1px solid rgba(59,130,246,0.15)" }}>
-                {rows.slice(0, 3).map((r, i) => (
-                  <div key={i} className="flex gap-2 px-3 py-2 text-xs font-mono flex-wrap" style={{ background: i%2===0 ? "rgba(15,23,42,0.4)" : "transparent", color: "inherit" }}>
-                    {(Array.isArray(r) ? r : Object.values(r)).map((cell, ci) => (
-                      <span key={ci} className="px-2 py-0.5 rounded" style={{ background: "rgba(59,130,246,0.08)", minWidth: 60 }}>{cell}</span>
-                    ))}
-                  </div>
-                ))}
-              </div>
+          <div className="p-4 rounded-xl" style={{ background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.2)" }}>
+            <p className="text-blue-300 text-sm font-medium mb-2">Format Kolom yang Dibutuhkan:</p>
+            <div className="font-mono text-xs" style={{ color: "inherit", opacity: 0.8 }}>
+              {isStudent ? "Kolom 1: Nama Lengkap | Kolom 2: NISN | Kolom 3: Kelas | Kolom 4: Peminatan" : "Kolom 1: Nama Lengkap | Kolom 2: NIP | Kolom 3: Email (opsional)"}
             </div>
-          )}
-          <div className="flex gap-2 justify-end">
-            <Btn variant="secondary" onClick={() => setStep("upload")}><ArrowLeft size={14} />Ganti File</Btn>
-            <Btn onClick={applyColMap}><CheckCircle size={14} />Terapkan</Btn>
+            <button onClick={downloadTemplate} className="mt-2 text-xs text-blue-400 hover:underline flex items-center gap-1"><Download size={12} />Download Template CSV</button>
           </div>
+          <label className="flex flex-col items-center justify-center gap-3 p-8 rounded-xl cursor-pointer transition" style={{ border: "2px dashed rgba(59,130,246,0.4)", background: "rgba(15,23,42,0.3)" }}>
+            <Upload size={32} className="text-blue-400" />
+            <span className="text-sm font-medium text-blue-300">{loading ? "Membaca file..." : "Klik untuk pilih file"}</span>
+            <span className="text-xs" style={{ color: "inherit", opacity: 0.5 }}>Format: .xlsx, .csv, .txt, .docx</span>
+            <input type="file" accept=".xlsx,.xls,.csv,.txt,.docx" onChange={e => { if (e.target.files[0]) parseFile(e.target.files[0]); }} className="hidden" disabled={loading} />
+          </label>
         </div>
       )}
-
-      {/* PREVIEW & EDIT STEP */}
       {step === "preview" && (
         <div>
-          <div className="flex items-center gap-3 mb-4 flex-wrap">
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-semibold" style={{ background: "rgba(22,163,74,0.15)", color: "#4ade80" }}>
-              <CheckCircle size={14} />{validRows.length} valid
-            </div>
-            {editRows.length - validRows.length > 0 && (
-              <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-semibold" style={{ background: "rgba(220,38,38,0.15)", color: "#f87171" }}>
-                <AlertTriangle size={14} />{editRows.length - validRows.length} bermasalah
-              </div>
-            )}
-            <button onClick={() => setStep("upload")} className="ml-auto text-xs px-3 py-1.5 rounded-lg" style={{ background: "rgba(51,65,85,0.5)", color: "#94a3b8" }}>← Ganti File</button>
+          <div className="flex items-center justify-between mb-4">
+            <span className="text-green-400 font-semibold">{rows.length} data terdeteksi</span>
+            <Btn variant="secondary" onClick={() => setStep("upload")}><ArrowLeft size={14} />Ganti File</Btn>
           </div>
-          <p className="text-xs mb-2" style={{ color: "inherit", opacity: 0.45 }}>Klik sel untuk edit langsung. Baris merah = data tidak lengkap.</p>
           <div className="rounded-xl overflow-hidden mb-4" style={{ border: "1px solid rgba(59,130,246,0.2)" }}>
-            <div className="grid text-xs font-bold px-3 py-2" style={{ gridTemplateColumns: isStudent ? "2fr 1.5fr 1.2fr 1fr auto" : "2fr 1.5fr 1.5fr auto", background: "rgba(59,130,246,0.15)", color: "#60a5fa" }}>
-              <div>Nama Lengkap</div>
+            <div className="grid text-xs font-bold px-3 py-2" style={{ gridTemplateColumns: isStudent ? "1fr 1fr 1fr 1fr" : "1fr 1fr 1fr", background: "rgba(59,130,246,0.15)", color: "#60a5fa" }}>
+              <div>Nama</div>
               <div>{isStudent ? "NISN" : "NIP"}</div>
-              {isStudent ? <div>Kelas</div> : <div>Email</div>}
-              {isStudent && <div>Peminatan</div>}
-              <div></div>
+              {isStudent ? <><div>Kelas</div><div>Peminatan</div></> : <div>Email</div>}
             </div>
-            <div className="max-h-72 overflow-y-auto">
-              {editRows.map((r, i) => {
-                const isValid = r.name && (isStudent ? r.nisn : r.nip);
-                return (
-                  <div key={i} className="grid items-center px-2 py-1 gap-1" style={{ gridTemplateColumns: isStudent ? "2fr 1.5fr 1.2fr 1fr auto" : "2fr 1.5fr 1.5fr auto", background: !isValid ? "rgba(220,38,38,0.08)" : i%2===0 ? "rgba(15,23,42,0.3)" : "transparent", borderLeft: !isValid ? "2px solid rgba(220,38,38,0.4)" : "2px solid transparent" }}>
-                    <input value={r.name||""} onChange={e => updateCell(i,"name",e.target.value)} className="w-full py-1 px-2 rounded text-xs outline-none" style={{ background:"rgba(15,23,42,0.5)", color:!r.name?"#f87171":"inherit", border:"1px solid transparent" }} placeholder="Nama..." />
-                    <input value={isStudent?(r.nisn||""):(r.nip||"")} onChange={e => updateCell(i,isStudent?"nisn":"nip",e.target.value)} className="w-full py-1 px-2 rounded text-xs outline-none font-mono" style={{ background:"rgba(15,23,42,0.5)", color:!(isStudent?r.nisn:r.nip)?"#f87171":"inherit", border:"1px solid transparent" }} placeholder={isStudent?"NISN...":"NIP..."} />
-                    {isStudent ? (
-                      <input value={r.kelas||""} onChange={e => updateCell(i,"kelas",e.target.value)} className="w-full py-1 px-2 rounded text-xs outline-none" style={{ background:"rgba(15,23,42,0.5)", color:"inherit", border:"1px solid transparent" }} placeholder="Kelas..." />
-                    ) : (
-                      <input value={r.email||""} onChange={e => updateCell(i,"email",e.target.value)} className="w-full py-1 px-2 rounded text-xs outline-none" style={{ background:"rgba(15,23,42,0.5)", color:"inherit", border:"1px solid transparent" }} placeholder="Email..." />
-                    )}
-                    {isStudent && (
-                      <select value={r.peminatan||"MIPA"} onChange={e => updateCell(i,"peminatan",e.target.value)} className="w-full py-1 px-2 rounded text-xs outline-none" style={{ background:"rgba(15,23,42,0.5)", color:"inherit", border:"1px solid transparent" }}>
-                        <option>MIPA</option><option>IPS</option><option>Bahasa</option>
-                      </select>
-                    )}
-                    <button onClick={() => setEditRows(prev => prev.filter((_,ri)=>ri!==i))} className="p-1 rounded text-slate-500 hover:text-red-400 shrink-0"><X size={12} /></button>
-                  </div>
-                );
-              })}
+            <div className="max-h-60 overflow-y-auto">
+              {rows.map((r, i) => (
+                <div key={i} className="grid text-xs px-3 py-2" style={{ gridTemplateColumns: isStudent ? "1fr 1fr 1fr 1fr" : "1fr 1fr 1fr", background: i%2===0 ? "rgba(15,23,42,0.3)" : "transparent", color: "inherit" }}>
+                  <div>{r.name}</div>
+                  <div>{isStudent ? r.nisn : r.nip}</div>
+                  {isStudent ? <><div>{r.kelas}</div><div>{r.peminatan}</div></> : <div>{r.email}</div>}
+                </div>
+              ))}
             </div>
           </div>
-          <div className="flex justify-between items-center gap-2 flex-wrap">
-            <button onClick={() => {
-              const empty = isStudent ? { name:"",nisn:"",kelas:"",peminatan:"MIPA" } : { name:"",nip:"",email:"",subjects:[],photo:"" };
-              setEditRows(prev => [...prev, empty]);
-            }} className="text-xs px-3 py-2 rounded-xl flex items-center gap-1" style={{ background:"rgba(51,65,85,0.4)", color:"#94a3b8", border:"1px solid rgba(59,130,246,0.15)" }}>
-              <Plus size={12} /> Tambah baris
-            </button>
-            <div className="flex gap-2">
-              <Btn variant="secondary" onClick={onClose}>Batal</Btn>
-              <Btn variant="success" onClick={() => {
-                const final = editRows.filter(r => r.name && (isStudent ? r.nisn : r.nip));
-                if (!final.length) return showToast("Tidak ada data valid untuk diimpor","error");
-                onImport(final);
-              }}><CheckCircle size={14} />Import {validRows.length} Data</Btn>
-            </div>
+          <div className="flex justify-end gap-2">
+            <Btn variant="secondary" onClick={onClose}>Batal</Btn>
+            <Btn variant="success" onClick={() => onImport(rows)}><CheckCircle size={14} />Import {rows.length} Data</Btn>
           </div>
         </div>
       )}
@@ -1618,6 +1356,20 @@ function AIGenerateModal({ data, onImport, onClose, showToast, userId, subjectFi
   const availableSubjects = subjectFilter
     ? (data.subjects || []).filter(s => s.id === subjectFilter)
     : (data.subjects || []);
+
+  // Guard: teacher has no subjects assigned
+  if (availableSubjects.length === 0) {
+    return (
+      <Modal onClose={onClose} wide>
+        <div className="text-center py-8">
+          <BookOpen size={48} className="mx-auto mb-4 text-slate-500" />
+          <p className="text-amber-400 font-semibold mb-2">Belum Ada Mata Pelajaran yang Diampu</p>
+          <p className="text-sm text-slate-400 mb-4">Hubungi admin untuk menetapkan mata pelajaran yang Anda ampu sebelum menggunakan AI Generate.</p>
+          <Btn variant="secondary" onClick={onClose}>Tutup</Btn>
+        </div>
+      </Modal>
+    );
+  }
 
   const PROMPT_EXAMPLES = [
     "Fokus pada soal aplikasi dan analisis (bukan hafalan)",
@@ -2038,7 +1790,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     if (filterType !== "all" && (q.type || "pilgan") !== filterType) return false;
     return true;
   });
-  const myCount = userId ? allQ.filter(q => q.createdBy === userId).length : allQ.length;
+  const myCount = userId ? subjectFilteredQ.filter(q => q.createdBy === userId).length : allQ.length;
 
   const defaultSubjectId = visibleSubjects[0]?.id || "";
 
@@ -2120,7 +1872,10 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     showToast(`${importedQuestions.length} soal berhasil diimpor`);
   };
 
-  const getSubjectName = (sid) => { if (!sid) return "—"; return (data.subjects || []).find(s => s.id === sid)?.name || "—"; };
+  const getSubjectName = (sid) => {
+    if (!sid) return "⚠️ Mapel tidak diset";
+    return (data.subjects || []).find(s => s.id === sid)?.name || "⚠️ Mapel tidak dikenal";
+  };
 
   // Science editor: insert text into a specific field
   const handleScienceInsert = (text) => {
@@ -2312,6 +2067,20 @@ function ImportSoalModal({ data, onImport, onClose, showToast, visibleSubjects }
   const subjects = visibleSubjects || data.subjects || [];
   const [step, setStep] = useState("upload");
   const [subjectId, setSubjectId] = useState(subjects[0]?.id || "");
+
+  // Guard: no subjects available for this teacher
+  if (subjects.length === 0) {
+    return (
+      <Modal title="Import Soal dari Dokumen" onClose={onClose} wide>
+        <div className="text-center py-8">
+          <BookOpen size={48} className="mx-auto mb-4 text-slate-500" />
+          <p className="text-amber-400 font-semibold mb-2">Belum Ada Mata Pelajaran yang Diampu</p>
+          <p className="text-sm text-slate-400 mb-4">Hubungi admin untuk menetapkan mata pelajaran yang Anda ampu sebelum mengimpor soal.</p>
+          <Btn variant="secondary" onClick={onClose}>Tutup</Btn>
+        </div>
+      </Modal>
+    );
+  }
   const [rawText, setRawText] = useState("");
   const [parsed, setParsed] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -2492,7 +2261,12 @@ function ImportSoalModal({ data, onImport, onClose, showToast, visibleSubjects }
       {step === "preview" && (
         <div>
           <div className="flex items-center justify-between mb-4">
-            <div className="text-green-400 font-semibold">{parsed.length} soal terdeteksi</div>
+            <div>
+              <div className="text-green-400 font-semibold">{parsed.length} soal terdeteksi</div>
+              <div className="text-xs text-blue-300 mt-1">
+                Akan diimpor ke: <strong>{subjects.find(s => s.id === subjectId)?.name || "-"}</strong>
+              </div>
+            </div>
             <Btn variant="secondary" onClick={() => setStep("upload")}><ArrowLeft size={14} />Kembali</Btn>
           </div>
           {importProgress && (
@@ -2538,8 +2312,7 @@ function ExamManager({ data, dataRef, saveData, showToast, isAdmin, userId }) {
   const openAdd = () => {
     setEditId(null);
     const now = new Date(); const later = new Date(now.getTime() + 2 * 3600000);
-    const latest = dataRef?.current || data;
-    setForm({ title: "", subjectId: (latest.subjects || [])[0]?.id || "", targetKelas: [], duration: 90, startTime: now.toISOString().slice(0, 16), endTime: later.toISOString().slice(0, 16), shuffleQuestions: true, shuffleOptions: false, showResult: true, questionIds: [] });
+    setForm({ title: "", subjectId: (data.subjects || [])[0]?.id || "", targetKelas: [], duration: 90, startTime: now.toISOString().slice(0, 16), endTime: later.toISOString().slice(0, 16), shuffleQuestions: true, shuffleOptions: false, showResult: true, questionIds: [] });
     setShowModal(true);
   };
   const openEdit = (ex) => { setEditId(ex.id); setForm({ ...ex }); setShowModal(true); };
@@ -2581,7 +2354,7 @@ function ExamManager({ data, dataRef, saveData, showToast, isAdmin, userId }) {
     showToast("Ujian dihapus");
   };
 
-  const getSubjectName = (sid) => { if (!sid) return "—"; return (data.subjects || []).find(s => s.id === sid)?.name || "—"; };
+  const getSubjectName = (sid) => (data.subjects || []).find(s => s.id === sid)?.name || "-";
   const myExams = isAdmin ? data.exams : data.exams.filter(e => e.createdBy === userId);
   const statusColors = { draft: { bg: "rgba(100,116,139,0.2)", text: "#94a3b8" }, active: { bg: "rgba(22,163,74,0.2)", text: "#4ade80" }, ended: { bg: "rgba(220,38,38,0.2)", text: "#f87171" } };
   const statusLabels = { draft: "Draft", active: "Aktif", ended: "Selesai" };
@@ -2696,12 +2469,11 @@ function MonitorView({ data }) {
   const [liveResults, setLiveResults] = useState({});
   const [, forceUpdate] = useState(0);
 
-  // Auto-refresh every 5s for live data (only when viewing an exam to reduce renders)
+  // Auto-refresh every 3s for live data
   useEffect(() => {
-    if (!selectedExam) return;
-    const iv = setInterval(() => forceUpdate(n => n + 1), 5000);
+    const iv = setInterval(() => forceUpdate(n => n + 1), 3000);
     return () => clearInterval(iv);
-  }, [selectedExam]);
+  }, []);
 
   // Subscribe to live sessions and results when exam selected
   useEffect(() => {
@@ -3069,7 +2841,7 @@ function ResultsView({ data }) {
               </div>
             </div>
           )}
-        </Card>
+        </Card>}
 
         {notSubmitted.length > 0 && (
           <Card className="mt-4">
@@ -3140,8 +2912,7 @@ function ResultsView({ data }) {
         <div className="space-y-3">
           {examsWithData.map(ex => {
             const results = getExamResults(ex.id);
-            const scoredR = results.filter(r => r.score != null);
-          const avg = scoredR.length > 0 ? (scoredR.reduce((a, r) => a + r.score, 0) / scoredR.length).toFixed(1) : "-";
+            const avg = results.length > 0 ? (results.reduce((a, r) => a + r.score, 0) / results.length).toFixed(1) : "-";
             const passCount = results.filter(r => r.score >= 75).length;
             return (
               <Card key={ex.id} className="cursor-pointer hover:border-blue-500/40 transition" onClick={() => setSelectedExam(ex.id)}>
@@ -3451,13 +3222,13 @@ function TeacherDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
       {tab === "exams" && <ExamManager data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} userId={user.id} />}
       {tab === "monitor" && <MonitorView data={data} />}
       {tab === "results" && <ResultsView data={data} />}
-      {tab === "profile" && <TeacherProfile data={data} dataRef={dataRef} saveData={saveData} user={user} showToast={showToast} updateUserSession={updateUserSession} />}
+      {tab === "profile" && <TeacherProfile data={data} saveData={saveData} user={user} showToast={showToast} updateUserSession={updateUserSession} />}
     </DashboardLayout>
   );
 }
 
 // ============= TEACHER PROFILE =============
-function TeacherProfile({ data, dataRef, saveData, user, showToast, updateUserSession }) {
+function TeacherProfile({ data, saveData, user, showToast, updateUserSession }) {
   const [pw, setPw] = useState({ old: "", new1: "", new2: "" });
   const [photo, setPhoto] = useState(user.photo || "");
 
@@ -3467,9 +3238,8 @@ function TeacherProfile({ data, dataRef, saveData, user, showToast, updateUserSe
     if (pw.old !== currentPassword) return showToast("Password/NIP lama salah", "error");
     if (pw.new1.length < 4) return showToast("Password baru minimal 4 karakter", "error");
     if (pw.new1 !== pw.new2) return showToast("Konfirmasi tidak cocok", "error");
-    const latest = dataRef?.current || data;
-    const teachers = (latest.teachers || []).map(t => t.id === user.id ? { ...t, password: pw.new1 } : t);
-    saveData({ ...latest, teachers }, ["teachers"]);
+    const teachers = data.teachers.map(t => t.id === user.id ? { ...t, password: pw.new1 } : t);
+    saveData({ ...data, teachers }, ["teachers"]);
     const updatedUser = { ...user, password: pw.new1 };
     updateUserSession(updatedUser);
     setPw({ old: "", new1: "", new2: "" });
@@ -3477,9 +3247,8 @@ function TeacherProfile({ data, dataRef, saveData, user, showToast, updateUserSe
   };
 
   const handleSavePhoto = () => {
-    const latest = dataRef?.current || data;
-    const teachers = (latest.teachers || []).map(t => t.id === user.id ? { ...t, photo } : t);
-    saveData({ ...latest, teachers }, ["teachers"]);
+    const teachers = data.teachers.map(t => t.id === user.id ? { ...t, photo } : t);
+    saveData({ ...data, teachers }, ["teachers"]);
     updateUserSession({ ...user, photo });
     showToast("Foto profil disimpan");
   };
@@ -3538,9 +3307,7 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
   });
 
   const myResults = (data.results || []).filter(r => r.studentId === user.id);
-  // sessions at top level may be empty; check dataRef for sessions added by ExamTaker
-  const _sessions = dataRef?.current?.sessions || data.sessions || [];
-  const resumableSessions = _sessions.filter(s => s.studentId === user.id && s.status === "active" && data.exams.find(e => e.id === s.examId && e.status === "active"));
+  const resumableSessions = (data.sessions || []).filter(s => s.studentId === user.id && s.status === "active" && data.exams.find(e => e.id === s.examId && e.status === "active"));
 
   const tabs = [
     { id: "exams", label: "Ujian Tersedia", icon: <FileText size={18} /> },
@@ -3643,13 +3410,10 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
                         {r.submittedAt && <div className="text-slate-500 text-xs mt-0.5">{new Date(r.submittedAt).toLocaleString("id-ID")}</div>}
                       </div>
                       <div className="text-right">
-                        {r.score != null ? (
-                          <span className="px-3 py-1 rounded-full text-lg font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
-                            {r.score.toFixed(1)}
-                          </span>
-                        ) : (
-                          <span className="px-2 py-1 rounded-full text-xs font-semibold" style={{ background: "rgba(168,85,247,0.2)", color: "#c084fc" }}>Dinilai</span>
-                        )}
+                        <span className="px-3 py-1 rounded-full text-lg font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
+                          {r.score.toFixed(1)}
+                        </span>
+
                       </div>
                     </div>
                   </Card>
@@ -3661,7 +3425,7 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
       )}
 
       {tab === "tryout" && <TryoutView data={data} user={user} showToast={showToast} />}
-      {tab === "profile" && <StudentProfile data={data} dataRef={dataRef} saveData={saveData} user={user} showToast={showToast} updateUserSession={updateUserSession} />}
+      {tab === "profile" && <StudentProfile data={data} saveData={saveData} user={user} showToast={showToast} updateUserSession={updateUserSession} />}
     </DashboardLayout>
   );
 }
@@ -3712,7 +3476,7 @@ function TryoutView({ data, user, showToast }) {
                   </div>
                   {(qType === "pilgan" || qType === "benar_salah") && (
                     <div className="text-xs space-y-1 ml-6">
-                      {userAns !== undefined && userAns !== q.correctAnswer && <div style={{ color: "#f87171" }}>Jawaban kamu: {qType === "benar_salah" ? (userAns === 0 ? "Benar" : "Salah") : (q.options?.[userAns] != null ? String.fromCharCode(65+userAns)+". "+q.options[userAns] : "—")}</div>}
+                      {userAns !== undefined && userAns !== q.correctAnswer && <div style={{ color: "#f87171" }}>Jawaban kamu: {qType === "benar_salah" ? (userAns === 0 ? "Benar" : "Salah") : (q.options?.[userAns] ? String.fromCharCode(65+userAns)+". "+q.options[userAns] : "-")}</div>}
                       <div style={{ color: "#4ade80" }}>Kunci: {qType === "benar_salah" ? (q.correctAnswer === 0 ? "Benar" : "Salah") : (q.options?.[q.correctAnswer] ? String.fromCharCode(65+q.correctAnswer)+". "+q.options[q.correctAnswer] : "-")}</div>
                       {q.explanation && <div className="text-blue-300 mt-1">💡 {q.explanation}</div>}
                     </div>
@@ -3861,21 +3625,19 @@ function TryoutTaker({ data, user, exam, onFinish, showToast }) {
 }
 
 // ============= STUDENT PROFILE =============
-function StudentProfile({ data, dataRef, saveData, user, showToast, updateUserSession }) {
+function StudentProfile({ data, saveData, user, showToast, updateUserSession }) {
   const [photo, setPhoto] = useState(user.photo || "");
 
   const handleSavePhoto = () => {
-    const latest = dataRef?.current || data;
-    const students = (latest.students || []).map(s => s.id === user.id ? { ...s, photo } : s);
-    saveData({ ...latest, students }, ["students"]);
+    const students = data.students.map(s => s.id === user.id ? { ...s, photo } : s);
+    saveData({ ...data, students }, ["students"]);
     updateUserSession({ ...user, photo });
     showToast("Foto profil disimpan");
   };
 
   const myResults = (data.results || []).filter(r => r.studentId === user.id);
-  const scoredMyResults = myResults.filter(r => r.score != null);
-  const avg = scoredMyResults.length > 0 ? (scoredMyResults.reduce((a, r) => a + r.score, 0) / scoredMyResults.length).toFixed(1) : "-";
-  const best = scoredMyResults.length > 0 ? Math.max(...scoredMyResults.map(r => r.score)).toFixed(1) : "-";
+  const avg = myResults.length > 0 ? (myResults.reduce((a, r) => a + r.score, 0) / myResults.length).toFixed(1) : "-";
+  const best = myResults.length > 0 ? Math.max(...myResults.map(r => r.score)).toFixed(1) : "-";
 
   return (
     <div>
@@ -3903,12 +3665,7 @@ function StudentProfile({ data, dataRef, saveData, user, showToast, updateUserSe
 // ============= EXAM TAKER (STUDENT) =============
 function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast }) {
   // Check for existing session to resume
-  // Note: data.sessions is always [] at top level (sessions are per-exam in Firestore).
-  // We check dataRef.current which may have sessions updated by doSaveSession's direct assignment.
-  const existingSession = useMemo(() => {
-    const allSessions = dataRef?.current?.sessions || data.sessions || [];
-    return allSessions.find(s => s.examId === exam.id && s.studentId === user.id && s.status === "active");
-  }, []); // empty deps: only check on mount, not on every render
+  const existingSession = useMemo(() => (data.sessions || []).find(s => s.examId === exam.id && s.studentId === user.id && s.status === "active"), []);
 
   const questions = useMemo(() => {
     let qs = exam.questionIds.map(id => data.questions.find(q => q.id === id)).filter(Boolean);
@@ -4080,10 +3837,11 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
     return () => clearInterval(iv);
   }, [submitted]);
 
-  // Save on answer change with debounce (answersRef is kept current by its own effect above)
+  // Save on answer change with debounce
   useEffect(() => {
+    answersRef.current = answers;
     if (submittedRef.current) return;
-    const t = setTimeout(() => doSaveSession("active"), 1200);
+    const t = setTimeout(() => doSaveSession("active"), 1000);
     return () => clearTimeout(t);
   }, [answers]);
 
@@ -4109,7 +3867,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
       // essay/uraian: marked as "answered" if non-empty, scored by teacher later
     });
     const hasEssay = questions.some(q => q.type === "esai" || q.type === "uraian");
-    const score = pilganCount > 0 ? Math.round((correct / pilganCount) * 1000) / 10 : (hasEssay ? null : 0);
+    const score = pilganCount > 0 ? (correct / pilganCount) * 100 : (hasEssay ? null : 0);
     const resultData = { id: genId(), examId: exam.id, studentId: user.id, answers: { ...finalAnswers }, correct, pilganCount, score, hasEssay, needsGrading: hasEssay, violations: finalViolations, submittedAt: Date.now() };
     setResult(resultData);
 
@@ -4130,7 +3888,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
       dataRef.current = { ...dataRef.current, results, sessions };
     }
     showToast(auto ? "Waktu habis! Jawaban dikumpulkan otomatis." : "Jawaban berhasil dikumpulkan!");
-  }, [questions, exam, user, showToast]); // removed: data (use dataRef), saveData (never called here)
+  }, [questions, exam, user, data, saveData, showToast]);
 
   // Keep ref always up-to-date so timer can call latest version without stale closure
   useEffect(() => { handleSubmitRef.current = handleSubmit; }, [handleSubmit]);
@@ -4148,10 +3906,8 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
           <p className="text-slate-400 mb-4">{exam.title}</p>
           {exam.showResult ? (
             <div className="space-y-3 mb-6">
-              <div className="text-6xl font-bold" style={{ color: (result.score ?? 0) >= 75 ? "#4ade80" : (result.score ?? 0) >= 50 ? "#fbbf24" : "#f87171" }}>
-                {result.score != null ? result.score.toFixed(1) : "—"}
-              </div>
-              <div className="text-slate-300">Benar: {result.correct} dari {questions.filter(q => !q.type || q.type === "pilgan" || q.type === "benar_salah").length || questions.length} soal objektif</div>
+              <div className="text-6xl font-bold" style={{ color: result.score >= 75 ? "#4ade80" : result.score >= 50 ? "#fbbf24" : "#f87171" }}>{result.score.toFixed(1)}</div>
+              <div className="text-slate-300">Benar: {result.correct} dari {questions.length} soal</div>
 
               {violations > 0 && <div className="text-red-400 text-sm flex items-center justify-center gap-1"><AlertTriangle size={14} />Pelanggaran: {violations}x</div>}
             </div>

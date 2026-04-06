@@ -2072,14 +2072,20 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
 
   // Teacher: only show their subjects; Admin: show all
   const teacherSubjects = userId ? (data.teachers || []).find(t => t.id === userId)?.subjects || [] : null;
-  const visibleSubjects = teacherSubjects
+
+  // BUG FIX: [] (array kosong) di JavaScript adalah TRUTHY, sehingga kondisi
+  // `teacherSubjects ?` akan masuk ke filter meski tidak ada mapel yang diampu,
+  // menghasilkan visibleSubjects=[] dan subjectFilteredQ=[] (soal tidak bisa disimpan).
+  // Solusi: gunakan teacherSubjects?.length > 0 (falsy jika kosong).
+  const hasSubjectFilter = teacherSubjects !== null && teacherSubjects.length > 0;
+  const visibleSubjects = hasSubjectFilter
     ? (data.subjects || []).filter(s => teacherSubjects.includes(s.id))
     : (data.subjects || []);
 
   const [showMineOnly, setShowMineOnly] = useState(false);
   const allQ = data.questions || [];
-  // Guru only sees questions for their subjects
-  const subjectFilteredQ = teacherSubjects
+  // Guru only sees questions for their subjects (jika ada mapel yang diampu)
+  const subjectFilteredQ = hasSubjectFilter
     ? allQ.filter(q => teacherSubjects.includes(q.subjectId))
     : allQ;
   const baseQ = (userId && showMineOnly) ? subjectFilteredQ.filter(q => q.createdBy === userId) : subjectFilteredQ;
@@ -2112,6 +2118,10 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
   };
 
   const handleSave = async () => {
+    // Jika guru belum diampu mapel apapun, beri pesan yang spesifik
+    if (userId && visibleSubjects.length === 0) {
+      return showToast("Anda belum memiliki mata pelajaran yang diampu. Hubungi Admin untuk menambahkan mapel.", "error");
+    }
     if (!form.subjectId || !form.text.trim()) return showToast("Mapel dan teks soal wajib diisi", "error");
     if (form.type === "pilgan") {
       const validOpts = form.options.filter(o => o.trim());
@@ -2203,6 +2213,16 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
           <Btn onClick={openAdd}><Plus size={16} />Tambah Soal</Btn>
         </div>
       </div>
+
+      {userId && visibleSubjects.length === 0 && (
+        <div className="mb-4 p-4 rounded-xl flex items-start gap-3" style={{ background: "rgba(234,179,8,0.1)", border: "1px solid rgba(234,179,8,0.3)" }}>
+          <AlertTriangle size={18} className="text-yellow-400 shrink-0 mt-0.5" />
+          <div>
+            <p className="text-yellow-400 text-sm font-semibold">Belum ada Mata Pelajaran yang Diampu</p>
+            <p className="text-yellow-300 text-xs mt-0.5 opacity-80">Minta Admin untuk menambahkan mata pelajaran Anda di menu <strong>Data Guru</strong>. Setelah itu Anda dapat menambah dan melihat soal.</p>
+          </div>
+        </div>
+      )}
 
       {bulkMode && selectedIds.size > 0 && (
         <div className="mb-4 p-3 rounded-xl flex items-center justify-between" style={{ background: "rgba(220,38,38,0.1)", border: "1px solid rgba(220,38,38,0.2)" }}>

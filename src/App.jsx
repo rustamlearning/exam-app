@@ -3069,7 +3069,7 @@ function ResultsView({ data }) {
               </div>
             </div>
           )}
-        </Card>}
+        </Card>
 
         {notSubmitted.length > 0 && (
           <Card className="mt-4">

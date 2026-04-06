@@ -347,7 +347,7 @@ export default function ExamApp() {
       // 2. Load all collections in parallel
       try {
         const vals = await Promise.all(COLS.map(col => store.getCol(col)));
-        const fbD = {
+        const d = {
           meta: vals[0] || DEFAULT_DATA.meta,
           teachers: vals[1] || [],
           students: vals[2] || [],
@@ -357,20 +357,6 @@ export default function ExamApp() {
           sessions: vals[6] || [],
           results: vals[7] || [],
         };
-        // FIX BUG 3: If localStorage has MORE data than Firestore, it means
-        // a previous Firestore write failed silently (Bug 2 scenario).
-        // Keep the local version for those collections to prevent data loss on reload.
-        const localCached = ls.get(CACHE_KEY);
-        const d = { ...fbD };
-        if (localCached) {
-          if ((localCached.questions?.length || 0) > (fbD.questions?.length || 0)) {
-            d.questions = localCached.questions;
-            console.warn("[data-merge] localStorage has more questions than Firestore. Keeping local. A previous write may have failed.");
-          }
-          if ((localCached.teachers?.length || 0) > (fbD.teachers?.length || 0)) d.teachers = localCached.teachers;
-          if ((localCached.students?.length || 0) > (fbD.students?.length || 0)) d.students = localCached.students;
-          if ((localCached.exams?.length || 0) > (fbD.exams?.length || 0)) d.exams = localCached.exams;
-        }
         setData(d);
         setLoading(false);
         ls.set(CACHE_KEY, d);
@@ -409,7 +395,9 @@ export default function ExamApp() {
         const u = store.listenCol(col, (val, meta) => {
           if (val === null || val === undefined) return;
           if (meta.hasPendingWrites) return;
-          if (Date.now() - (writeTimesRef.current[col] || 0) < 1500) return;
+          // Guard: ignore Firestore snapshots for 8s after a local write
+          // Prevents slow-network round-trips from overwriting freshly saved data
+          if (Date.now() - (writeTimesRef.current[col] || 0) < 8000) return;
           setData(prev => {
             if (!prev) return prev;
             const next = { ...prev, [col]: val };
@@ -425,10 +413,9 @@ export default function ExamApp() {
 
   const saveData = useCallback(async (newData, hints) => {
     if (!newData) return;
+    // Update dataRef synchronously FIRST so subsequent rapid saves use fresh data
+    dataRef.current = newData;
     setData(newData);
-    // FIX BUG 1: Update dataRef immediately so rapid consecutive saves
-    // always read the latest data, not stale data from previous render cycle.
-    if (dataRef.current !== undefined) dataRef.current = newData;
     ls.set(CACHE_KEY, newData);
     ls.set(BACKUP_KEY, newData);
     // --- BACKUP SYSTEM: save to rotating localStorage slots ---
@@ -437,35 +424,23 @@ export default function ExamApp() {
       const prev = dataRef.current;
       return newData[col] !== undefined && (!prev || JSON.stringify(newData[col]) !== JSON.stringify(prev[col]));
     });
-    // FIX BUG 2: Track which columns fail to write so we can alert the user.
-    const failedCols = [];
     await Promise.all(toSave.map(async col => {
       if (newData[col] === undefined) return;
       writeTimesRef.current[col] = Date.now();
       try { await store.setCol(col, newData[col]); }
       catch(e) {
-        console.error("saveData first attempt failed for col:", col, e);
-        // Retry once after a short delay
         await new Promise(r => setTimeout(r, 1500));
-        try { await store.setCol(col, newData[col]); }
-        catch(e2) {
-          console.error("saveData retry also failed for col:", col, e2);
-          failedCols.push(col);
-        }
+        store.setCol(col, newData[col]).catch(console.error);
       }
     }));
-    if (failedCols.length > 0) {
-      // Show visible error so teacher knows the save did NOT reach the server.
-      // Data is still in localStorage so it won't be lost on this device,
-      // but it will be gone after a hard reload if Firestore never gets updated.
-      showToast("⚠️ Gagal menyimpan ke server! Data tersimpan sementara di perangkat ini saja. Coba lagi atau periksa koneksi internet.", "error");
-    }
     // --- BACKUP SYSTEM: async Firebase backup (non-blocking) ---
     store.saveBackup(newData).catch(console.warn);
-  }, [showToast]);
+  }, []);
 
 
   // Expose dataRef so ExamTaker can always access latest data
+  // NOTE: saveData already sets dataRef.current synchronously.
+  // This effect only catches external updates (e.g. from Firestore realtime listener).
   const dataRef = useRef(null);
   useEffect(() => { dataRef.current = data; }, [data]);
 
@@ -2072,21 +2047,16 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
 
   // Teacher: only show their subjects; Admin: show all
   const teacherSubjects = userId ? (data.teachers || []).find(t => t.id === userId)?.subjects || [] : null;
-
-  // BUG FIX: [] (array kosong) di JavaScript adalah TRUTHY, sehingga kondisi
-  // `teacherSubjects ?` akan masuk ke filter meski tidak ada mapel yang diampu,
-  // menghasilkan visibleSubjects=[] dan subjectFilteredQ=[] (soal tidak bisa disimpan).
-  // Solusi: gunakan teacherSubjects?.length > 0 (falsy jika kosong).
-  const hasSubjectFilter = teacherSubjects !== null && teacherSubjects.length > 0;
-  const visibleSubjects = hasSubjectFilter
+  const visibleSubjects = teacherSubjects
     ? (data.subjects || []).filter(s => teacherSubjects.includes(s.id))
     : (data.subjects || []);
 
   const [showMineOnly, setShowMineOnly] = useState(false);
   const allQ = data.questions || [];
-  // Guru only sees questions for their subjects (jika ada mapel yang diampu)
-  const subjectFilteredQ = hasSubjectFilter
-    ? allQ.filter(q => teacherSubjects.includes(q.subjectId))
+  // Guru sees: questions for their subjects OR questions they personally created
+  // (prevents own questions from disappearing when subjectId doesn't match teacherSubjects)
+  const subjectFilteredQ = teacherSubjects
+    ? allQ.filter(q => teacherSubjects.includes(q.subjectId) || (userId && q.createdBy === userId))
     : allQ;
   const baseQ = (userId && showMineOnly) ? subjectFilteredQ.filter(q => q.createdBy === userId) : subjectFilteredQ;
   const filtered = baseQ.filter(q => {
@@ -2117,15 +2087,15 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     reader.readAsDataURL(file);
   };
 
-  const handleSave = async () => {
-    // Jika guru belum diampu mapel apapun, beri pesan yang spesifik
-    if (userId && visibleSubjects.length === 0) {
-      return showToast("Anda belum memiliki mata pelajaran yang diampu. Hubungi Admin untuk menambahkan mapel.", "error");
-    }
+  const handleSave = () => {
     if (!form.subjectId || !form.text.trim()) return showToast("Mapel dan teks soal wajib diisi", "error");
     if (form.type === "pilgan") {
       const validOpts = form.options.filter(o => o.trim());
       if (validOpts.length < 2) return showToast("Minimal 2 pilihan jawaban", "error");
+    }
+    // Warn if teacher's subjectId is not in their assigned subjects (would make question invisible to filter)
+    if (userId && teacherSubjects && form.subjectId && !teacherSubjects.includes(form.subjectId)) {
+      showToast("Perhatian: mapel ini bukan mapel yang Anda ampu. Soal tetap disimpan.", "warning");
     }
     const latest = dataRef?.current || data;
     let questions = [...(latest.questions || [])];
@@ -2137,11 +2107,9 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     };
     if (editId) questions = questions.map(q => q.id === editId ? { ...q, ...qData } : q);
     else questions.push({ id: genId(), ...qData });
-    // FIX: await saveData so error toast from failed Firestore write is shown
-    // AFTER the success toast (saveData will override with error if write fails).
+    saveData({ ...latest, questions }, ["questions"]);
     setShowModal(false);
-    showToast(editId ? "Soal diperbarui" : "Soal berhasil ditambahkan ke bank soal");
-    await saveData({ ...latest, questions }, ["questions"]);
+    showToast(editId ? "Soal diperbarui" : "Soal berhasil ditambahkan");
   };
 
   const handleDelete = (id) => {
@@ -2213,16 +2181,6 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
           <Btn onClick={openAdd}><Plus size={16} />Tambah Soal</Btn>
         </div>
       </div>
-
-      {userId && visibleSubjects.length === 0 && (
-        <div className="mb-4 p-4 rounded-xl flex items-start gap-3" style={{ background: "rgba(234,179,8,0.1)", border: "1px solid rgba(234,179,8,0.3)" }}>
-          <AlertTriangle size={18} className="text-yellow-400 shrink-0 mt-0.5" />
-          <div>
-            <p className="text-yellow-400 text-sm font-semibold">Belum ada Mata Pelajaran yang Diampu</p>
-            <p className="text-yellow-300 text-xs mt-0.5 opacity-80">Minta Admin untuk menambahkan mata pelajaran Anda di menu <strong>Data Guru</strong>. Setelah itu Anda dapat menambah dan melihat soal.</p>
-          </div>
-        </div>
-      )}
 
       {bulkMode && selectedIds.size > 0 && (
         <div className="mb-4 p-3 rounded-xl flex items-center justify-between" style={{ background: "rgba(220,38,38,0.1)", border: "1px solid rgba(220,38,38,0.2)" }}>

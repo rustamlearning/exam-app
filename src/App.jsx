@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo, createContext, useContext } from "react";
-import { BookOpen, Users, GraduationCap, Settings, LogOut, Plus, Trash2, Edit, Eye, Clock, AlertTriangle, CheckCircle, XCircle, Monitor, Upload, ChevronRight, Menu, X, Search, FileText, BarChart3, Shield, Lock, Save, RefreshCw, ChevronDown, ArrowLeft, Home, User, Hash, Layers, Play, Square, Award, Bell, AlertCircle, Printer, Camera, Key, Download } from "lucide-react";
+import { BookOpen, Users, GraduationCap, Settings, LogOut, Plus, Trash2, Edit, Eye, Clock, AlertTriangle, CheckCircle, XCircle, Monitor, Upload, ChevronRight, Menu, X, Search, FileText, BarChart3, Shield, Lock, Save, RefreshCw, ArrowLeft, Home, User, Hash, Layers, Play, Square, Award, Printer, Camera, Key, Download } from "lucide-react";
 import { initializeApp } from "firebase/app";
 import { getFirestore, doc, getDoc, setDoc, onSnapshot, runTransaction } from "firebase/firestore";
 
@@ -479,7 +479,7 @@ export default function ExamApp() {
   if (loading) return <LoadingScreen />;
 
   return (
-    <ThemeCtx.Provider value={{ theme, toggleTheme, isDark, T }}>
+    <ThemeCtx.Provider value={useMemo(() => ({ theme, toggleTheme, isDark, T }), [theme, toggleTheme, isDark, T])}>
     <div className="min-h-screen" style={{ background: T.bg }}>
       {toast && <Toast msg={toast.msg} type={toast.type} />}
       {view === "login" && <LoginScreen onLogin={handleLogin} />}
@@ -3451,13 +3451,13 @@ function TeacherDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
       {tab === "exams" && <ExamManager data={data} dataRef={dataRef} saveData={saveData} showToast={showToast} userId={user.id} />}
       {tab === "monitor" && <MonitorView data={data} />}
       {tab === "results" && <ResultsView data={data} />}
-      {tab === "profile" && <TeacherProfile data={data} saveData={saveData} user={user} showToast={showToast} updateUserSession={updateUserSession} />}
+      {tab === "profile" && <TeacherProfile data={data} dataRef={dataRef} saveData={saveData} user={user} showToast={showToast} updateUserSession={updateUserSession} />}
     </DashboardLayout>
   );
 }
 
 // ============= TEACHER PROFILE =============
-function TeacherProfile({ data, saveData, user, showToast, updateUserSession }) {
+function TeacherProfile({ data, dataRef, saveData, user, showToast, updateUserSession }) {
   const [pw, setPw] = useState({ old: "", new1: "", new2: "" });
   const [photo, setPhoto] = useState(user.photo || "");
 
@@ -3467,8 +3467,9 @@ function TeacherProfile({ data, saveData, user, showToast, updateUserSession }) 
     if (pw.old !== currentPassword) return showToast("Password/NIP lama salah", "error");
     if (pw.new1.length < 4) return showToast("Password baru minimal 4 karakter", "error");
     if (pw.new1 !== pw.new2) return showToast("Konfirmasi tidak cocok", "error");
-    const teachers = (data.teachers || []).map(t => t.id === user.id ? { ...t, password: pw.new1 } : t);
-    saveData({ ...data, teachers }, ["teachers"]);
+    const latest = dataRef?.current || data;
+    const teachers = (latest.teachers || []).map(t => t.id === user.id ? { ...t, password: pw.new1 } : t);
+    saveData({ ...latest, teachers }, ["teachers"]);
     const updatedUser = { ...user, password: pw.new1 };
     updateUserSession(updatedUser);
     setPw({ old: "", new1: "", new2: "" });
@@ -3476,8 +3477,9 @@ function TeacherProfile({ data, saveData, user, showToast, updateUserSession }) 
   };
 
   const handleSavePhoto = () => {
-    const teachers = (data.teachers || []).map(t => t.id === user.id ? { ...t, photo } : t);
-    saveData({ ...data, teachers }, ["teachers"]);
+    const latest = dataRef?.current || data;
+    const teachers = (latest.teachers || []).map(t => t.id === user.id ? { ...t, photo } : t);
+    saveData({ ...latest, teachers }, ["teachers"]);
     updateUserSession({ ...user, photo });
     showToast("Foto profil disimpan");
   };
@@ -3536,7 +3538,9 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
   });
 
   const myResults = (data.results || []).filter(r => r.studentId === user.id);
-  const resumableSessions = (data.sessions || []).filter(s => s.studentId === user.id && s.status === "active" && data.exams.find(e => e.id === s.examId && e.status === "active"));
+  // sessions at top level may be empty; check dataRef for sessions added by ExamTaker
+  const _sessions = dataRef?.current?.sessions || data.sessions || [];
+  const resumableSessions = _sessions.filter(s => s.studentId === user.id && s.status === "active" && data.exams.find(e => e.id === s.examId && e.status === "active"));
 
   const tabs = [
     { id: "exams", label: "Ujian Tersedia", icon: <FileText size={18} /> },
@@ -3657,7 +3661,7 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
       )}
 
       {tab === "tryout" && <TryoutView data={data} user={user} showToast={showToast} />}
-      {tab === "profile" && <StudentProfile data={data} saveData={saveData} user={user} showToast={showToast} updateUserSession={updateUserSession} />}
+      {tab === "profile" && <StudentProfile data={data} dataRef={dataRef} saveData={saveData} user={user} showToast={showToast} updateUserSession={updateUserSession} />}
     </DashboardLayout>
   );
 }
@@ -3857,19 +3861,21 @@ function TryoutTaker({ data, user, exam, onFinish, showToast }) {
 }
 
 // ============= STUDENT PROFILE =============
-function StudentProfile({ data, saveData, user, showToast, updateUserSession }) {
+function StudentProfile({ data, dataRef, saveData, user, showToast, updateUserSession }) {
   const [photo, setPhoto] = useState(user.photo || "");
 
   const handleSavePhoto = () => {
-    const students = data.students.map(s => s.id === user.id ? { ...s, photo } : s);
-    saveData({ ...data, students }, ["students"]);
+    const latest = dataRef?.current || data;
+    const students = (latest.students || []).map(s => s.id === user.id ? { ...s, photo } : s);
+    saveData({ ...latest, students }, ["students"]);
     updateUserSession({ ...user, photo });
     showToast("Foto profil disimpan");
   };
 
   const myResults = (data.results || []).filter(r => r.studentId === user.id);
-  const avg = myResults.length > 0 ? (myResults.reduce((a, r) => a + r.score, 0) / myResults.length).toFixed(1) : "-";
-  const best = myResults.length > 0 ? Math.max(...myResults.map(r => r.score)).toFixed(1) : "-";
+  const scoredMyResults = myResults.filter(r => r.score != null);
+  const avg = scoredMyResults.length > 0 ? (scoredMyResults.reduce((a, r) => a + r.score, 0) / scoredMyResults.length).toFixed(1) : "-";
+  const best = scoredMyResults.length > 0 ? Math.max(...scoredMyResults.map(r => r.score)).toFixed(1) : "-";
 
   return (
     <div>
@@ -3897,7 +3903,12 @@ function StudentProfile({ data, saveData, user, showToast, updateUserSession }) 
 // ============= EXAM TAKER (STUDENT) =============
 function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast }) {
   // Check for existing session to resume
-  const existingSession = useMemo(() => (data.sessions || []).find(s => s.examId === exam.id && s.studentId === user.id && s.status === "active"), []);
+  // Note: data.sessions is always [] at top level (sessions are per-exam in Firestore).
+  // We check dataRef.current which may have sessions updated by doSaveSession's direct assignment.
+  const existingSession = useMemo(() => {
+    const allSessions = dataRef?.current?.sessions || data.sessions || [];
+    return allSessions.find(s => s.examId === exam.id && s.studentId === user.id && s.status === "active");
+  }, []); // empty deps: only check on mount, not on every render
 
   const questions = useMemo(() => {
     let qs = exam.questionIds.map(id => data.questions.find(q => q.id === id)).filter(Boolean);
@@ -4119,7 +4130,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
       dataRef.current = { ...dataRef.current, results, sessions };
     }
     showToast(auto ? "Waktu habis! Jawaban dikumpulkan otomatis." : "Jawaban berhasil dikumpulkan!");
-  }, [questions, exam, user, data, saveData, showToast]);
+  }, [questions, exam, user, showToast]); // removed: data (use dataRef), saveData (never called here)
 
   // Keep ref always up-to-date so timer can call latest version without stale closure
   useEffect(() => { handleSubmitRef.current = handleSubmit; }, [handleSubmit]);

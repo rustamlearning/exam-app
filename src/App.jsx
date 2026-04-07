@@ -406,7 +406,9 @@ export default function ExamApp() {
 
       // 3. Restore session
       const sess = ls.get(SESSION_KEY);
-      if (sess?.user && sess?.view && sess.view !== "login") {
+      const SESSION_EXPIRY = 8 * 60 * 60 * 1000;
+      const sessionExpired = sess?.loginAt && (Date.now() - sess.loginAt > SESSION_EXPIRY);
+      if (sess?.user && sess?.view && sess.view !== "login" && !sessionExpired) {
         setUser(sess.user); setView(sess.view);
       }
 
@@ -523,7 +525,7 @@ export default function ExamApp() {
     if (loggedUser) {
       setUser(loggedUser);
       setView(nextView);
-      try { localStorage.setItem(SESSION_KEY, JSON.stringify({ user: loggedUser, view: nextView })); } catch {}
+      try { localStorage.setItem(SESSION_KEY, JSON.stringify({ user: loggedUser, view: nextView, loginAt: Date.now() })); } catch {}
     }
   }, [data, showToast]);
 

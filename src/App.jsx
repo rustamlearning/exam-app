@@ -299,7 +299,7 @@ export default function ExamApp() {
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState("login");
   const [loginAttempts, setLoginAttempts] = useState({});
-  const loginAttemptsRef = React.useRef({});
+  const loginAttemptsRef = useRef({});
   const [toast, setToast] = useState(null);
   const [theme, setTheme] = useState(() => ls.get(THEME_KEY) || "dark");
   const toggleTheme = useCallback(() => {

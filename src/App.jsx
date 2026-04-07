@@ -1,8 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo, createContext, useContext } from "react";
 import { BookOpen, Users, GraduationCap, Settings, LogOut, Plus, Trash2, Edit, Eye, Clock, AlertTriangle, CheckCircle, XCircle, Monitor, Upload, ChevronRight, Menu, X, Search, FileText, BarChart3, Shield, Lock, Save, RefreshCw, ChevronDown, ArrowLeft, Home, User, Hash, Layers, Play, Square, Award, Bell, AlertCircle, Printer, Camera, Key, Download } from "lucide-react";
 import { initializeApp } from "firebase/app";
-import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, query, where, getDocs, runTransaction, writeBatch } from "firebase/firestore";
-import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, updatePassword, EmailAuthProvider, reauthenticateWithCredential } from "firebase/auth";
+import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, query, where, getDocs, runTransaction } from "firebase/firestore";
 
 // ============= CONSTANTS =============
 const SCHOOL_NAME = "SMA Negeri 6 Pangkajene dan Kepulauan";
@@ -157,26 +156,6 @@ const firebaseConfig = {
 };
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
-const firebaseAuth = getAuth(app);
-
-// ============= AUTH HELPERS =============
-const makeAuthEmail = (role, id) => `${role}_${(id||"").toLowerCase().replace(/[^a-z0-9]/g,"")}@sman6pangkep.exam`;
-
-// ============= ANSWER KEYS (separated collection — lazy save) =============
-// Answer keys disimpan terpisah saat soal dibuat/diedit, bukan batch migration
-const answerKeyStore = {
-  async save(questionId, data) {
-    try { await setDoc(doc(db, "answer_keys", questionId), { ...data, ts: Date.now() }); }
-    catch(e) { console.warn("answerKey save:", e.message); }
-  },
-  async saveBatch(keys) {
-    // Save one by one with delay to avoid quota issues on Spark plan
-    for (const k of keys) {
-      try { await setDoc(doc(db, "answer_keys", k.questionId), { correctAnswer: k.correctAnswer, points: k.points || 1, type: k.type || "pilgan", ts: Date.now() }); }
-      catch(e) { console.warn("answerKey batch item:", e.message); break; }
-    }
-  },
-};
 
 // ============= GRANULAR STORE =============
 // sessions & results stored as individual docs to prevent race conditions
@@ -368,7 +347,7 @@ export default function ExamApp() {
       // 2. Load all collections in parallel
       try {
         const vals = await Promise.all(COLS.map(col => store.getCol(col)));
-        const d = {
+        const fbD = {
           meta: vals[0] || DEFAULT_DATA.meta,
           teachers: vals[1] || [],
           students: vals[2] || [],
@@ -378,6 +357,20 @@ export default function ExamApp() {
           sessions: vals[6] || [],
           results: vals[7] || [],
         };
+        // FIX BUG 3: If localStorage has MORE data than Firestore, it means
+        // a previous Firestore write failed silently (Bug 2 scenario).
+        // Keep the local version for those collections to prevent data loss on reload.
+        const localCached = ls.get(CACHE_KEY);
+        const d = { ...fbD };
+        if (localCached) {
+          if ((localCached.questions?.length || 0) > (fbD.questions?.length || 0)) {
+            d.questions = localCached.questions;
+            console.warn("[data-merge] localStorage has more questions than Firestore. Keeping local. A previous write may have failed.");
+          }
+          if ((localCached.teachers?.length || 0) > (fbD.teachers?.length || 0)) d.teachers = localCached.teachers;
+          if ((localCached.students?.length || 0) > (fbD.students?.length || 0)) d.students = localCached.students;
+          if ((localCached.exams?.length || 0) > (fbD.exams?.length || 0)) d.exams = localCached.exams;
+        }
         setData(d);
         setLoading(false);
         ls.set(CACHE_KEY, d);
@@ -433,6 +426,9 @@ export default function ExamApp() {
   const saveData = useCallback(async (newData, hints) => {
     if (!newData) return;
     setData(newData);
+    // FIX BUG 1: Update dataRef immediately so rapid consecutive saves
+    // always read the latest data, not stale data from previous render cycle.
+    if (dataRef.current !== undefined) dataRef.current = newData;
     ls.set(CACHE_KEY, newData);
     ls.set(BACKUP_KEY, newData);
     // --- BACKUP SYSTEM: save to rotating localStorage slots ---
@@ -441,75 +437,73 @@ export default function ExamApp() {
       const prev = dataRef.current;
       return newData[col] !== undefined && (!prev || JSON.stringify(newData[col]) !== JSON.stringify(prev[col]));
     });
+    // FIX BUG 2: Track which columns fail to write so we can alert the user.
+    const failedCols = [];
     await Promise.all(toSave.map(async col => {
       if (newData[col] === undefined) return;
       writeTimesRef.current[col] = Date.now();
       try { await store.setCol(col, newData[col]); }
       catch(e) {
+        console.error("saveData first attempt failed for col:", col, e);
+        // Retry once after a short delay
         await new Promise(r => setTimeout(r, 1500));
-        store.setCol(col, newData[col]).catch(console.error);
+        try { await store.setCol(col, newData[col]); }
+        catch(e2) {
+          console.error("saveData retry also failed for col:", col, e2);
+          failedCols.push(col);
+        }
       }
     }));
+    if (failedCols.length > 0) {
+      // Show visible error so teacher knows the save did NOT reach the server.
+      // Data is still in localStorage so it won't be lost on this device,
+      // but it will be gone after a hard reload if Firestore never gets updated.
+      showToast("⚠️ Gagal menyimpan ke server! Data tersimpan sementara di perangkat ini saja. Coba lagi atau periksa koneksi internet.", "error");
+    }
     // --- BACKUP SYSTEM: async Firebase backup (non-blocking) ---
     store.saveBackup(newData).catch(console.warn);
-  }, []);
+  }, [showToast]);
 
 
   // Expose dataRef so ExamTaker can always access latest data
   const dataRef = useRef(null);
   useEffect(() => { dataRef.current = data; }, [data]);
 
-  const handleLogin = useCallback(async (credentials) => {
+  const handleLogin = useCallback((credentials) => {
+    // Always use freshest data — critical for newly added teachers/students
     const d = dataRef.current || data;
     if (!d) return;
     const { role, username, password } = credentials;
     let loggedUser = null;
     let nextView = "login";
+    // Admin credentials stored in data.meta.admin (not data.admin)
     const adminCred = d.meta?.admin || { username: "admin", password: "admin123" };
-    let identity = null, authEmail = null;
+
     if (role === "admin") {
-      if (username !== adminCred.username) { showToast("Username admin salah", "error"); return; }
-      authEmail = makeAuthEmail("admin", adminCred.username);
-      identity = { role: "admin", name: "Administrator" };
+      if (username === adminCred.username && password === adminCred.password) {
+        loggedUser = { role: "admin", name: "Administrator" };
+        nextView = "admin";
+        showToast("Login berhasil sebagai Admin");
+      } else { showToast("Username atau password salah", "error"); return; }
     } else if (role === "guru") {
-      const guru = (d.teachers || []).find(t => t.name.toLowerCase() === username.toLowerCase());
-      if (!guru) { showToast("Guru tidak ditemukan", "error"); return; }
-      authEmail = makeAuthEmail("guru", guru.id);
-      identity = { role: "guru", ...guru };
+      const guru = (d.teachers || []).find(t => t.name.toLowerCase() === username.toLowerCase() && (t.password ? t.password === password : t.nip === password));
+      if (guru) {
+        loggedUser = { role: "guru", ...guru };
+        nextView = "guru";
+        showToast(`Selamat datang, ${guru.name}`);
+      } else { showToast("Nama atau NIP/Password salah", "error"); return; }
     } else if (role === "siswa") {
-      const siswa = (d.students || []).find(s => s.name.toLowerCase() === username.toLowerCase());
-      if (!siswa) { showToast("Siswa tidak ditemukan", "error"); return; }
-      authEmail = makeAuthEmail("siswa", siswa.id);
-      identity = { role: "siswa", ...siswa };
+      const siswa = (d.students || []).find(s => s.name.toLowerCase() === username.toLowerCase() && s.nisn === password);
+      if (siswa) {
+        loggedUser = { role: "siswa", ...siswa };
+        nextView = "siswa";
+        showToast(`Selamat datang, ${siswa.name}`);
+      } else { showToast("Nama atau NISN salah", "error"); return; }
     }
-    if (!identity || !authEmail) return;
-    try {
-      await signInWithEmailAndPassword(firebaseAuth, authEmail, password);
-      loggedUser = identity;
-    } catch (authErr) {
-      if (authErr.code === "auth/user-not-found" || authErr.code === "auth/invalid-credential") {
-        let oldValid = false;
-        if (role === "admin") oldValid = (password === adminCred.password);
-        else if (role === "guru") { const g = (d.teachers||[]).find(t=>t.name.toLowerCase()===username.toLowerCase()); oldValid = g && (g.password ? g.password===password : g.nip===password); }
-        else if (role === "siswa") { const s = (d.students||[]).find(s=>s.name.toLowerCase()===username.toLowerCase()); oldValid = s && s.nisn===password; }
-        if (!oldValid) { showToast(role==="admin"?"Username atau password salah":role==="guru"?"Nama atau NIP/Password salah":"Nama atau NISN salah","error"); return; }
-        const safePw = password.length >= 6 ? password : password + "000000".slice(0, 6 - password.length);
-        try { await createUserWithEmailAndPassword(firebaseAuth, authEmail, safePw); loggedUser = identity; } catch(ce) { console.warn("Auth migration:",ce.message); loggedUser = identity; }
-      } else if (authErr.code === "auth/wrong-password") { showToast("Password salah","error"); return; }
-      else if (authErr.code === "auth/too-many-requests") { showToast("Terlalu banyak percobaan. Tunggu beberapa menit.","error"); return; }
-      else { console.warn("Auth fallback:",authErr.message);
-        if (role==="admin") { if(password===adminCred.password) loggedUser=identity; else {showToast("Username atau password salah","error");return;} }
-        else if (role==="guru") { const g=(d.teachers||[]).find(t=>t.name.toLowerCase()===username.toLowerCase()&&(t.password?t.password===password:t.nip===password)); if(g) loggedUser=identity; else {showToast("Nama atau NIP/Password salah","error");return;} }
-        else if (role==="siswa") { const s=(d.students||[]).find(s=>s.name.toLowerCase()===username.toLowerCase()&&s.nisn===password); if(s) loggedUser=identity; else {showToast("Nama atau NISN salah","error");return;} }
-      }
-    }
-    if (loggedUser && firebaseAuth.currentUser) {
-      try { await setDoc(doc(db,"user_roles",firebaseAuth.currentUser.uid),{role:loggedUser.role,refId:loggedUser.id||"admin",name:loggedUser.name,ts:Date.now()}); } catch(e) {}
-    }
+
     if (loggedUser) {
-      nextView = role==="admin"?"admin":role==="guru"?"guru":"siswa";
-      showToast(role==="admin"?"Login berhasil sebagai Admin":"Selamat datang, "+loggedUser.name);
-      setUser(loggedUser); setView(nextView);
+      setUser(loggedUser);
+      setView(nextView);
       try { localStorage.setItem(SESSION_KEY, JSON.stringify({ user: loggedUser, view: nextView })); } catch {}
     }
   }, [data, showToast]);
@@ -518,7 +512,6 @@ export default function ExamApp() {
     setUser(null);
     setView("login");
     ls.remove(SESSION_KEY);
-    try { signOut(firebaseAuth); } catch(e) {}
   }, []);
 
   // Sync updated user data (e.g. after profile photo change)
@@ -828,155 +821,436 @@ function AdminHome({ data }) {
   );
 }
 
-// ============= IMPORT DATA MODAL (Excel/CSV/Word) =============
+// ============= IMPORT DATA MODAL (Excel/CSV/Word/PDF — Smart & Robust) =============
 function ImportDataModal({ type, onImport, onClose, showToast }) {
   const [rows, setRows] = useState([]);
+  const [editRows, setEditRows] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMsg, setLoadingMsg] = useState("");
   const [step, setStep] = useState("upload");
+  const [dragOver, setDragOver] = useState(false);
+  const [errors, setErrors] = useState([]);
+  const [colMap, setColMap] = useState({});
+  const [headers, setHeaders] = useState([]);
+  const [fileName, setFileName] = useState("");
+  const [pasteMode, setPasteMode] = useState(false);
+  const [pasteText, setPasteText] = useState("");
 
-  const parseCSVLine = (line) => {
+  const isStudent = type === "students";
+  const title = isStudent ? "Import Data Siswa" : "Import Data Guru";
+
+  const FIELDS_STUDENT = [
+    { key: "name",      label: "Nama Lengkap", required: true },
+    { key: "nisn",      label: "NISN",         required: true },
+    { key: "kelas",     label: "Kelas",        required: false },
+    { key: "peminatan", label: "Peminatan",    required: false },
+  ];
+  const FIELDS_TEACHER = [
+    { key: "name",  label: "Nama Lengkap", required: true },
+    { key: "nip",   label: "NIP",          required: true },
+    { key: "email", label: "Email",        required: false },
+  ];
+  const FIELDS = isStudent ? FIELDS_STUDENT : FIELDS_TEACHER;
+
+  const guessField = (header) => {
+    const h = header.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (/^(nama|name|fullname|namalengkap|namasiswa|namaguru)/.test(h)) return "name";
+    if (/^(nisn|nomornisn)/.test(h)) return "nisn";
+    if (/^(nip|nomornip)/.test(h)) return "nip";
+    if (/^(kelas|class|tingkat)/.test(h)) return "kelas";
+    if (/^(peminatan|jurusan|program|major)/.test(h)) return "peminatan";
+    if (/^(email|surel|mail)/.test(h)) return "email";
+    return "";
+  };
+
+  const loadXLSX = () => new Promise((res, rej) => {
+    if (window.XLSX) return res(window.XLSX);
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+    s.onload = () => res(window.XLSX);
+    s.onerror = () => rej(new Error("Gagal memuat library Excel. Cek koneksi internet."));
+    document.head.appendChild(s);
+  });
+
+  const loadMammoth = () => new Promise((res, rej) => {
+    if (window.mammoth) return res(window.mammoth);
+    const s = document.createElement("script");
+    s.src = "https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js";
+    s.onload = () => res(window.mammoth);
+    s.onerror = () => rej(new Error("Gagal memuat library Word. Cek koneksi internet."));
+    document.head.appendChild(s);
+  });
+
+  const parseCSVLine = (line, sep) => {
+    if (sep === "\t") return line.split("\t").map(s => s.replace(/^["']|["']$/g, "").trim());
     const result = []; let cur = ""; let inQ = false;
-    for (let c of line) {
-      if (c === '"') { inQ = !inQ; }
-      else if (c === "," && !inQ) { result.push(cur.trim()); cur = ""; }
+    for (const c of line) {
+      if (c === '"' || c === "'") { inQ = !inQ; }
+      else if (c === sep && !inQ) { result.push(cur.trim()); cur = ""; }
       else cur += c;
     }
     result.push(cur.trim());
-    return result;
+    return result.map(s => s.replace(/^["']|["']$/g, "").trim());
   };
 
-  const parseFile = async (file) => {
-    setLoading(true);
+  const detectSep = (text) => {
+    const sample = text.split("\n").slice(0, 5).join("\n");
+    const tabs = (sample.match(/\t/g) || []).length;
+    const semis = (sample.match(/;/g) || []).length;
+    const commas = (sample.match(/,/g) || []).length;
+    if (tabs >= semis && tabs >= commas) return "\t";
+    if (semis > commas) return ";";
+    return ",";
+  };
+
+  const parseTextToMatrix = (text) => {
+    const lines = text.split(/\r?\n/).map(l => l.trimEnd()).filter(l => l.trim());
+    if (!lines.length) return { matrix: [], hdrs: [] };
+    const sep = detectSep(text);
+    const matrix = lines.map(l => parseCSVLine(l, sep));
+    const firstRow = matrix[0];
+    const isHeader = firstRow.some(cell => /^(nama|name|nisn|nip|kelas|peminatan|email|no\.?|nomor)/i.test(cell.trim()));
+    let dataRows, hdrs;
+    if (isHeader) {
+      hdrs = firstRow;
+      dataRows = matrix.slice(1).filter(r => r.some(c => c.trim()));
+    } else {
+      hdrs = isStudent ? ["Nama Lengkap","NISN","Kelas","Peminatan"] : ["Nama Lengkap","NIP","Email"];
+      dataRows = matrix.filter(r => r.some(c => c.trim()));
+    }
+    return { matrix: dataRows, hdrs };
+  };
+
+  const buildRows = (matrix, map, hdrs) => {
+    const result = []; const errs = [];
+    for (let i = 0; i < matrix.length; i++) {
+      const cols = matrix[i];
+      const row = {};
+      for (const [hdr, field] of Object.entries(map)) {
+        const colIdx = hdrs.indexOf(hdr);
+        const val = colIdx >= 0 ? (cols[colIdx] || "").toString().trim() : "";
+        if (val) row[field] = val;
+      }
+      const rowErrors = [];
+      if (!row.name) rowErrors.push("Nama kosong");
+      if (isStudent && !row.nisn) rowErrors.push("NISN kosong");
+      if (!isStudent && !row.nip) rowErrors.push("NIP kosong");
+      if (rowErrors.length) { errs.push({ row: i, errors: rowErrors }); continue; }
+      if (isStudent) result.push({ name: row.name, nisn: row.nisn || "", kelas: row.kelas || "", peminatan: row.peminatan || "MIPA" });
+      else result.push({ name: row.name, nip: row.nip || "", email: row.email || "", subjects: [], photo: "" });
+    }
+    return { result, errs };
+  };
+
+  const processFile = async (file) => {
+    setLoading(true); setLoadingMsg("Membaca file..."); setFileName(file.name);
     try {
       const ext = file.name.split(".").pop().toLowerCase();
       let text = "";
       if (ext === "csv" || ext === "txt") {
-        text = await file.text();
+        try { text = await file.text(); } catch {
+          const ab = await file.arrayBuffer();
+          text = new TextDecoder("utf-8").decode(ab);
+        }
+        text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
       } else if (ext === "xlsx" || ext === "xls") {
-        // Load SheetJS from CDN
-        if (!window.XLSX) {
-          await new Promise((res, rej) => {
-            const s = document.createElement("script");
-            s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
-            s.onload = res; s.onerror = rej;
-            document.head.appendChild(s);
-          });
-        }
+        setLoadingMsg("Memuat library Excel...");
+        const XLSX = await loadXLSX();
+        setLoadingMsg("Membaca sheet Excel...");
         const ab = await file.arrayBuffer();
-        const wb = window.XLSX.read(ab, { type: "array" });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        text = window.XLSX.utils.sheet_to_csv(ws);
-      } else if (ext === "docx") {
-        if (!window.mammoth) {
-          await new Promise((res, rej) => {
-            const s = document.createElement("script");
-            s.src = "https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js";
-            s.onload = res; s.onerror = rej;
-            document.head.appendChild(s);
-          });
+        const wb = XLSX.read(ab, { type: "array", cellText: true, cellDates: false });
+        let bestSheet = wb.SheetNames[0]; let bestCount = 0;
+        for (const name of wb.SheetNames) {
+          const ws = wb.Sheets[name];
+          const range = XLSX.utils.decode_range(ws["!ref"] || "A1:A1");
+          const count = (range.e.r - range.s.r) * (range.e.c - range.s.c);
+          if (count > bestCount) { bestCount = count; bestSheet = name; }
         }
+        text = XLSX.utils.sheet_to_csv(wb.Sheets[bestSheet], { rawNumbers: false });
+      } else if (ext === "docx" || ext === "doc") {
+        setLoadingMsg("Memuat library Word...");
+        const mammoth = await loadMammoth();
+        setLoadingMsg("Mengekstrak teks dari Word...");
         const ab = await file.arrayBuffer();
-        const result = await window.mammoth.extractRawText({ arrayBuffer: ab });
+        const result = await mammoth.extractRawText({ arrayBuffer: ab });
         text = result.value;
+      } else if (ext === "pdf") {
+        setLoading(false); setPasteMode(true);
+        showToast("PDF tidak bisa dibaca langsung. Silakan copy-paste isi tabel dari PDF.", "warning");
+        return;
+      } else {
+        throw new Error(`Format .${ext} tidak didukung. Gunakan Excel (.xlsx), CSV, atau Word (.docx).`);
       }
-
-      const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
-      const parsed = [];
-
-      if (type === "students") {
-        for (const line of lines) {
-          const cols = line.includes(",") ? parseCSVLine(line) : line.split(/	|;/).map(s => s.trim());
-          if (cols.length >= 2) {
-            const name = cols[0]?.replace(/^["']|["']$/g, "").trim();
-            const nisn = cols[1]?.replace(/^["']|["']$/g, "").trim();
-            const kelas = cols[2]?.replace(/^["']|["']$/g, "").trim() || "";
-            const peminatan = cols[3]?.replace(/^["']|["']$/g, "").trim() || "MIPA";
-            if (name && nisn && !/^(nama|name|siswa)/i.test(name)) {
-              parsed.push({ name, nisn, kelas, peminatan });
-            }
-          }
-        }
-      } else if (type === "teachers") {
-        for (const line of lines) {
-          const cols = line.includes(",") ? parseCSVLine(line) : line.split(/	|;/).map(s => s.trim());
-          if (cols.length >= 2) {
-            const name = cols[0]?.replace(/^["']|["']$/g, "").trim();
-            const nip = cols[1]?.replace(/^["']|["']$/g, "").trim();
-            const email = cols[2]?.replace(/^["']|["']$/g, "").trim() || "";
-            if (name && nip && !/^(nama|name|guru)/i.test(name)) {
-              parsed.push({ name, nip, email, subjects: [], photo: "" });
-            }
-          }
-        }
+      if (!text || !text.trim()) throw new Error("File kosong atau tidak ada data yang bisa dibaca.");
+      setLoadingMsg("Menganalisis kolom...");
+      const { matrix, hdrs } = parseTextToMatrix(text);
+      if (!matrix.length) throw new Error("Tidak ada baris data ditemukan.");
+      setHeaders(hdrs);
+      const autoMap = {};
+      hdrs.forEach(h => { const f = guessField(h); if (f) autoMap[h] = f; });
+      if (!Object.keys(autoMap).length) {
+        FIELDS.forEach((f, i) => { if (hdrs[i]) autoMap[hdrs[i]] = f.key; });
       }
+      setColMap(autoMap);
+      const requiredMapped = FIELDS.filter(f => f.required).every(f => Object.values(autoMap).includes(f.key));
+      if (requiredMapped) {
+        const { result, errs } = buildRows(matrix, autoMap, hdrs);
+        if (result.length) {
+          setRows(matrix); setEditRows(result.map(r => ({ ...r }))); setErrors(errs);
+          setStep("preview");
+          showToast(`${result.length} data berhasil dibaca!`);
+        } else { setRows(matrix); setStep("map"); showToast("Data terbaca tapi kolom perlu dipetakan manual.", "warning"); }
+      } else {
+        setRows(matrix); setStep("map");
+        showToast(`File terbaca (${matrix.length} baris). Petakan kolom di bawah.`, "warning");
+      }
+    } catch(e) { showToast("❌ " + e.message, "error"); }
+    setLoading(false); setLoadingMsg("");
+  };
 
-      if (!parsed.length) return showToast("Tidak ada data valid ditemukan. Periksa format file.", "error");
-      setRows(parsed);
-      setStep("preview");
-    } catch(e) {
-      showToast("Gagal membaca file: " + e.message, "error");
+  const handlePaste = () => {
+    if (!pasteText.trim()) return showToast("Teks kosong", "error");
+    const { matrix, hdrs } = parseTextToMatrix(pasteText);
+    if (!matrix.length) return showToast("Tidak ada data yang terdeteksi", "error");
+    setHeaders(hdrs);
+    const autoMap = {};
+    hdrs.forEach(h => { const f = guessField(h); if (f) autoMap[h] = f; });
+    FIELDS.forEach((f, i) => { if (hdrs[i] && !Object.values(autoMap).includes(f.key)) autoMap[hdrs[i]] = f.key; });
+    setColMap(autoMap);
+    const { result, errs } = buildRows(matrix, autoMap, hdrs);
+    setRows(matrix); setEditRows(result.map(r => ({ ...r }))); setErrors(errs);
+    setPasteMode(false); setStep("preview");
+    showToast(`${result.length} data terdeteksi dari teks!`);
+  };
+
+  const applyColMap = () => {
+    const missing = FIELDS.filter(f => f.required && !Object.values(colMap).includes(f.key)).map(f => f.label);
+    if (missing.length) return showToast("Kolom wajib belum dipilih: " + missing.join(", "), "error");
+    const { result, errs } = buildRows(rows, colMap, headers);
+    if (!result.length) return showToast("Tidak ada data valid setelah mapping.", "error");
+    setEditRows(result.map(r => ({ ...r }))); setErrors(errs); setStep("preview");
+  };
+
+  const handleDrop = (e) => { e.preventDefault(); setDragOver(false); const file = e.dataTransfer.files[0]; if (file) processFile(file); };
+  const updateCell = (rowIdx, field, val) => setEditRows(prev => prev.map((r, i) => i === rowIdx ? { ...r, [field]: val } : r));
+
+  const downloadTemplate = async () => {
+    try {
+      const XLSX = await loadXLSX();
+      const data = isStudent
+        ? [["Nama Lengkap","NISN","Kelas","Peminatan"],["Ahmad Fauzi","1234567890","XII-MIPA 1","MIPA"],["Siti Rahayu","0987654321","XII-IPS 1","IPS"]]
+        : [["Nama Lengkap","NIP","Email"],["Budi Santoso","199001012020011001","budi@sman6.sch.id"]];
+      const ws = XLSX.utils.aoa_to_sheet(data);
+      ws["!cols"] = [{ wch: 30 },{ wch: 20 },{ wch: 15 },{ wch: 12 }];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, isStudent ? "Data Siswa" : "Data Guru");
+      XLSX.writeFile(wb, (isStudent ? "template_siswa" : "template_guru") + ".xlsx");
+      showToast("Template Excel berhasil diunduh!");
+    } catch {
+      const csv = isStudent
+        ? "Nama Lengkap,NISN,Kelas,Peminatan\nAhmad Fauzi,1234567890,XII-MIPA 1,MIPA"
+        : "Nama Lengkap,NIP,Email\nBudi Santoso,199001012020011001,budi@sman6.sch.id";
+      const a = document.createElement("a");
+      a.href = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
+      a.download = (isStudent ? "template_siswa" : "template_guru") + ".csv";
+      a.click();
     }
-    setLoading(false);
   };
 
-  const isStudent = type === "students";
-  const title = isStudent ? "Import Data Siswa" : "Import Data Guru";
-  const template = isStudent
-    ? "Nama Lengkap,NISN,Kelas,Peminatan\nAhmad Fauzi,1234567890,XII-MIPA 1,MIPA\nSiti Rahayu,0987654321,XII-IPS 1,IPS"
-    : "Nama Lengkap,NIP,Email\nBudi Santoso,199001012020011001,budi@sman6.sch.id";
-
-  const downloadTemplate = () => {
-    const blob = new Blob([template], { type: "text/csv" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = (isStudent ? "template_siswa" : "template_guru") + ".csv";
-    a.click();
-  };
+  const validRows = editRows.filter(r => r.name && (isStudent ? r.nisn : r.nip));
 
   return (
     <Modal title={title} onClose={onClose} wide>
-      {step === "upload" && (
+
+      {/* UPLOAD STEP */}
+      {step === "upload" && !pasteMode && (
         <div className="space-y-4">
-          <div className="p-4 rounded-xl" style={{ background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.2)" }}>
-            <p className="text-blue-300 text-sm font-medium mb-2">Format Kolom yang Dibutuhkan:</p>
-            <div className="font-mono text-xs" style={{ color: "inherit", opacity: 0.8 }}>
-              {isStudent ? "Kolom 1: Nama Lengkap | Kolom 2: NISN | Kolom 3: Kelas | Kolom 4: Peminatan" : "Kolom 1: Nama Lengkap | Kolom 2: NIP | Kolom 3: Email (opsional)"}
-            </div>
-            <button onClick={downloadTemplate} className="mt-2 text-xs text-blue-400 hover:underline flex items-center gap-1"><Download size={12} />Download Template CSV</button>
+          <div className="p-3 rounded-xl text-sm" style={{ background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.18)" }}>
+            <p className="text-blue-300 font-semibold mb-1">📋 Kolom yang dibutuhkan:</p>
+            <p className="text-xs" style={{ color: "inherit", opacity: 0.8 }}>
+              {isStudent ? "Wajib: Nama Lengkap, NISN — Opsional: Kelas, Peminatan" : "Wajib: Nama Lengkap, NIP — Opsional: Email"}
+            </p>
+            <p className="text-xs mt-1" style={{ color: "inherit", opacity: 0.5 }}>
+              Urutan kolom bebas — header tidak harus persis sama, sistem deteksi otomatis.
+            </p>
           </div>
-          <label className="flex flex-col items-center justify-center gap-3 p-8 rounded-xl cursor-pointer transition" style={{ border: "2px dashed rgba(59,130,246,0.4)", background: "rgba(15,23,42,0.3)" }}>
-            <Upload size={32} className="text-blue-400" />
-            <span className="text-sm font-medium text-blue-300">{loading ? "Membaca file..." : "Klik untuk pilih file"}</span>
-            <span className="text-xs" style={{ color: "inherit", opacity: 0.5 }}>Format: .xlsx, .csv, .txt, .docx</span>
-            <input type="file" accept=".xlsx,.xls,.csv,.txt,.docx" onChange={e => { if (e.target.files[0]) parseFile(e.target.files[0]); }} className="hidden" disabled={loading} />
-          </label>
+          <div
+            onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={handleDrop}
+            className="rounded-2xl transition-all"
+            style={{ border: dragOver ? "2px solid #3b82f6" : "2px dashed rgba(59,130,246,0.35)", background: dragOver ? "rgba(59,130,246,0.1)" : "rgba(15,23,42,0.35)", padding: "2rem" }}
+          >
+            {loading ? (
+              <div className="flex flex-col items-center gap-3 py-2">
+                <div className="w-10 h-10 rounded-full border-2 border-blue-400 border-t-transparent" style={{ animation: "spin 1s linear infinite" }} />
+                <p className="text-blue-300 text-sm font-medium">{loadingMsg || "Memproses..."}</p>
+                <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+              </div>
+            ) : (
+              <label className="flex flex-col items-center gap-3 cursor-pointer">
+                <div className="w-14 h-14 rounded-2xl flex items-center justify-center" style={{ background: "rgba(59,130,246,0.15)" }}>
+                  <Upload size={28} className="text-blue-400" />
+                </div>
+                <div className="text-center">
+                  <p className="text-white font-semibold mb-1">Seret file ke sini atau klik untuk pilih</p>
+                  <p className="text-xs" style={{ color: "inherit", opacity: 0.5 }}>Excel (.xlsx .xls) · CSV · Word (.docx) · TXT</p>
+                </div>
+                <input type="file" accept=".xlsx,.xls,.csv,.txt,.docx,.doc" onChange={e => { if (e.target.files[0]) processFile(e.target.files[0]); }} className="hidden" />
+              </label>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="flex-1 h-px" style={{ background: "rgba(59,130,246,0.15)" }} />
+            <span className="text-xs" style={{ color: "inherit", opacity: 0.4 }}>atau</span>
+            <div className="flex-1 h-px" style={{ background: "rgba(59,130,246,0.15)" }} />
+          </div>
+          <div className="flex gap-2 flex-wrap">
+            <button onClick={() => setPasteMode(true)} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 transition" style={{ background: "rgba(51,65,85,0.5)", color: "#94a3b8", border: "1px solid rgba(59,130,246,0.15)" }}>
+              📋 Tempel teks / dari PDF
+            </button>
+            <button onClick={downloadTemplate} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 transition" style={{ background: "rgba(22,163,74,0.12)", color: "#4ade80", border: "1px solid rgba(22,163,74,0.2)" }}>
+              <Download size={14} /> Download Template Excel
+            </button>
+          </div>
         </div>
       )}
+
+      {/* PASTE MODE */}
+      {step === "upload" && pasteMode && (
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <p className="text-blue-300 font-semibold">📋 Tempel teks dari PDF / tabel lain</p>
+            <button onClick={() => setPasteMode(false)} className="text-xs text-slate-400 hover:text-white">← Kembali</button>
+          </div>
+          <p className="text-xs" style={{ color: "inherit", opacity: 0.55 }}>Buka PDF → blok semua teks tabel → Ctrl+C → paste di sini. Kolom bisa dipisah tab, spasi ganda, atau koma.</p>
+          <textarea
+            value={pasteText}
+            onChange={e => setPasteText(e.target.value)}
+            rows={10}
+            placeholder={"Tempel teks di sini...\nContoh:\nAhmad Fauzi\t1234567890\tXII-MIPA 1\nSiti Rahayu\t0987654321\tXII-IPS 1"}
+            className="w-full py-3 px-3 rounded-xl text-sm outline-none font-mono resize-y"
+            style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.3)", color: "inherit" }}
+          />
+          <div className="flex justify-end gap-2">
+            <Btn variant="secondary" onClick={() => setPasteMode(false)}>Batal</Btn>
+            <Btn onClick={handlePaste}><CheckCircle size={14} />Proses Teks</Btn>
+          </div>
+        </div>
+      )}
+
+      {/* COLUMN MAPPING STEP */}
+      {step === "map" && (
+        <div className="space-y-4">
+          <div className="p-3 rounded-xl" style={{ background: "rgba(217,119,6,0.1)", border: "1px solid rgba(217,119,6,0.25)" }}>
+            <p className="text-amber-400 font-semibold mb-1">⚠️ Kolom tidak terdeteksi otomatis</p>
+            <p className="text-xs" style={{ color: "inherit", opacity: 0.75 }}>File <strong>{fileName}</strong> terbaca tapi header tidak dikenali. Petakan kolom secara manual:</p>
+          </div>
+          <div className="space-y-3">
+            {FIELDS.map(f => (
+              <div key={f.key} className="flex items-center gap-3">
+                <div className="w-36 text-sm shrink-0" style={{ color: f.required ? "#60a5fa" : "#94a3b8" }}>
+                  {f.label} {f.required && <span className="text-red-400">*</span>}
+                </div>
+                <select
+                  value={Object.keys(colMap).find(k => colMap[k] === f.key) || ""}
+                  onChange={e => {
+                    const newMap = { ...colMap };
+                    Object.keys(newMap).forEach(k => { if (newMap[k] === f.key) delete newMap[k]; });
+                    if (e.target.value) newMap[e.target.value] = f.key;
+                    setColMap(newMap);
+                  }}
+                  className="flex-1 py-2 px-3 rounded-xl text-sm outline-none"
+                  style={{ background: "rgba(15,23,42,0.8)", border: "1px solid rgba(59,130,246,0.25)", color: "inherit" }}
+                >
+                  <option value="">-- Pilih kolom --</option>
+                  {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                </select>
+              </div>
+            ))}
+          </div>
+          {Array.isArray(rows) && rows.length > 0 && (
+            <div>
+              <p className="text-xs text-slate-400 mb-2">Preview 3 baris pertama:</p>
+              <div className="rounded-xl overflow-x-auto" style={{ border: "1px solid rgba(59,130,246,0.15)" }}>
+                {rows.slice(0, 3).map((r, i) => (
+                  <div key={i} className="flex gap-2 px-3 py-2 text-xs font-mono flex-wrap" style={{ background: i%2===0 ? "rgba(15,23,42,0.4)" : "transparent", color: "inherit" }}>
+                    {(Array.isArray(r) ? r : Object.values(r)).map((cell, ci) => (
+                      <span key={ci} className="px-2 py-0.5 rounded" style={{ background: "rgba(59,130,246,0.08)", minWidth: 60 }}>{cell}</span>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="flex gap-2 justify-end">
+            <Btn variant="secondary" onClick={() => setStep("upload")}><ArrowLeft size={14} />Ganti File</Btn>
+            <Btn onClick={applyColMap}><CheckCircle size={14} />Terapkan</Btn>
+          </div>
+        </div>
+      )}
+
+      {/* PREVIEW & EDIT STEP */}
       {step === "preview" && (
         <div>
-          <div className="flex items-center justify-between mb-4">
-            <span className="text-green-400 font-semibold">{rows.length} data terdeteksi</span>
-            <Btn variant="secondary" onClick={() => setStep("upload")}><ArrowLeft size={14} />Ganti File</Btn>
+          <div className="flex items-center gap-3 mb-4 flex-wrap">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-semibold" style={{ background: "rgba(22,163,74,0.15)", color: "#4ade80" }}>
+              <CheckCircle size={14} />{validRows.length} valid
+            </div>
+            {editRows.length - validRows.length > 0 && (
+              <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-semibold" style={{ background: "rgba(220,38,38,0.15)", color: "#f87171" }}>
+                <AlertTriangle size={14} />{editRows.length - validRows.length} bermasalah
+              </div>
+            )}
+            <button onClick={() => setStep("upload")} className="ml-auto text-xs px-3 py-1.5 rounded-lg" style={{ background: "rgba(51,65,85,0.5)", color: "#94a3b8" }}>← Ganti File</button>
           </div>
+          <p className="text-xs mb-2" style={{ color: "inherit", opacity: 0.45 }}>Klik sel untuk edit langsung. Baris merah = data tidak lengkap.</p>
           <div className="rounded-xl overflow-hidden mb-4" style={{ border: "1px solid rgba(59,130,246,0.2)" }}>
-            <div className="grid text-xs font-bold px-3 py-2" style={{ gridTemplateColumns: isStudent ? "1fr 1fr 1fr 1fr" : "1fr 1fr 1fr", background: "rgba(59,130,246,0.15)", color: "#60a5fa" }}>
-              <div>Nama</div>
+            <div className="grid text-xs font-bold px-3 py-2" style={{ gridTemplateColumns: isStudent ? "2fr 1.5fr 1.2fr 1fr auto" : "2fr 1.5fr 1.5fr auto", background: "rgba(59,130,246,0.15)", color: "#60a5fa" }}>
+              <div>Nama Lengkap</div>
               <div>{isStudent ? "NISN" : "NIP"}</div>
-              {isStudent ? <><div>Kelas</div><div>Peminatan</div></> : <div>Email</div>}
+              {isStudent ? <div>Kelas</div> : <div>Email</div>}
+              {isStudent && <div>Peminatan</div>}
+              <div></div>
             </div>
-            <div className="max-h-60 overflow-y-auto">
-              {rows.map((r, i) => (
-                <div key={i} className="grid text-xs px-3 py-2" style={{ gridTemplateColumns: isStudent ? "1fr 1fr 1fr 1fr" : "1fr 1fr 1fr", background: i%2===0 ? "rgba(15,23,42,0.3)" : "transparent", color: "inherit" }}>
-                  <div>{r.name}</div>
-                  <div>{isStudent ? r.nisn : r.nip}</div>
-                  {isStudent ? <><div>{r.kelas}</div><div>{r.peminatan}</div></> : <div>{r.email}</div>}
-                </div>
-              ))}
+            <div className="max-h-72 overflow-y-auto">
+              {editRows.map((r, i) => {
+                const isValid = r.name && (isStudent ? r.nisn : r.nip);
+                return (
+                  <div key={i} className="grid items-center px-2 py-1 gap-1" style={{ gridTemplateColumns: isStudent ? "2fr 1.5fr 1.2fr 1fr auto" : "2fr 1.5fr 1.5fr auto", background: !isValid ? "rgba(220,38,38,0.08)" : i%2===0 ? "rgba(15,23,42,0.3)" : "transparent", borderLeft: !isValid ? "2px solid rgba(220,38,38,0.4)" : "2px solid transparent" }}>
+                    <input value={r.name||""} onChange={e => updateCell(i,"name",e.target.value)} className="w-full py-1 px-2 rounded text-xs outline-none" style={{ background:"rgba(15,23,42,0.5)", color:!r.name?"#f87171":"inherit", border:"1px solid transparent" }} placeholder="Nama..." />
+                    <input value={isStudent?(r.nisn||""):(r.nip||"")} onChange={e => updateCell(i,isStudent?"nisn":"nip",e.target.value)} className="w-full py-1 px-2 rounded text-xs outline-none font-mono" style={{ background:"rgba(15,23,42,0.5)", color:!(isStudent?r.nisn:r.nip)?"#f87171":"inherit", border:"1px solid transparent" }} placeholder={isStudent?"NISN...":"NIP..."} />
+                    {isStudent ? (
+                      <input value={r.kelas||""} onChange={e => updateCell(i,"kelas",e.target.value)} className="w-full py-1 px-2 rounded text-xs outline-none" style={{ background:"rgba(15,23,42,0.5)", color:"inherit", border:"1px solid transparent" }} placeholder="Kelas..." />
+                    ) : (
+                      <input value={r.email||""} onChange={e => updateCell(i,"email",e.target.value)} className="w-full py-1 px-2 rounded text-xs outline-none" style={{ background:"rgba(15,23,42,0.5)", color:"inherit", border:"1px solid transparent" }} placeholder="Email..." />
+                    )}
+                    {isStudent && (
+                      <select value={r.peminatan||"MIPA"} onChange={e => updateCell(i,"peminatan",e.target.value)} className="w-full py-1 px-2 rounded text-xs outline-none" style={{ background:"rgba(15,23,42,0.5)", color:"inherit", border:"1px solid transparent" }}>
+                        <option>MIPA</option><option>IPS</option><option>Bahasa</option>
+                      </select>
+                    )}
+                    <button onClick={() => setEditRows(prev => prev.filter((_,ri)=>ri!==i))} className="p-1 rounded text-slate-500 hover:text-red-400 shrink-0"><X size={12} /></button>
+                  </div>
+                );
+              })}
             </div>
           </div>
-          <div className="flex justify-end gap-2">
-            <Btn variant="secondary" onClick={onClose}>Batal</Btn>
-            <Btn variant="success" onClick={() => onImport(rows)}><CheckCircle size={14} />Import {rows.length} Data</Btn>
+          <div className="flex justify-between items-center gap-2 flex-wrap">
+            <button onClick={() => {
+              const empty = isStudent ? { name:"",nisn:"",kelas:"",peminatan:"MIPA" } : { name:"",nip:"",email:"",subjects:[],photo:"" };
+              setEditRows(prev => [...prev, empty]);
+            }} className="text-xs px-3 py-2 rounded-xl flex items-center gap-1" style={{ background:"rgba(51,65,85,0.4)", color:"#94a3b8", border:"1px solid rgba(59,130,246,0.15)" }}>
+              <Plus size={12} /> Tambah baris
+            </button>
+            <div className="flex gap-2">
+              <Btn variant="secondary" onClick={onClose}>Batal</Btn>
+              <Btn variant="success" onClick={() => {
+                const final = editRows.filter(r => r.name && (isStudent ? r.nisn : r.nip));
+                if (!final.length) return showToast("Tidak ada data valid untuk diimpor","error");
+                onImport(final);
+              }}><CheckCircle size={14} />Import {validRows.length} Data</Btn>
+            </div>
           </div>
         </div>
       )}
@@ -1395,20 +1669,6 @@ function AIGenerateModal({ data, onImport, onClose, showToast, userId, subjectFi
     ? (data.subjects || []).filter(s => s.id === subjectFilter)
     : (data.subjects || []);
 
-  // Guard: teacher has no subjects assigned
-  if (availableSubjects.length === 0) {
-    return (
-      <Modal onClose={onClose} wide>
-        <div className="text-center py-8">
-          <BookOpen size={48} className="mx-auto mb-4 text-slate-500" />
-          <p className="text-amber-400 font-semibold mb-2">Belum Ada Mata Pelajaran yang Diampu</p>
-          <p className="text-sm text-slate-400 mb-4">Hubungi admin untuk menetapkan mata pelajaran yang Anda ampu sebelum menggunakan AI Generate.</p>
-          <Btn variant="secondary" onClick={onClose}>Tutup</Btn>
-        </div>
-      </Modal>
-    );
-  }
-
   const PROMPT_EXAMPLES = [
     "Fokus pada soal aplikasi dan analisis (bukan hafalan)",
     "Gunakan konteks kehidupan sehari-hari / fenomena nyata",
@@ -1812,15 +2072,21 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
 
   // Teacher: only show their subjects; Admin: show all
   const teacherSubjects = userId ? (data.teachers || []).find(t => t.id === userId)?.subjects || [] : null;
-  const visibleSubjects = teacherSubjects
+
+  // BUG FIX: [] (array kosong) di JavaScript adalah TRUTHY, sehingga kondisi
+  // `teacherSubjects ?` akan masuk ke filter meski tidak ada mapel yang diampu,
+  // menghasilkan visibleSubjects=[] dan subjectFilteredQ=[] (soal tidak bisa disimpan).
+  // Solusi: gunakan teacherSubjects?.length > 0 (falsy jika kosong).
+  const hasSubjectFilter = teacherSubjects !== null && teacherSubjects.length > 0;
+  const visibleSubjects = hasSubjectFilter
     ? (data.subjects || []).filter(s => teacherSubjects.includes(s.id))
     : (data.subjects || []);
 
   const [showMineOnly, setShowMineOnly] = useState(false);
   const allQ = data.questions || [];
-  // Guru sees: questions for their subjects OR questions they personally created/imported
-  const subjectFilteredQ = teacherSubjects
-    ? allQ.filter(q => teacherSubjects.includes(q.subjectId) || (userId && q.createdBy === userId))
+  // Guru only sees questions for their subjects (jika ada mapel yang diampu)
+  const subjectFilteredQ = hasSubjectFilter
+    ? allQ.filter(q => teacherSubjects.includes(q.subjectId))
     : allQ;
   const baseQ = (userId && showMineOnly) ? subjectFilteredQ.filter(q => q.createdBy === userId) : subjectFilteredQ;
   const filtered = baseQ.filter(q => {
@@ -1851,7 +2117,11 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     reader.readAsDataURL(file);
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
+    // Jika guru belum diampu mapel apapun, beri pesan yang spesifik
+    if (userId && visibleSubjects.length === 0) {
+      return showToast("Anda belum memiliki mata pelajaran yang diampu. Hubungi Admin untuk menambahkan mapel.", "error");
+    }
     if (!form.subjectId || !form.text.trim()) return showToast("Mapel dan teks soal wajib diisi", "error");
     if (form.type === "pilgan") {
       const validOpts = form.options.filter(o => o.trim());
@@ -1867,11 +2137,11 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     };
     if (editId) questions = questions.map(q => q.id === editId ? { ...q, ...qData } : q);
     else questions.push({ id: genId(), ...qData });
-    saveData({ ...latest, questions }, ["questions"]);
-    const savedQ = editId ? questions.find(q => q.id === editId) : questions[questions.length - 1];
-    if (savedQ && savedQ.correctAnswer !== undefined) answerKeyStore.save(savedQ.id, { correctAnswer: savedQ.correctAnswer, type: savedQ.type || "pilgan", points: 1 }).catch(() => {});
+    // FIX: await saveData so error toast from failed Firestore write is shown
+    // AFTER the success toast (saveData will override with error if write fails).
     setShowModal(false);
-    showToast(editId ? "Soal diperbarui" : "Soal berhasil ditambahkan");
+    showToast(editId ? "Soal diperbarui" : "Soal berhasil ditambahkan ke bank soal");
+    await saveData({ ...latest, questions }, ["questions"]);
   };
 
   const handleDelete = (id) => {
@@ -1906,19 +2176,13 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
 
   const handleBulkImport = (importedQuestions) => {
     const latest = dataRef?.current || data;
-    const newQs = importedQuestions.map(q => ({ id: genId(), ...q, type: q.type || "pilgan", createdBy: userId || "admin" }));
-    const questions = [...(latest.questions || []), ...newQs];
+    const questions = [...(latest.questions || []), ...importedQuestions.map(q => ({ id: genId(), ...q, type: q.type || "pilgan", createdBy: userId || "admin" }))];
     saveData({ ...latest, questions }, ["questions"]);
-    const keys = newQs.filter(q => q.correctAnswer !== undefined).map(q => ({ questionId: q.id, correctAnswer: q.correctAnswer, type: q.type || "pilgan", points: 1 }));
-    if (keys.length > 0) answerKeyStore.saveBatch(keys).catch(() => {});
     setShowImport(false);
     showToast(`${importedQuestions.length} soal berhasil diimpor`);
   };
 
-  const getSubjectName = (sid) => {
-    if (!sid) return "⚠️ Mapel tidak diset";
-    return (data.subjects || []).find(s => s.id === sid)?.name || "⚠️ Mapel tidak dikenal";
-  };
+  const getSubjectName = (sid) => (data.subjects || []).find(s => s.id === sid)?.name || "-";
 
   // Science editor: insert text into a specific field
   const handleScienceInsert = (text) => {
@@ -1949,6 +2213,16 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
           <Btn onClick={openAdd}><Plus size={16} />Tambah Soal</Btn>
         </div>
       </div>
+
+      {userId && visibleSubjects.length === 0 && (
+        <div className="mb-4 p-4 rounded-xl flex items-start gap-3" style={{ background: "rgba(234,179,8,0.1)", border: "1px solid rgba(234,179,8,0.3)" }}>
+          <AlertTriangle size={18} className="text-yellow-400 shrink-0 mt-0.5" />
+          <div>
+            <p className="text-yellow-400 text-sm font-semibold">Belum ada Mata Pelajaran yang Diampu</p>
+            <p className="text-yellow-300 text-xs mt-0.5 opacity-80">Minta Admin untuk menambahkan mata pelajaran Anda di menu <strong>Data Guru</strong>. Setelah itu Anda dapat menambah dan melihat soal.</p>
+          </div>
+        </div>
+      )}
 
       {bulkMode && selectedIds.size > 0 && (
         <div className="mb-4 p-3 rounded-xl flex items-center justify-between" style={{ background: "rgba(220,38,38,0.1)", border: "1px solid rgba(220,38,38,0.2)" }}>
@@ -2110,20 +2384,6 @@ function ImportSoalModal({ data, onImport, onClose, showToast, visibleSubjects }
   const subjects = visibleSubjects || data.subjects || [];
   const [step, setStep] = useState("upload");
   const [subjectId, setSubjectId] = useState(subjects[0]?.id || "");
-
-  // Guard: no subjects available for this teacher
-  if (subjects.length === 0) {
-    return (
-      <Modal title="Import Soal dari Dokumen" onClose={onClose} wide>
-        <div className="text-center py-8">
-          <BookOpen size={48} className="mx-auto mb-4 text-slate-500" />
-          <p className="text-amber-400 font-semibold mb-2">Belum Ada Mata Pelajaran yang Diampu</p>
-          <p className="text-sm text-slate-400 mb-4">Hubungi admin untuk menetapkan mata pelajaran yang Anda ampu sebelum mengimpor soal.</p>
-          <Btn variant="secondary" onClick={onClose}>Tutup</Btn>
-        </div>
-      </Modal>
-    );
-  }
   const [rawText, setRawText] = useState("");
   const [parsed, setParsed] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -2304,12 +2564,7 @@ function ImportSoalModal({ data, onImport, onClose, showToast, visibleSubjects }
       {step === "preview" && (
         <div>
           <div className="flex items-center justify-between mb-4">
-            <div>
-              <div className="text-green-400 font-semibold">{parsed.length} soal terdeteksi</div>
-              <div className="text-xs text-blue-300 mt-1">
-                Akan diimpor ke: <strong>{subjects.find(s => s.id === subjectId)?.name || "-"}</strong>
-              </div>
-            </div>
+            <div className="text-green-400 font-semibold">{parsed.length} soal terdeteksi</div>
             <Btn variant="secondary" onClick={() => setStep("upload")}><ArrowLeft size={14} />Kembali</Btn>
           </div>
           {importProgress && (

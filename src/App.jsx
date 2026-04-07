@@ -3110,6 +3110,12 @@ function ResultsView({ data }) {
       <div>
         <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
           <button onClick={() => { setSelectedExam(null); setActiveResultTab("ranking"); }} className="flex items-center gap-2 text-blue-400 hover:underline"><ArrowLeft size={16} />Kembali</button>
+          <Btn variant="success" onClick={() => {
+            const rows = [["No","Nama","NIS/NISN","Kelas","Skor","Benar","Salah","Pelanggaran","Status"]];
+            results.forEach((r,i) => rows.push([i+1, r.studentName||r.name||"-", r.nis||r.nisn||"-", r.class||"-", r.score??"-", r.correct??"-", r.wrong??"-", r.violations||0, r.submitted?"Selesai":"Belum"]));
+            const csv = rows.map(r => r.map(c => `"${c}"`).join(",")).join("\n");
+            const a = document.createElement("a"); a.href = "data:text/csv;charset=utf-8,\uFEFF"+encodeURIComponent(csv); a.download = `nilai-${exam?.title||"ujian"}-${new Date().toISOString().slice(0,10)}.csv`; a.click();
+          }}><Download size={16} />Export CSV</Btn>
           <Btn variant="secondary" onClick={() => handlePrint(exam, results)}><Printer size={16} />Cetak Laporan PDF</Btn>
         </div>
         <h2 className="text-2xl font-bold mb-1" style={{ color: "inherit" }}>{exam?.title} — Hasil</h2>

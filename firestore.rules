@@ -1,0 +1,13 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /examapp2/{document} {
+      allow read: if true;
+      allow write: if request.resource.data.keys().hasAny(['answers', 'currentQuestion', 'startTime', 'studentName', 'nis', 'class']);
+    }
+    match /examapp2/{document}/{subcollection}/{subDoc} {
+      allow read: if true;
+      allow write: if true;
+    }
+  }
+}

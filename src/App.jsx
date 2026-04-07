@@ -298,6 +298,8 @@ export default function ExamApp() {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState("login");
+  const [loginAttempts, setLoginAttempts] = useState({});
+  const loginAttemptsRef = React.useRef({});
   const [toast, setToast] = useState(null);
   const [theme, setTheme] = useState(() => ls.get(THEME_KEY) || "dark");
   const toggleTheme = useCallback(() => {
@@ -482,6 +484,13 @@ export default function ExamApp() {
     const d = dataRef.current || data;
     if (!d) return;
     const { role, username, password } = credentials;
+    const attemptKey = `${role}_${username}`;
+    const attempts = loginAttemptsRef.current[attemptKey] || { count: 0, lockedUntil: 0 };
+    if (attempts.lockedUntil > Date.now()) {
+      const sisa = Math.ceil((attempts.lockedUntil - Date.now()) / 1000);
+      showToast(`Terlalu banyak percobaan. Tunggu ${sisa} detik.`, "error");
+      return;
+    }
     let loggedUser = null;
     let nextView = "login";
     // Admin credentials stored in data.meta.admin (not data.admin)
@@ -492,7 +501,9 @@ export default function ExamApp() {
         loggedUser = { role: "admin", name: "Administrator" };
         nextView = "admin";
         showToast("Login berhasil sebagai Admin");
-      } else { showToast("Username atau password salah", "error"); return; }
+      } else { const newCount = (loginAttemptsRef.current[attemptKey]?.count || 0) + 1;
+        loginAttemptsRef.current[attemptKey] = { count: newCount, lockedUntil: newCount >= 3 ? Date.now() + 30000 : 0 };
+        showToast(newCount >= 3 ? "Akun terkunci 30 detik." : `Password salah (${newCount}/3)`, "error"); return; }
     } else if (role === "guru") {
       const guru = (d.teachers || []).find(t => t.name.toLowerCase() === username.toLowerCase() && (t.password ? t.password === password : t.nip === password));
       if (guru) {

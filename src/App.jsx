@@ -187,9 +187,14 @@ const store = {
   async saveSession(examId, studentId, sessionData) {
     const key = this.sessionKey(examId, studentId);
     try {
-      // Save individual student doc (no race condition)
+      // Save individual student doc only — 1 write instead of 3
       await setDoc(doc(db, "sessions2", key), { ...sessionData, _key: key, ts: Date.now() });
-      // Update index doc atomically — prevents race condition with concurrent students
+    }
+    catch(e) { console.error("saveSession", e); throw e; }
+  },
+  // Heavy index update — only call on start/submit, not every interval
+  async saveSessionIndex(examId, studentId, sessionData) {
+    try {
       const indexRef = doc(db, "examapp2", "sessions_" + examId);
       await runTransaction(db, async (tx) => {
         const snap = await tx.get(indexRef);
@@ -200,8 +205,7 @@ const store = {
         else updated.push(sessionData);
         tx.set(indexRef, { sessions: updated, ts: Date.now() });
       });
-    }
-    catch(e) { console.error("saveSession", e); throw e; }
+    } catch(e) { console.warn("saveSessionIndex skipped:", e.message); }
   },
   listenSessions(examId, cb) {
     return onSnapshot(doc(db, "examapp2", "sessions_" + examId),
@@ -460,8 +464,12 @@ export default function ExamApp() {
       // but it will be gone after a hard reload if Firestore never gets updated.
       showToast("⚠️ Gagal menyimpan ke server! Data tersimpan sementara di perangkat ini saja. Coba lagi atau periksa koneksi internet.", "error");
     }
-    // --- BACKUP SYSTEM: async Firebase backup (non-blocking) ---
-    store.saveBackup(newData).catch(console.warn);
+    // --- BACKUP SYSTEM: async Firebase backup — throttled to once per 5 minutes ---
+    const now = Date.now();
+    if (!window._lastFirebaseBackup || now - window._lastFirebaseBackup > 300000) {
+      window._lastFirebaseBackup = now;
+      store.saveBackup(newData).catch(console.warn);
+    }
   }, [showToast]);
 
 
@@ -3963,7 +3971,18 @@ function StudentProfile({ data, saveData, user, showToast, updateUserSession }) 
 // ============= EXAM TAKER (STUDENT) =============
 function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast }) {
   // Check for existing session to resume
-  const existingSession = useMemo(() => (data.sessions || []).find(s => s.examId === exam.id && s.studentId === user.id && s.status === "active"), []);
+  // Check localStorage first (most recent), then Firestore
+  const existingSession = useMemo(() => {
+    try {
+      const lsKey = "sman6_exam_session_" + exam.id + "_" + user.id;
+      const lsRaw = localStorage.getItem(lsKey);
+      if (lsRaw) {
+        const lsSession = JSON.parse(lsRaw);
+        if (lsSession && lsSession.status === "active") return lsSession;
+      }
+    } catch(e) {}
+    return (data.sessions || []).find(s => s.examId === exam.id && s.studentId === user.id && s.status === "active");
+  }, []);
 
   const questions = useMemo(() => {
     let qs = exam.questionIds.map(id => data.questions.find(q => q.id === id)).filter(Boolean);
@@ -4100,47 +4119,59 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
   const doSaveSession = useCallback(async (status = "active") => {
     if (submittedRef.current && status === "active") return;
     const now = Date.now();
-    if (status === "active" && now - lastSessionSave.current < 800) return;
-    lastSessionSave.current = now;
     const sessionData = {
       id: sessionIdRef.current,
       examId: exam.id, studentId: user.id,
       studentName: user.name, kelas: user.kelas,
       answers: { ...answersRef.current },
       currentQuestion: currentQRef.current,
-      questionOrder: questionsRef.current.map(q => q.id), // persist shuffle order
+      questionOrder: questionsRef.current.map(q => q.id),
       status, violations: violationsRef.current,
       timeLeft: timeLeftRef.current,
       lastUpdate: now, startedAt: existingSession?.startedAt || now
     };
+    // ALWAYS save to localStorage first (instant, no quota)
+    try { localStorage.setItem("sman6_exam_session_" + exam.id + "_" + user.id, JSON.stringify(sessionData)); } catch(e) {}
+    // Update local state for monitoring
     try {
-      // Write to individual doc — no race condition
-      await store.saveSession(exam.id, user.id, sessionData);
-      // Also update local state so monitoring works
       const currentData = dataRef?.current || data;
       const sessions = [...(currentData.sessions || [])];
       const idx = sessions.findIndex(s => s.studentId === user.id && s.examId === exam.id);
       if (idx >= 0) sessions[idx] = sessionData;
       else sessions.push(sessionData);
-      // Only update local data, don't call full saveData to avoid overwriting
       if (dataRef.current) dataRef.current = { ...dataRef.current, sessions };
-    } catch(e) { console.error("Session save failed:", e); }
+    } catch(e) {}
+    // Throttle Firestore writes: only every 30 seconds for active saves
+    if (status === "active" && now - lastSessionSave.current < 25000) return;
+    lastSessionSave.current = now;
+    try {
+      await store.saveSession(exam.id, user.id, sessionData);
+      // Only update heavy index on first save or submit
+      if (status !== "active") {
+        await store.saveSessionIndex(exam.id, user.id, sessionData);
+      }
+    } catch(e) { console.warn("Firestore save failed, data safe in localStorage:", e.message); }
   }, [exam.id, user.id]);
 
-  // Save every 5 seconds
+  // Save to Firestore every 30 seconds (was 5 — reduced to avoid quota)
   useEffect(() => {
     if (submitted) return;
     doSaveSession("active");
-    const iv = setInterval(() => doSaveSession("active"), 5000);
+    // Also update index once at start so monitoring can see this student
+    store.saveSessionIndex(exam.id, user.id, { id: sessionIdRef.current, examId: exam.id, studentId: user.id, studentName: user.name, kelas: user.kelas, status: "active", startedAt: Date.now() }).catch(() => {});
+    const iv = setInterval(() => doSaveSession("active"), 30000);
     return () => clearInterval(iv);
   }, [submitted]);
 
-  // Save on answer change with debounce
+  // Answer change: save to localStorage instantly (no Firestore write)
   useEffect(() => {
     answersRef.current = answers;
     if (submittedRef.current) return;
-    const t = setTimeout(() => doSaveSession("active"), 1000);
-    return () => clearTimeout(t);
+    // Only localStorage — Firestore will catch up on next 30s interval
+    try { 
+      const sd = { id: sessionIdRef.current, examId: exam.id, studentId: user.id, answers: { ...answers }, currentQuestion: currentQRef.current, questionOrder: questionsRef.current.map(q => q.id), status: "active", violations: violationsRef.current, timeLeft: timeLeftRef.current, lastUpdate: Date.now(), startedAt: existingSession?.startedAt || Date.now() };
+      localStorage.setItem("sman6_exam_session_" + exam.id + "_" + user.id, JSON.stringify(sd));
+    } catch(e) {}
   }, [answers]);
 
   const handleSubmit = useCallback(async (auto = false) => {

@@ -162,26 +162,19 @@ const firebaseAuth = getAuth(app);
 // ============= AUTH HELPERS =============
 const makeAuthEmail = (role, id) => `${role}_${(id||"").toLowerCase().replace(/[^a-z0-9]/g,"")}@sman6pangkep.exam`;
 
-// ============= ANSWER KEYS (separated collection) =============
+// ============= ANSWER KEYS (separated collection — lazy save) =============
+// Answer keys disimpan terpisah saat soal dibuat/diedit, bukan batch migration
 const answerKeyStore = {
   async save(questionId, data) {
     try { await setDoc(doc(db, "answer_keys", questionId), { ...data, ts: Date.now() }); }
-    catch(e) { console.warn("answerKey save failed:", e); }
+    catch(e) { console.warn("answerKey save:", e.message); }
   },
   async saveBatch(keys) {
-    try {
-      const batch = writeBatch(db);
-      keys.forEach(k => batch.set(doc(db, "answer_keys", k.questionId), { correctAnswer: k.correctAnswer, points: k.points || 1, type: k.type || "pilgan", ts: Date.now() }));
-      await batch.commit();
-    } catch(e) { console.warn("answerKey batch save failed:", e); }
-  },
-  async loadAll(questionIds) {
-    const keys = {};
-    try {
-      const promises = (questionIds || []).map(id => getDoc(doc(db, "answer_keys", id)).then(s => { if (s.exists()) keys[id] = s.data(); }).catch(() => {}));
-      await Promise.all(promises);
-    } catch(e) { console.warn("answerKey load failed:", e); }
-    return keys;
+    // Save one by one with delay to avoid quota issues on Spark plan
+    for (const k of keys) {
+      try { await setDoc(doc(db, "answer_keys", k.questionId), { correctAnswer: k.correctAnswer, points: k.points || 1, type: k.type || "pilgan", ts: Date.now() }); }
+      catch(e) { console.warn("answerKey batch item:", e.message); break; }
+    }
   },
 };
 
@@ -473,8 +466,7 @@ export default function ExamApp() {
     let loggedUser = null;
     let nextView = "login";
     const adminCred = d.meta?.admin || { username: "admin", password: "admin123" };
-    let identity = null;
-    let authEmail = null;
+    let identity = null, authEmail = null;
     if (role === "admin") {
       if (username !== adminCred.username) { showToast("Username admin salah", "error"); return; }
       authEmail = makeAuthEmail("admin", adminCred.username);
@@ -502,17 +494,17 @@ export default function ExamApp() {
         else if (role === "siswa") { const s = (d.students||[]).find(s=>s.name.toLowerCase()===username.toLowerCase()); oldValid = s && s.nisn===password; }
         if (!oldValid) { showToast(role==="admin"?"Username atau password salah":role==="guru"?"Nama atau NIP/Password salah":"Nama atau NISN salah","error"); return; }
         const safePw = password.length >= 6 ? password : password + "000000".slice(0, 6 - password.length);
-        try { await createUserWithEmailAndPassword(firebaseAuth, authEmail, safePw); loggedUser = identity; } catch(ce) { console.warn("Auth migration failed:",ce.message); loggedUser = identity; }
+        try { await createUserWithEmailAndPassword(firebaseAuth, authEmail, safePw); loggedUser = identity; } catch(ce) { console.warn("Auth migration:",ce.message); loggedUser = identity; }
       } else if (authErr.code === "auth/wrong-password") { showToast("Password salah","error"); return; }
-      else if (authErr.code === "auth/too-many-requests") { showToast("Terlalu banyak percobaan login. Tunggu beberapa menit.","error"); return; }
-      else { console.warn("Firebase Auth error, fallback:",authErr.message);
-        if (role==="admin") { if (password===adminCred.password) loggedUser=identity; else { showToast("Username atau password salah","error"); return; } }
-        else if (role==="guru") { const g=(d.teachers||[]).find(t=>t.name.toLowerCase()===username.toLowerCase()&&(t.password?t.password===password:t.nip===password)); if(g) loggedUser=identity; else { showToast("Nama atau NIP/Password salah","error"); return; } }
-        else if (role==="siswa") { const s=(d.students||[]).find(s=>s.name.toLowerCase()===username.toLowerCase()&&s.nisn===password); if(s) loggedUser=identity; else { showToast("Nama atau NISN salah","error"); return; } }
+      else if (authErr.code === "auth/too-many-requests") { showToast("Terlalu banyak percobaan. Tunggu beberapa menit.","error"); return; }
+      else { console.warn("Auth fallback:",authErr.message);
+        if (role==="admin") { if(password===adminCred.password) loggedUser=identity; else {showToast("Username atau password salah","error");return;} }
+        else if (role==="guru") { const g=(d.teachers||[]).find(t=>t.name.toLowerCase()===username.toLowerCase()&&(t.password?t.password===password:t.nip===password)); if(g) loggedUser=identity; else {showToast("Nama atau NIP/Password salah","error");return;} }
+        else if (role==="siswa") { const s=(d.students||[]).find(s=>s.name.toLowerCase()===username.toLowerCase()&&s.nisn===password); if(s) loggedUser=identity; else {showToast("Nama atau NISN salah","error");return;} }
       }
     }
     if (loggedUser && firebaseAuth.currentUser) {
-      try { await setDoc(doc(db,"user_roles",firebaseAuth.currentUser.uid),{role:loggedUser.role,refId:loggedUser.id||"admin",name:loggedUser.name,ts:Date.now()}); } catch(e) { console.warn("user_roles save failed:",e); }
+      try { await setDoc(doc(db,"user_roles",firebaseAuth.currentUser.uid),{role:loggedUser.role,refId:loggedUser.id||"admin",name:loggedUser.name,ts:Date.now()}); } catch(e) {}
     }
     if (loggedUser) {
       nextView = role==="admin"?"admin":role==="guru"?"guru":"siswa";
@@ -526,7 +518,7 @@ export default function ExamApp() {
     setUser(null);
     setView("login");
     ls.remove(SESSION_KEY);
-    try { signOut(firebaseAuth); } catch(e) { console.warn("Firebase signOut failed:", e); }
+    try { signOut(firebaseAuth); } catch(e) {}
   }, []);
 
   // Sync updated user data (e.g. after profile photo change)
@@ -771,20 +763,6 @@ function PhotoUpload({ currentPhoto, onPhoto, size = 80 }) {
 // ============= ADMIN DASHBOARD =============
 function AdminDashboard({ data, dataRef, saveData, user, onLogout, showToast }) {
   const [tab, setTab] = useState("dashboard");
-
-  // === ONE-TIME MIGRATION: save existing correctAnswers to answer_keys collection ===
-  useEffect(() => {
-    const migrationKey = "sman6_answerkeys_migrated";
-    if (localStorage.getItem(migrationKey)) return;
-    const questions = data?.questions || [];
-    const withAnswers = questions.filter(q => q.correctAnswer !== undefined);
-    if (withAnswers.length === 0) return;
-    console.log("[Migration] Saving " + withAnswers.length + " answer keys to separate collection...");
-    const keys = withAnswers.map(q => ({ questionId: q.id, correctAnswer: q.correctAnswer, type: q.type || "pilgan", points: 1 }));
-    answerKeyStore.saveBatch(keys)
-      .then(() => { localStorage.setItem(migrationKey, Date.now().toString()); console.log("[Migration] Answer keys migrated successfully!"); })
-      .catch(e => console.warn("[Migration] Answer key migration failed (will retry):", e));
-  }, [data?.questions]);
   const tabs = [
     { id: "dashboard", label: "Dashboard", icon: <Home size={18} /> },
     { id: "teachers", label: "Data Guru", icon: <Users size={18} /> },
@@ -1891,9 +1869,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     else questions.push({ id: genId(), ...qData });
     saveData({ ...latest, questions }, ["questions"]);
     const savedQ = editId ? questions.find(q => q.id === editId) : questions[questions.length - 1];
-    if (savedQ && savedQ.correctAnswer !== undefined) {
-      answerKeyStore.save(savedQ.id, { correctAnswer: savedQ.correctAnswer, type: savedQ.type || "pilgan", points: 1 }).catch(console.warn);
-    }
+    if (savedQ && savedQ.correctAnswer !== undefined) answerKeyStore.save(savedQ.id, { correctAnswer: savedQ.correctAnswer, type: savedQ.type || "pilgan", points: 1 }).catch(() => {});
     setShowModal(false);
     showToast(editId ? "Soal diperbarui" : "Soal berhasil ditambahkan");
   };
@@ -1934,7 +1910,7 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     const questions = [...(latest.questions || []), ...newQs];
     saveData({ ...latest, questions }, ["questions"]);
     const keys = newQs.filter(q => q.correctAnswer !== undefined).map(q => ({ questionId: q.id, correctAnswer: q.correctAnswer, type: q.type || "pilgan", points: 1 }));
-    if (keys.length > 0) answerKeyStore.saveBatch(keys).catch(console.warn);
+    if (keys.length > 0) answerKeyStore.saveBatch(keys).catch(() => {});
     setShowImport(false);
     showToast(`${importedQuestions.length} soal berhasil diimpor`);
   };

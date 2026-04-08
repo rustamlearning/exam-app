@@ -167,8 +167,9 @@ const store = {
   async getCol(col) {
     try {
       const snap = await getDoc(doc(db, "examapp2", col));
-      return snap.exists() ? snap.data().value : null;
-    } catch(e) { console.error("getCol", col, e); return null; }
+      if (snap.exists()) return snap.data().value;
+      return undefined; // collection belum pernah ada (beda dengan null = error)
+    } catch(e) { console.error("getCol", col, e); return null; } // null = error
   },
   async setCol(col, val) {
     if (val === undefined) return;
@@ -354,15 +355,25 @@ export default function ExamApp() {
       try {
         const vals = await Promise.all(COLS.map(col => store.getCol(col)));
         const fbD = {
-          meta: vals[0] || DEFAULT_DATA.meta,
-          teachers: vals[1] || [],
-          students: vals[2] || [],
-          subjects: vals[3]?.length ? vals[3] : MAPEL_K13,
-          questions: vals[4] || [],
-          exams: vals[5] || [],
-          sessions: vals[6] || [],
-          results: vals[7] || [],
+          meta: vals[0] !== null && vals[0] !== undefined ? vals[0] : DEFAULT_DATA.meta,
+          teachers: vals[1] !== null && vals[1] !== undefined ? vals[1] : [],
+          students: vals[2] !== null && vals[2] !== undefined ? vals[2] : [],
+          subjects: (vals[3] !== null && vals[3] !== undefined && vals[3]?.length) ? vals[3] : MAPEL_K13,
+          questions: vals[4] !== null && vals[4] !== undefined ? vals[4] : [],
+          exams: vals[5] !== null && vals[5] !== undefined ? vals[5] : [],
+          sessions: vals[6] !== null && vals[6] !== undefined ? vals[6] : [],
+          results: vals[7] !== null && vals[7] !== undefined ? vals[7] : [],
         };
+        // Jika ada collection yang error (null), gunakan data localStorage sebagai fallback
+        const localCached2 = ls.get(CACHE_KEY);
+        if (localCached2) {
+          COLS.forEach((col, i) => {
+            if (vals[i] === null && localCached2[col]) {
+              console.warn(`[safety] ${col} error dari Firestore — pakai localStorage`);
+              fbD[col] = localCached2[col];
+            }
+          });
+        }
         // FIX BUG 3: If localStorage has MORE data than Firestore, it means
         // a previous Firestore write failed silently (Bug 2 scenario).
         // Keep the local version for those collections to prevent data loss on reload.
@@ -381,8 +392,23 @@ export default function ExamApp() {
         setLoading(false);
         ls.set(CACHE_KEY, d);
         ls.set(BACKUP_KEY, d);
+        // SAFETY: jangan pernah overwrite collection dengan data kosong/default
+        // null bisa berarti error network/quota, bukan collection kosong sungguhan
+        // Hanya inisialisasi collection yang BENAR-BENAR belum pernah ada (tidak ada di cache lokal juga)
+        const localCacheForInit = ls.get(CACHE_KEY);
         COLS.forEach((col, i) => {
           if (vals[i] === null) {
+            // Cek apakah ada data lokal — kalau ada, JANGAN overwrite Firestore
+            const localVal = localCacheForInit?.[col];
+            const hasLocalData = Array.isArray(localVal) ? localVal.length > 0 : !!localVal;
+            if (hasLocalData) {
+              // Ada data lokal tapi Firestore null — kemungkinan quota/network error
+              // Coba restore ke Firestore dari cache lokal
+              console.warn(`[safety] ${col} null di Firestore tapi ada di localStorage — restore dari lokal`);
+              store.setCol(col, localVal).catch(e => console.error(`[safety] gagal restore ${col}:`, e));
+              return;
+            }
+            // Benar-benar kosong — inisialisasi dengan default
             const def = col === "subjects" ? MAPEL_K13 : col === "meta" ? DEFAULT_DATA.meta : [];
             store.setCol(col, def).catch(console.error);
           }
@@ -4037,7 +4063,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
   const [showNav, setShowNav] = useState(false);
   const [showLockdownGuide, setShowLockdownGuide] = useState(!existingSession);
   const [lockdownWarning, setLockdownWarning] = useState(null);
-  const MAX_VIOLATIONS = 3;
+  const MAX_VIOLATIONS = 5;
 
   // Ref for handleSubmit to avoid stale closure in timer interval
   const handleSubmitRef = useRef(null);

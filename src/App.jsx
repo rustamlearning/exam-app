@@ -209,8 +209,12 @@ const store = {
   },
   listenCol(col, cb) {
     if (col === "questions") {
+      let lastTs = 0;
       return onSnapshot(doc(db, "examapp2", "questions_index"), async (snap) => {
         if (!snap.exists() || snap.metadata.hasPendingWrites) return;
+        const ts = snap.data().ts || 0;
+        if (ts <= lastTs) return; // skip jika tidak ada perubahan baru
+        lastTs = ts;
         const questions = await this.getQuestions();
         if (questions) cb(questions, snap.metadata);
       }, err => console.error("listenCol questions", err));
@@ -235,13 +239,26 @@ const store = {
   async saveSessionIndex(examId, studentId, sessionData) {
     try {
       const indexRef = doc(db, "examapp2", "sessions_" + examId);
+      // Hanya simpan field minimal di index agar tidak > 1MB dengan 38+ siswa
+      const minimal = {
+        studentId: sessionData.studentId,
+        studentName: sessionData.studentName,
+        kelas: sessionData.kelas,
+        status: sessionData.status,
+        violations: sessionData.violations || 0,
+        currentQuestion: sessionData.currentQuestion || 0,
+        answeredCount: Object.keys(sessionData.answers || {}).length,
+        timeLeft: sessionData.timeLeft || 0,
+        startedAt: sessionData.startedAt || Date.now(),
+        lastUpdate: sessionData.lastUpdate || Date.now(),
+      };
       await runTransaction(db, async (tx) => {
         const snap = await tx.get(indexRef);
         const existing = snap.exists() ? (snap.data().sessions || []) : [];
         const idx = existing.findIndex(s => s.studentId === studentId);
         const updated = [...existing];
-        if (idx >= 0) updated[idx] = sessionData;
-        else updated.push(sessionData);
+        if (idx >= 0) updated[idx] = minimal;
+        else updated.push(minimal);
         tx.set(indexRef, { sessions: updated, ts: Date.now() });
       });
     } catch(e) { console.warn("saveSessionIndex skipped:", e.message); }
@@ -277,14 +294,22 @@ const store = {
   },
   async loadBackup() {
     try {
+      let backup = null;
       const snap = await getDoc(doc(db, "backups2", "latest"));
-      if (snap.exists()) return snap.data();
-      // Try slots
-      for (const slot of ["slot_0","slot_1","slot_2"]) {
-        const s = await getDoc(doc(db, "backups2", slot));
-        if (s.exists()) return s.data();
+      if (snap.exists()) backup = snap.data();
+      else {
+        for (const slot of ["slot_0","slot_1","slot_2"]) {
+          const s = await getDoc(doc(db, "backups2", slot));
+          if (s.exists()) { backup = s.data(); break; }
+        }
       }
-      return null;
+      if (!backup) return null;
+      // Jika backup tidak punya soal (format baru), coba load dari chunks
+      if (!backup.questions || backup.questions.length === 0) {
+        const questions = await this.getQuestions().catch(() => []);
+        if (questions && questions.length > 0) backup.questions = questions;
+      }
+      return backup;
     } catch(e) { console.warn("Load Firebase backup failed:", e); return null; }
   },
   async saveResult(examId, studentId, resultData) {
@@ -4109,7 +4134,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
   const [showNav, setShowNav] = useState(false);
   const [showLockdownGuide, setShowLockdownGuide] = useState(!existingSession);
   const [lockdownWarning, setLockdownWarning] = useState(null);
-  const MAX_VIOLATIONS = 5;
+  const MAX_VIOLATIONS = 3;
 
   // Ref for handleSubmit to avoid stale closure in timer interval
   const handleSubmitRef = useRef(null);
@@ -4313,8 +4338,9 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
       // essay/uraian: marked as "answered" if non-empty, scored by teacher later
     });
     const hasEssay = questions.some(q => q.type === "esai" || q.type === "uraian");
-    const score = pilganCount > 0 ? (correct / pilganCount) * 100 : (hasEssay ? null : 0);
-    const resultData = { id: genId(), examId: exam.id, studentId: user.id, answers: { ...finalAnswers }, correct, pilganCount, score, hasEssay, needsGrading: hasEssay, violations: finalViolations, submittedAt: Date.now() };
+    const score = pilganCount > 0 ? Math.round((correct / pilganCount) * 10000) / 100 : (hasEssay ? null : 0);
+    const wrong = pilganCount - correct;
+    const resultData = { id: genId(), examId: exam.id, studentId: user.id, studentName: user.name, kelas: user.kelas, nisn: user.nisn || user.nis || "", answers: { ...finalAnswers }, correct, wrong, pilganCount, score, hasEssay, needsGrading: hasEssay, violations: finalViolations, submitted: true, submittedAt: Date.now() };
     setResult(resultData);
 
     // Save result to individual doc — guaranteed no race condition with other students

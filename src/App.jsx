@@ -4078,20 +4078,21 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
     };
   }, [submitted, showToast]);
 
-  // Fullscreen — request on start, re-request if exited, count as violation
+  // Fullscreen — skip di iOS Safari (tidak support), hanya Android/desktop
   useEffect(() => {
     if (submitted) return;
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+    if (isIOS) return; // iOS Safari tidak support fullscreen API — skip
     const requestFS = () => {
       try {
         const el = document.documentElement;
         if (el.requestFullscreen) el.requestFullscreen();
-        else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
         else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
       } catch {}
     };
     requestFS();
     const handler = () => {
-      const isFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement);
+      const isFullscreen = !!(document.fullscreenElement || document.mozFullScreenElement);
       if (!isFullscreen && !submittedRef.current) {
         setViolations(v => {
           const nv = v + 1;
@@ -4103,11 +4104,9 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
       }
     };
     document.addEventListener("fullscreenchange", handler);
-    document.addEventListener("webkitfullscreenchange", handler);
     document.addEventListener("mozfullscreenchange", handler);
     return () => {
       document.removeEventListener("fullscreenchange", handler);
-      document.removeEventListener("webkitfullscreenchange", handler);
       document.removeEventListener("mozfullscreenchange", handler);
     };
   }, [submitted]);
@@ -4125,14 +4124,6 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
     };
     const preventDrag = e => e.preventDefault();
     const preventSelect = e => e.preventDefault();
-    // Block devtools open via resize (heuristic)
-    const devtoolsCheck = () => {
-      const threshold = 160;
-      if (window.outerWidth - window.innerWidth > threshold || window.outerHeight - window.innerHeight > threshold) {
-        setViolations(v => v + 1);
-      }
-    };
-    const devInterval = setInterval(devtoolsCheck, 3000);
     document.addEventListener("contextmenu", prevent);
     document.addEventListener("copy", prevent);
     document.addEventListener("cut", prevent);
@@ -4143,7 +4134,6 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
     // Block print
     window.addEventListener("beforeprint", prevent);
     return () => {
-      clearInterval(devInterval);
       document.removeEventListener("contextmenu", prevent);
       document.removeEventListener("copy", prevent);
       document.removeEventListener("cut", prevent);

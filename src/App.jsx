@@ -826,15 +826,15 @@ function AdminDashboard({ data, dataRef, saveData, user, onLogout, showToast }) 
 }
 
 function AdminHome({ data }) {
-  const activeExams = data.exams.filter(e => e.status === "active").length;
+  const activeExams = (data.exams || []).filter(e => e.status === "active").length;
   const activeSessions = (data.sessions || []).filter(s => s.status === "active").length;
   return (
     <div>
       <h2 className="text-2xl font-bold mb-6" style={{ color: "inherit" }}>Dashboard Admin</h2>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <StatCard icon={<Users size={24} className="text-blue-400" />} label="Total Guru" value={data.teachers.length} />
-        <StatCard icon={<GraduationCap size={24} className="text-green-400" />} label="Total Siswa" value={data.students.length} color="#16a34a" />
-        <StatCard icon={<FileText size={24} className="text-purple-400" />} label="Bank Soal" value={data.questions.length} color="#9333ea" />
+        <StatCard icon={<Users size={24} className="text-blue-400" />} label="Total Guru" value={(data.teachers || []).length} />
+        <StatCard icon={<GraduationCap size={24} className="text-green-400" />} label="Total Siswa" value={(data.students || []).length} color="#16a34a" />
+        <StatCard icon={<FileText size={24} className="text-purple-400" />} label="Bank Soal" value={(data.questions || []).length} color="#9333ea" />
         <StatCard icon={<Play size={24} className="text-amber-400" />} label="Ujian Aktif" value={activeExams} color="#d97706" />
       </div>
       {activeSessions > 0 && (
@@ -1335,7 +1335,7 @@ function TeacherManager({ data, dataRef, saveData, showToast }) {
   };
 
   const toggleSubject = (sid) => setForm(f => ({ ...f, subjects: f.subjects.includes(sid) ? f.subjects.filter(s => s !== sid) : [...f.subjects, sid] }));
-  const filtered = data.teachers.filter(t => t.name.toLowerCase().includes(search.toLowerCase()) || t.nip.includes(search));
+  const filtered = (data.teachers || []).filter(t => t.name.toLowerCase().includes(search.toLowerCase()) || t.nip.includes(search));
 
   return (
     <div>
@@ -1448,7 +1448,7 @@ function StudentManager({ data, dataRef, saveData, showToast }) {
     showToast("Siswa dihapus");
   };
 
-  const filtered = data.students.filter(s => {
+  const filtered = (data.students || []).filter(s => {
     const matchSearch = s.name.toLowerCase().includes(search.toLowerCase()) || s.nisn.includes(search);
     const matchKelas = filterKelas === "all" || s.kelas === filterKelas;
     return matchSearch && matchKelas;
@@ -1474,7 +1474,7 @@ function StudentManager({ data, dataRef, saveData, showToast }) {
             {KELAS_OPTIONS.map(k => <option key={k} value={k}>{k}</option>)}
           </select>
         </div>
-        <div className="text-xs mb-3" style={{ color: "inherit", opacity: 0.65 }}>Menampilkan {filtered.length} dari {data.students.length} siswa</div>
+        <div className="text-xs mb-3" style={{ color: "inherit", opacity: 0.65 }}>Menampilkan {filtered.length} dari {(data.students || []).length} siswa</div>
         {filtered.length === 0 ? <EmptyState icon={<GraduationCap size={40} className="mx-auto" />} text="Belum ada data siswa" /> : (
           <div className="space-y-2 max-h-[60vh] overflow-y-auto">
             {filtered.map(s => (
@@ -2661,7 +2661,7 @@ function ExamManager({ data, dataRef, saveData, showToast, isAdmin, userId }) {
 
   const availableQuestions = useMemo(() => {
     if (!form.subjectId) return [];
-    return data.questions.filter(q => q.subjectId === form.subjectId);
+    return (data.questions || []).filter(q => q.subjectId === form.subjectId);
   }, [form.subjectId, data.questions]);
 
   const toggleQuestion = (qid) => setForm(f => ({ ...f, questionIds: f.questionIds.includes(qid) ? f.questionIds.filter(x => x !== qid) : [...f.questionIds, qid] }));
@@ -2697,7 +2697,7 @@ function ExamManager({ data, dataRef, saveData, showToast, isAdmin, userId }) {
   };
 
   const getSubjectName = (sid) => (data.subjects || []).find(s => s.id === sid)?.name || "-";
-  const myExams = isAdmin ? data.exams : data.exams.filter(e => e.createdBy === userId);
+  const myExams = isAdmin ? data.exams : (data.exams || []).filter(e => e.createdBy === userId);
   const statusColors = { draft: { bg: "rgba(100,116,139,0.2)", text: "#94a3b8" }, active: { bg: "rgba(22,163,74,0.2)", text: "#4ade80" }, ended: { bg: "rgba(220,38,38,0.2)", text: "#f87171" } };
   const statusLabels = { draft: "Draft", active: "Aktif", ended: "Selesai" };
 
@@ -2863,14 +2863,14 @@ function MonitorView({ data }) {
     return merged;
   };
 
-  const activeExams = useMemo(() => data.exams.filter(e => e.status === "active"), [data.exams]);
+  const activeExams = useMemo(() => (data.exams || []).filter(e => e.status === "active"), [data.exams]);
 
   if (selectedExam) {
-    const exam = data.exams.find(e => e.id === selectedExam);
+    const exam = (data.exams || []).find(e => e.id === selectedExam);
     if (!exam) return null;
     const sessions = getMergedSessions(selectedExam);
     const examResults = getMergedResults(selectedExam);
-    const targetStudents = data.students.filter(s => exam.targetKelas?.includes(s.kelas));
+    const targetStudents = (data.students || []).filter(s => exam.targetKelas?.includes(s.kelas));
     const totalQ = exam.questionIds.length;
     const getStudentStatus = (st) => {
       const session = sessions.find(s => s.studentId === st.id);
@@ -2973,7 +2973,7 @@ function MonitorView({ data }) {
         <div className="space-y-3">
           {activeExams.map(ex => {
             const sessions = (data.sessions || []).filter(s => s.examId === ex.id);
-            const targetCount = data.students.filter(s => ex.targetKelas?.includes(s.kelas)).length;
+            const targetCount = (data.students || []).filter(s => ex.targetKelas?.includes(s.kelas)).length;
             return (
               <Card key={ex.id} className="cursor-pointer hover:border-blue-500/40 transition" onClick={() => setSelectedExam(ex.id)}>
                 <div className="flex items-center justify-between">
@@ -3027,7 +3027,7 @@ function ResultsView({ data }) {
   };
 
   // Show ALL exams that have at least 1 result, regardless of status
-  const examsWithData = data.exams.filter(e =>
+  const examsWithData = (data.exams || []).filter(e =>
     (data.results || []).some(r => r.examId === e.id) || e.status === "ended"
   ).sort((a, b) => {
     const ra = (data.results || []).filter(r => r.examId === a.id).length;
@@ -3076,7 +3076,7 @@ function ResultsView({ data }) {
         <thead><tr><th>No</th><th>Nama Siswa</th><th>Kelas</th><th>Benar</th><th>Nilai</th><th>Ket.</th></tr></thead>
         <tbody>
           ${sorted.map((r, i) => {
-            const student = data.students.find(s => s.id === r.studentId);
+            const student = (data.students || []).find(s => s.id === r.studentId);
             const scoreNull = r.score === null || r.score === undefined;
             const scoreVal = scoreNull ? "-" : Number(r.score).toFixed(1);
             const ket = scoreNull ? "Perlu Dinilai" : Number(r.score) >= 75 ? "Lulus" : "Tidak Lulus";
@@ -3103,10 +3103,10 @@ function ResultsView({ data }) {
   };
 
   if (selectedExam) {
-    const exam = data.exams.find(e => e.id === selectedExam);
+    const exam = (data.exams || []).find(e => e.id === selectedExam);
     const results = getExamResults(selectedExam);
     const totalQ = exam?.questionIds?.length || 0;
-    const targetStudents = data.students.filter(s => exam?.targetKelas?.includes(s.kelas));
+    const targetStudents = (data.students || []).filter(s => exam?.targetKelas?.includes(s.kelas));
     const submittedIds = new Set(results.map(r => r.studentId));
     const notSubmitted = targetStudents.filter(s => !submittedIds.has(s.id));
     const scoredResults = results.filter(r => r.score !== null && r.score !== undefined);
@@ -3116,7 +3116,7 @@ function ResultsView({ data }) {
     const rankedResults = [...results].sort((a, b) => (b.score||0) - (a.score||0));
     // Per-question analysis
     const questionAnalysis = exam?.questionIds?.map((qid, qi) => {
-      const q = data.questions.find(x => x.id === qid);
+      const q = (data.questions || []).find(x => x.id === qid);
       const answered = results.filter(r => r.answers && r.answers[qi] !== undefined && r.answers[qi] !== "");
       const correct = results.filter(r => r.answers && r.answers[qi] === q?.correctAnswer);
       const pct = answered.length > 0 ? Math.round(correct.length / answered.length * 100) : 0;
@@ -3161,7 +3161,7 @@ function ResultsView({ data }) {
                 <div className="col-span-3">Nilai</div>
               </div>
               {rankedResults.map((r, i) => {
-                const student = data.students.find(s => s.id === r.studentId);
+                const student = (data.students || []).find(s => s.id === r.studentId);
                 const scoreNull = r.score === null || r.score === undefined;
                 const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : String(i+1);
                 return (
@@ -3235,7 +3235,7 @@ function ResultsView({ data }) {
       const totalQ = ex.questionIds?.length || 0;
       const sorted = [...results].sort((a, b) => (b.score || 0) - (a.score || 0));
       const rows = sorted.map((r, i) => {
-        const st = data.students.find(s => s.id === r.studentId);
+        const st = (data.students || []).find(s => s.id === r.studentId);
         const scoreNull = r.score === null || r.score === undefined;
         const scoreDisplay = scoreNull ? "-" : Number(r.score).toFixed(1);
         const ket = scoreNull ? "Perlu Dinilai" : Number(r.score) >= 75 ? "Lulus" : "Tidak Lulus";
@@ -3448,8 +3448,8 @@ function SettingsView({ data, dataRef, saveData, showToast }) {
         <div className="text-slate-300 text-sm space-y-1">
           <p>Sekolah: {SCHOOL_NAME}</p>
           <p>Kurikulum: K-13 & Merdeka Belajar</p>
-          <p>Total Guru: {data.teachers.length} | Total Siswa: {data.students.length}</p>
-          <p>Total Soal: {data.questions.length} | Total Ujian: {data.exams.length}</p>
+          <p>Total Guru: {(data.teachers || []).length} | Total Siswa: {(data.students || []).length}</p>
+          <p>Total Soal: {(data.questions || []).length} | Total Ujian: {(data.exams || []).length}</p>
         </div>
       </Card>
       <Card className="mb-4" style={{ background: "rgba(16,185,129,0.05)", border: "1px solid rgba(16,185,129,0.2)" }}>
@@ -3552,8 +3552,8 @@ function TeacherDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
         <div>
           <h2 className="text-2xl font-bold mb-6" style={{ color: "inherit" }}>Dashboard Guru</h2>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
-            <StatCard icon={<FileText size={24} className="text-blue-400" />} label="Soal Saya" value={data.questions.filter(q => q.createdBy === user.id).length} />
-            <StatCard icon={<Layers size={24} className="text-purple-400" />} label="Ujian Saya" value={data.exams.filter(e => e.createdBy === user.id).length} color="#9333ea" />
+            <StatCard icon={<FileText size={24} className="text-blue-400" />} label="Soal Saya" value={(data.questions || []).filter(q => q.createdBy === user.id).length} />
+            <StatCard icon={<Layers size={24} className="text-purple-400" />} label="Ujian Saya" value={(data.exams || []).filter(e => e.createdBy === user.id).length} color="#9333ea" />
             <StatCard icon={<BookOpen size={24} className="text-green-400" />} label="Mapel Diampu" value={(user.subjects || []).length} color="#16a34a" />
           </div>
           <Card>
@@ -3642,7 +3642,7 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
   }
 
   const now = new Date();
-  const availableExams = data.exams.filter(e => {
+  const availableExams = (data.exams || []).filter(e => {
     if (e.status !== "active") return false;
     if (!e.targetKelas?.includes(user.kelas)) return false;
     if (now < new Date(e.startTime)) return false; // belum dimulai
@@ -3650,14 +3650,14 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
     return !(data.results || []).find(r => r.examId === e.id && r.studentId === user.id);
   });
 
-  const upcomingExams = data.exams.filter(e => {
+  const upcomingExams = (data.exams || []).filter(e => {
     if (e.status !== "active") return false;
     if (!e.targetKelas?.includes(user.kelas)) return false;
     return now < new Date(e.startTime); // aktif tapi belum mulai
   });
 
   const myResults = (data.results || []).filter(r => r.studentId === user.id);
-  const resumableSessions = (data.sessions || []).filter(s => s.studentId === user.id && s.status === "active" && data.exams.find(e => e.id === s.examId && e.status === "active"));
+  const resumableSessions = (data.sessions || []).filter(s => s.studentId === user.id && s.status === "active" && (data.exams || []).find(e => e.id === s.examId && e.status === "active"));
 
   const tabs = [
     { id: "exams", label: "Ujian Tersedia", icon: <FileText size={18} /> },
@@ -3679,7 +3679,7 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
               <h3 className="text-amber-400 font-bold text-lg mb-3 flex items-center gap-2"><AlertTriangle size={18} />Ujian Belum Selesai</h3>
               <div className="space-y-3">
                 {resumableSessions.map(session => {
-                  const exam = data.exams.find(e => e.id === session.examId);
+                  const exam = (data.exams || []).find(e => e.id === session.examId);
                   if (!exam) return null;
                   const answered = Object.keys(session.answers || {}).length;
                   return (
@@ -3749,7 +3749,7 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
           {myResults.length === 0 ? <Card><EmptyState icon={<Award size={40} className="mx-auto" />} text="Belum ada hasil ujian" /></Card> : (
             <div className="space-y-3">
               {myResults.sort((a, b) => b.submittedAt - a.submittedAt).map(r => {
-                const exam = data.exams.find(e => e.id === r.examId);
+                const exam = (data.exams || []).find(e => e.id === r.examId);
                 const subject = (data.subjects || []).find(s => s.id === exam?.subjectId);
                 return (
                   <Card key={r.id}>
@@ -3786,7 +3786,7 @@ function TryoutView({ data, user, showToast }) {
   const [tryoutResult, setTryoutResult] = useState(null);
 
   // All exams marked as tryout OR all ended exams available as practice
-  const tryoutExams = data.exams.filter(e =>
+  const tryoutExams = (data.exams || []).filter(e =>
     e.isTryout || e.status === "ended"
   );
 
@@ -3797,7 +3797,7 @@ function TryoutView({ data, user, showToast }) {
   }
 
   if (tryoutResult) {
-    const exam = data.exams.find(e => e.id === activeExam?.id);
+    const exam = (data.exams || []).find(e => e.id === activeExam?.id);
     return (
       <div>
         <div className="text-center mb-6">
@@ -3879,7 +3879,7 @@ function TryoutView({ data, user, showToast }) {
 // ============= TRYOUT TAKER =============
 function TryoutTaker({ data, user, exam, onFinish, showToast }) {
   const questions = useMemo(() => {
-    let qs = (exam.questionIds || []).map(id => data.questions.find(q => q.id === id)).filter(Boolean);
+    let qs = (exam.questionIds || []).map(id => (data.questions || []).find(q => q.id === id)).filter(Boolean);
     if (exam.shuffleQuestions) {
       qs = [...qs];
       for (let i = qs.length - 1; i > 0; i--) {
@@ -4030,7 +4030,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
   }, []);
 
   const questions = useMemo(() => {
-    let qs = exam.questionIds.map(id => data.questions.find(q => q.id === id)).filter(Boolean);
+    let qs = exam.questionIds.map(id => (data.questions || []).find(q => q.id === id)).filter(Boolean);
     if (existingSession?.questionOrder?.length) {
       // Restore saved order from previous session
       const orderMap = {};
@@ -4299,14 +4299,14 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
     return (
       <div className="min-h-screen flex items-center justify-center p-4" style={{ background: "linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%)" }}>
         <Card className="w-full max-w-md text-center">
-          <div className="w-20 h-20 mx-auto mb-4 rounded-full flex items-center justify-center" style={{ background: result.score >= 75 ? "rgba(22,163,74,0.2)" : result.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)" }}>
-            <Award size={40} style={{ color: result.score >= 75 ? "#4ade80" : result.score >= 50 ? "#fbbf24" : "#f87171" }} />
+          <div className="w-20 h-20 mx-auto mb-4 rounded-full flex items-center justify-center" style={{ background: result.score == null ? "rgba(59,130,246,0.2)" : result.score >= 75 ? "rgba(22,163,74,0.2)" : result.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)" }}>
+            <Award size={40} style={{ color: result.score == null ? "#60a5fa" : result.score >= 75 ? "#4ade80" : result.score >= 50 ? "#fbbf24" : "#f87171" }} />
           </div>
           <h2 className="text-2xl font-bold mb-1" style={{ color: "inherit" }}>Ujian Selesai!</h2>
           <p className="text-slate-400 mb-4">{exam.title}</p>
           {exam.showResult ? (
             <div className="space-y-3 mb-6">
-              <div className="text-6xl font-bold" style={{ color: result.score >= 75 ? "#4ade80" : result.score >= 50 ? "#fbbf24" : "#f87171" }}>{result.score != null ? result.score.toFixed(1) : "Menunggu Penilaian"}</div>
+              <div className="text-6xl font-bold" style={{ color: result.score == null ? "#60a5fa" : result.score >= 75 ? "#4ade80" : result.score >= 50 ? "#fbbf24" : "#f87171" }}>{result.score != null ? result.score.toFixed(1) : "Menunggu Penilaian"}</div>
               <div className="text-slate-300">Benar: {result.correct} dari {questions.length} soal</div>
 
               {violations > 0 && <div className="text-red-400 text-sm flex items-center justify-center gap-1"><AlertTriangle size={14} />Pelanggaran: {violations}x</div>}

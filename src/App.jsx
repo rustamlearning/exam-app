@@ -4037,7 +4037,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
   const [showNav, setShowNav] = useState(false);
   const [showLockdownGuide, setShowLockdownGuide] = useState(!existingSession);
   const [lockdownWarning, setLockdownWarning] = useState(null);
-  const MAX_VIOLATIONS = 5;
+  const MAX_VIOLATIONS = 3;
 
   // Ref for handleSubmit to avoid stale closure in timer interval
   const handleSubmitRef = useRef(null);

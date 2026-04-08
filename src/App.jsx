@@ -298,6 +298,8 @@ export default function ExamApp() {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState("login");
+  const [loginAttempts, setLoginAttempts] = useState({});
+  const loginAttemptsRef = useRef({});
   const [toast, setToast] = useState(null);
   const [theme, setTheme] = useState(() => ls.get(THEME_KEY) || "dark");
   const toggleTheme = useCallback(() => {
@@ -404,7 +406,9 @@ export default function ExamApp() {
 
       // 3. Restore session
       const sess = ls.get(SESSION_KEY);
-      if (sess?.user && sess?.view && sess.view !== "login") {
+      const SESSION_EXPIRY = 8 * 60 * 60 * 1000;
+      const sessionExpired = sess?.loginAt && (Date.now() - sess.loginAt > SESSION_EXPIRY);
+      if (sess?.user && sess?.view && sess.view !== "login" && !sessionExpired) {
         setUser(sess.user); setView(sess.view);
       }
 
@@ -482,6 +486,13 @@ export default function ExamApp() {
     const d = dataRef.current || data;
     if (!d) return;
     const { role, username, password } = credentials;
+    const attemptKey = `${role}_${username}`;
+    const attempts = loginAttemptsRef.current[attemptKey] || { count: 0, lockedUntil: 0 };
+    if (attempts.lockedUntil > Date.now()) {
+      const sisa = Math.ceil((attempts.lockedUntil - Date.now()) / 1000);
+      showToast(`Terlalu banyak percobaan. Tunggu ${sisa} detik.`, "error");
+      return;
+    }
     let loggedUser = null;
     let nextView = "login";
     // Admin credentials stored in data.meta.admin (not data.admin)
@@ -492,7 +503,9 @@ export default function ExamApp() {
         loggedUser = { role: "admin", name: "Administrator" };
         nextView = "admin";
         showToast("Login berhasil sebagai Admin");
-      } else { showToast("Username atau password salah", "error"); return; }
+      } else { const newCount = (loginAttemptsRef.current[attemptKey]?.count || 0) + 1;
+        loginAttemptsRef.current[attemptKey] = { count: newCount, lockedUntil: newCount >= 3 ? Date.now() + 30000 : 0 };
+        showToast(newCount >= 3 ? "Akun terkunci 30 detik." : `Password salah (${newCount}/3)`, "error"); return; }
     } else if (role === "guru") {
       const guru = (d.teachers || []).find(t => t.name.toLowerCase() === username.toLowerCase() && (t.password ? t.password === password : t.nip === password));
       if (guru) {
@@ -512,7 +525,7 @@ export default function ExamApp() {
     if (loggedUser) {
       setUser(loggedUser);
       setView(nextView);
-      try { localStorage.setItem(SESSION_KEY, JSON.stringify({ user: loggedUser, view: nextView })); } catch {}
+      try { localStorage.setItem(SESSION_KEY, JSON.stringify({ user: loggedUser, view: nextView, loginAt: Date.now() })); } catch {}
     }
   }, [data, showToast]);
 
@@ -3097,6 +3110,12 @@ function ResultsView({ data }) {
       <div>
         <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
           <button onClick={() => { setSelectedExam(null); setActiveResultTab("ranking"); }} className="flex items-center gap-2 text-blue-400 hover:underline"><ArrowLeft size={16} />Kembali</button>
+          <Btn variant="success" onClick={() => {
+            const rows = [["No","Nama","NIS/NISN","Kelas","Skor","Benar","Salah","Pelanggaran","Status"]];
+            results.forEach((r,i) => rows.push([i+1, r.studentName||r.name||"-", r.nis||r.nisn||"-", r.class||"-", r.score??"-", r.correct??"-", r.wrong??"-", r.violations||0, r.submitted?"Selesai":"Belum"]));
+            const csv = rows.map(r => r.map(c => `"${c}"`).join(",")).join("\n");
+            const a = document.createElement("a"); a.href = "data:text/csv;charset=utf-8,\uFEFF"+encodeURIComponent(csv); a.download = `nilai-${exam?.title||"ujian"}-${new Date().toISOString().slice(0,10)}.csv`; a.click();
+          }}><Download size={16} />Export CSV</Btn>
           <Btn variant="secondary" onClick={() => handlePrint(exam, results)}><Printer size={16} />Cetak Laporan PDF</Btn>
         </div>
         <h2 className="text-2xl font-bold mb-1" style={{ color: "inherit" }}>{exam?.title} — Hasil</h2>
@@ -4016,6 +4035,9 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
   const [submitted, setSubmitted] = useState(false);
   const [result, setResult] = useState(null);
   const [showNav, setShowNav] = useState(false);
+  const [showLockdownGuide, setShowLockdownGuide] = useState(!existingSession);
+  const [lockdownWarning, setLockdownWarning] = useState(null);
+  const MAX_VIOLATIONS = 5;
 
   // Ref for handleSubmit to avoid stale closure in timer interval
   const handleSubmitRef = useRef(null);
@@ -4032,30 +4054,63 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
     return () => clearInterval(iv);
   }, [submitted]);
 
-  // Anti-cheat: tab visibility
+  // Anti-cheat: tab visibility + auto-submit if too many violations
   useEffect(() => {
     if (submitted) return;
     const handler = () => {
-      if (document.hidden) setViolations(v => { const nv = v + 1; showToast(`Pelanggaran! (${nv}x) — Jangan berpindah tab`, "warning"); return nv; });
+      if (document.hidden) {
+        setViolations(v => {
+          const nv = v + 1;
+          if (nv >= MAX_VIOLATIONS) {
+            setLockdownWarning("AUTO_SUBMIT");
+            setTimeout(() => handleSubmitRef.current?.(true), 2000);
+          } else {
+            setLockdownWarning(`Pelanggaran ${nv}/${MAX_VIOLATIONS}! Jangan berpindah tab atau aplikasi.`);
+            setTimeout(() => setLockdownWarning(null), 4000);
+          }
+          return nv;
+        });
+      }
     };
     document.addEventListener("visibilitychange", handler);
-    return () => document.removeEventListener("visibilitychange", handler);
+    return () => {
+      document.removeEventListener("visibilitychange", handler);
+    };
   }, [submitted, showToast]);
 
-  // Fullscreen
+  // Fullscreen — request on start, re-request if exited, count as violation
   useEffect(() => {
     if (submitted) return;
-    try { document.documentElement.requestFullscreen?.(); } catch {}
+    const requestFS = () => {
+      try {
+        const el = document.documentElement;
+        if (el.requestFullscreen) el.requestFullscreen();
+        else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+        else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
+      } catch {}
+    };
+    requestFS();
     const handler = () => {
-      if (!document.fullscreenElement && !submitted) {
-        setViolations(v => v + 1);
-        showToast("Keluar dari fullscreen terdeteksi!", "warning");
-        try { document.documentElement.requestFullscreen?.(); } catch {}
+      const isFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement);
+      if (!isFullscreen && !submittedRef.current) {
+        setViolations(v => {
+          const nv = v + 1;
+          setLockdownWarning(`Keluar fullscreen terdeteksi! (${nv}/${MAX_VIOLATIONS})`);
+          setTimeout(() => setLockdownWarning(null), 3000);
+          return nv;
+        });
+        setTimeout(requestFS, 500);
       }
     };
     document.addEventListener("fullscreenchange", handler);
-    return () => document.removeEventListener("fullscreenchange", handler);
-  }, [submitted, showToast]);
+    document.addEventListener("webkitfullscreenchange", handler);
+    document.addEventListener("mozfullscreenchange", handler);
+    return () => {
+      document.removeEventListener("fullscreenchange", handler);
+      document.removeEventListener("webkitfullscreenchange", handler);
+      document.removeEventListener("mozfullscreenchange", handler);
+    };
+  }, [submitted]);
 
   // Comprehensive lockdown
   useEffect(() => {
@@ -4252,8 +4307,103 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
   const q = questions[currentQ];
   if (!q) return null;
 
+  // Lockdown guide screen — shown once before exam starts
+  if (showLockdownGuide) {
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+    const isAndroid = /Android/.test(navigator.userAgent);
+    return (
+      <div className="min-h-screen flex items-center justify-center p-4" style={{ background: "linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%)" }}>
+        <div className="w-full max-w-md">
+          <div className="text-center mb-6">
+            <div className="w-16 h-16 mx-auto mb-3 rounded-full flex items-center justify-center" style={{ background: "rgba(59,130,246,0.2)" }}>
+              <Lock size={32} className="text-blue-400" />
+            </div>
+            <h2 className="text-xl font-bold text-white mb-1">Persiapan Ujian</h2>
+            <p className="text-slate-400 text-sm">{exam.title}</p>
+          </div>
+
+          <div className="rounded-xl p-4 mb-4" style={{ background: "rgba(220,38,38,0.1)", border: "1px solid rgba(220,38,38,0.3)" }}>
+            <p className="text-red-400 font-bold text-sm mb-2">⚠️ Aturan Ujian Digital</p>
+            <ul className="text-slate-300 text-sm space-y-1">
+              <li>• Dilarang berpindah tab atau aplikasi</li>
+              <li>• Dilarang keluar dari browser saat ujian</li>
+              <li>• Pelanggaran akan tercatat dan dilaporkan ke guru</li>
+              <li>• Setelah {MAX_VIOLATIONS}x pelanggaran, jawaban dikumpulkan otomatis</li>
+            </ul>
+          </div>
+
+          {isAndroid && (
+            <div className="rounded-xl p-4 mb-4" style={{ background: "rgba(59,130,246,0.1)", border: "1px solid rgba(59,130,246,0.2)" }}>
+              <p className="text-blue-400 font-bold text-sm mb-2">📱 Panduan Android — Screen Pinning</p>
+              <ol className="text-slate-300 text-sm space-y-1 list-none">
+                <li>1. Minta guru aktifkan <strong>Screen Pinning</strong></li>
+                <li>2. Buka <strong>Pengaturan → Keamanan → Screen Pinning</strong></li>
+                <li>3. Aktifkan, lalu buka browser ini</li>
+                <li>4. Tekan tombol <strong>Recent Apps</strong> → tap ikon pin 📌</li>
+                <li>5. HP terkunci di browser sampai guru buka kunci</li>
+              </ol>
+            </div>
+          )}
+
+          {isIOS && (
+            <div className="rounded-xl p-4 mb-4" style={{ background: "rgba(59,130,246,0.1)", border: "1px solid rgba(59,130,246,0.2)" }}>
+              <p className="text-blue-400 font-bold text-sm mb-2">📱 Panduan iPhone — Guided Access</p>
+              <ol className="text-slate-300 text-sm space-y-1 list-none">
+                <li>1. Buka <strong>Pengaturan → Accessibility → Guided Access</strong></li>
+                <li>2. Aktifkan Guided Access</li>
+                <li>3. Buka Safari/Chrome dengan halaman ujian ini</li>
+                <li>4. Klik tiga kali tombol <strong>Home/Side</strong></li>
+                <li>5. Tap <strong>Start</strong> — HP terkunci di halaman ini</li>
+              </ol>
+            </div>
+          )}
+
+          {!isAndroid && !isIOS && (
+            <div className="rounded-xl p-4 mb-4" style={{ background: "rgba(59,130,246,0.1)", border: "1px solid rgba(59,130,246,0.2)" }}>
+              <p className="text-blue-400 font-bold text-sm mb-2">💻 Kiosk Mode Browser</p>
+              <p className="text-slate-300 text-sm">Pastikan browser dalam mode fullscreen. Jangan buka tab atau jendela lain selama ujian.</p>
+            </div>
+          )}
+
+          <button
+            className="w-full py-3 rounded-xl font-bold text-white text-base"
+            style={{ background: "linear-gradient(135deg, #2563eb, #1d4ed8)" }}
+            onClick={() => {
+              try {
+                const el = document.documentElement;
+                if (el.requestFullscreen) el.requestFullscreen();
+                else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+              } catch {}
+              setShowLockdownGuide(false);
+            }}
+          >
+            Saya Mengerti — Mulai Ujian
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen select-none" style={{ background: "linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%)", userSelect: "none" }}>
+      {/* Lockdown violation warning overlay */}
+      {lockdownWarning && lockdownWarning !== "AUTO_SUBMIT" && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center pointer-events-none">
+          <div className="mx-4 px-6 py-4 rounded-2xl text-center" style={{ background: "rgba(220,38,38,0.95)", border: "2px solid #ef4444", maxWidth: 340 }}>
+            <AlertTriangle size={28} className="mx-auto mb-2 text-white" />
+            <p className="text-white font-bold text-sm">{lockdownWarning}</p>
+          </div>
+        </div>
+      )}
+      {lockdownWarning === "AUTO_SUBMIT" && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center" style={{ background: "rgba(0,0,0,0.85)" }}>
+          <div className="mx-4 px-8 py-6 rounded-2xl text-center" style={{ background: "rgba(220,38,38,0.95)", border: "2px solid #ef4444", maxWidth: 340 }}>
+            <AlertTriangle size={36} className="mx-auto mb-3 text-white" />
+            <p className="text-white font-bold text-lg mb-1">Batas Pelanggaran Tercapai!</p>
+            <p className="text-red-200 text-sm">Jawaban dikumpulkan otomatis dalam 2 detik...</p>
+          </div>
+        </div>
+      )}
       {/* Header */}
       <div className="sticky top-0 z-50 px-4 py-2 flex items-center justify-between" style={{ background: "rgba(15,23,42,0.98)", borderBottom: "1px solid rgba(59,130,246,0.2)" }}>
         <div className="flex items-center gap-3">

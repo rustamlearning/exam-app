@@ -298,8 +298,6 @@ export default function ExamApp() {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState("login");
-  const [loginAttempts, setLoginAttempts] = useState({});
-  const loginAttemptsRef = useRef({});
   const [toast, setToast] = useState(null);
   const [theme, setTheme] = useState(() => ls.get(THEME_KEY) || "dark");
   const toggleTheme = useCallback(() => {
@@ -406,9 +404,7 @@ export default function ExamApp() {
 
       // 3. Restore session
       const sess = ls.get(SESSION_KEY);
-      const SESSION_EXPIRY = 8 * 60 * 60 * 1000;
-      const sessionExpired = sess?.loginAt && (Date.now() - sess.loginAt > SESSION_EXPIRY);
-      if (sess?.user && sess?.view && sess.view !== "login" && !sessionExpired) {
+      if (sess?.user && sess?.view && sess.view !== "login") {
         setUser(sess.user); setView(sess.view);
       }
 
@@ -486,13 +482,6 @@ export default function ExamApp() {
     const d = dataRef.current || data;
     if (!d) return;
     const { role, username, password } = credentials;
-    const attemptKey = `${role}_${username}`;
-    const attempts = loginAttemptsRef.current[attemptKey] || { count: 0, lockedUntil: 0 };
-    if (attempts.lockedUntil > Date.now()) {
-      const sisa = Math.ceil((attempts.lockedUntil - Date.now()) / 1000);
-      showToast(`Terlalu banyak percobaan. Tunggu ${sisa} detik.`, "error");
-      return;
-    }
     let loggedUser = null;
     let nextView = "login";
     // Admin credentials stored in data.meta.admin (not data.admin)
@@ -503,9 +492,7 @@ export default function ExamApp() {
         loggedUser = { role: "admin", name: "Administrator" };
         nextView = "admin";
         showToast("Login berhasil sebagai Admin");
-      } else { const newCount = (loginAttemptsRef.current[attemptKey]?.count || 0) + 1;
-        loginAttemptsRef.current[attemptKey] = { count: newCount, lockedUntil: newCount >= 3 ? Date.now() + 30000 : 0 };
-        showToast(newCount >= 3 ? "Akun terkunci 30 detik." : `Password salah (${newCount}/3)`, "error"); return; }
+      } else { showToast("Username atau password salah", "error"); return; }
     } else if (role === "guru") {
       const guru = (d.teachers || []).find(t => t.name.toLowerCase() === username.toLowerCase() && (t.password ? t.password === password : t.nip === password));
       if (guru) {
@@ -525,7 +512,7 @@ export default function ExamApp() {
     if (loggedUser) {
       setUser(loggedUser);
       setView(nextView);
-      try { localStorage.setItem(SESSION_KEY, JSON.stringify({ user: loggedUser, view: nextView, loginAt: Date.now() })); } catch {}
+      try { localStorage.setItem(SESSION_KEY, JSON.stringify({ user: loggedUser, view: nextView })); } catch {}
     }
   }, [data, showToast]);
 
@@ -3110,12 +3097,6 @@ function ResultsView({ data }) {
       <div>
         <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
           <button onClick={() => { setSelectedExam(null); setActiveResultTab("ranking"); }} className="flex items-center gap-2 text-blue-400 hover:underline"><ArrowLeft size={16} />Kembali</button>
-          <Btn variant="success" onClick={() => {
-            const rows = [["No","Nama","NIS/NISN","Kelas","Skor","Benar","Salah","Pelanggaran","Status"]];
-            results.forEach((r,i) => rows.push([i+1, r.studentName||r.name||"-", r.nis||r.nisn||"-", r.class||"-", r.score??"-", r.correct??"-", r.wrong??"-", r.violations||0, r.submitted?"Selesai":"Belum"]));
-            const csv = rows.map(r => r.map(c => `"${c}"`).join(",")).join("\n");
-            const a = document.createElement("a"); a.href = "data:text/csv;charset=utf-8,\uFEFF"+encodeURIComponent(csv); a.download = `nilai-${exam?.title||"ujian"}-${new Date().toISOString().slice(0,10)}.csv`; a.click();
-          }}><Download size={16} />Export CSV</Btn>
           <Btn variant="secondary" onClick={() => handlePrint(exam, results)}><Printer size={16} />Cetak Laporan PDF</Btn>
         </div>
         <h2 className="text-2xl font-bold mb-1" style={{ color: "inherit" }}>{exam?.title} — Hasil</h2>

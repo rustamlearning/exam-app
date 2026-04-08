@@ -158,25 +158,63 @@ const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 
 // ============= GRANULAR STORE =============
-// sessions & results stored as individual docs to prevent race conditions
-// with 100+ concurrent students
+// sessions & results: individual docs (no race conditions)
+// questions: chunked per 100 soal (avoid Firestore 1MB limit)
 const COLS = ["meta","teachers","students","subjects","questions","exams"];
 const STATIC_COLS = ["meta","teachers","students","subjects","questions","exams"];
+const Q_CHUNK_SIZE = 100;
 
 const store = {
   async getCol(col) {
+    if (col === "questions") return this.getQuestions();
     try {
       const snap = await getDoc(doc(db, "examapp2", col));
       if (snap.exists()) return snap.data().value;
-      return undefined; // collection belum pernah ada (beda dengan null = error)
-    } catch(e) { console.error("getCol", col, e); return null; } // null = error
+      return undefined;
+    } catch(e) { console.error("getCol", col, e); return null; }
   },
   async setCol(col, val) {
     if (val === undefined) return;
+    if (col === "questions") return this.setQuestions(val);
     try { await setDoc(doc(db, "examapp2", col), { value: val, ts: Date.now() }); }
     catch(e) { console.error("setCol", col, e); throw e; }
   },
+  async getQuestions() {
+    try {
+      const idxSnap = await getDoc(doc(db, "examapp2", "questions_index"));
+      let chunkCount = 1;
+      if (idxSnap.exists()) chunkCount = idxSnap.data().chunks || 1;
+      const snaps = await Promise.all(
+        Array.from({ length: chunkCount }, (_, i) => getDoc(doc(db, "examapp2", "questions_" + i)))
+      );
+      const all = [];
+      snaps.forEach(s => { if (s.exists()) all.push(...(s.data().value || [])); });
+      if (all.length > 0) return all;
+      // fallback ke doc lama (migrasi otomatis)
+      const old = await getDoc(doc(db, "examapp2", "questions"));
+      if (old.exists()) return old.data().value || [];
+      return undefined;
+    } catch(e) { console.error("getQuestions", e); return null; }
+  },
+  async setQuestions(questions) {
+    if (!Array.isArray(questions)) return;
+    const chunks = [];
+    for (let i = 0; i < questions.length; i += Q_CHUNK_SIZE) chunks.push(questions.slice(i, i + Q_CHUNK_SIZE));
+    if (chunks.length === 0) chunks.push([]);
+    const ts = Date.now();
+    await Promise.all([
+      ...chunks.map((chunk, i) => setDoc(doc(db, "examapp2", "questions_" + i), { value: chunk, ts, chunk: i, total: chunks.length })),
+      setDoc(doc(db, "examapp2", "questions_index"), { chunks: chunks.length, total: questions.length, ts })
+    ]);
+  },
   listenCol(col, cb) {
+    if (col === "questions") {
+      return onSnapshot(doc(db, "examapp2", "questions_index"), async (snap) => {
+        if (!snap.exists() || snap.metadata.hasPendingWrites) return;
+        const questions = await this.getQuestions();
+        if (questions) cb(questions, snap.metadata);
+      }, err => console.error("listenCol questions", err));
+    }
     return onSnapshot(
       doc(db, "examapp2", col),
       snap => { if (snap.exists()) cb(snap.data().value, snap.metadata); },
@@ -217,23 +255,24 @@ const store = {
   // ---- BACKUP to Firebase (separate collection, never overwritten by reset) ----
   async saveBackup(data) {
     try {
+      const hasData = (data.teachers||[]).length > 0 || (data.students||[]).length > 0 || (data.questions||[]).length > 0;
+      if (!hasData) return;
+      // Backup metadata tanpa soal (soal sudah di chunk terpisah)
       const snapshot = {
         teachers: data.teachers || [],
         students: data.students || [],
-        questions: data.questions || [],
         exams: data.exams || [],
         subjects: data.subjects || [],
         meta: data.meta || {},
+        questionCount: (data.questions||[]).length,
         ts: Date.now(),
         date: new Date().toISOString(),
       };
-      // Only backup if there's real data
-      const hasData = snapshot.teachers.length > 0 || snapshot.students.length > 0 || snapshot.questions.length > 0;
-      if (!hasData) return;
-      await setDoc(doc(db, "backups2", "latest"), snapshot);
-      // Also save a timestamped slot (keep last 3)
       const slot = "slot_" + (Math.floor(Date.now() / 1000) % 3);
-      await setDoc(doc(db, "backups2", slot), snapshot);
+      await Promise.all([
+        setDoc(doc(db, "backups2", "latest"), snapshot),
+        setDoc(doc(db, "backups2", slot), snapshot),
+      ]);
     } catch(e) { console.warn("Firebase backup failed (non-critical):", e); }
   },
   async loadBackup() {
@@ -485,10 +524,17 @@ export default function ExamApp() {
       }
     }));
     if (failedCols.length > 0) {
-      // Show visible error so teacher knows the save did NOT reach the server.
-      // Data is still in localStorage so it won't be lost on this device,
-      // but it will be gone after a hard reload if Firestore never gets updated.
-      showToast("⚠️ Gagal menyimpan ke server! Data tersimpan sementara di perangkat ini saja. Coba lagi atau periksa koneksi internet.", "error");
+      const colNames = { questions: "soal", teachers: "guru", students: "siswa", exams: "ujian", meta: "pengaturan", subjects: "mapel" };
+      const failed = failedCols.map(c => colNames[c] || c).join(", ");
+      showToast(`⚠️ Gagal simpan ke server (${failed}). Data aman di perangkat ini. Pastikan internet stabil lalu refresh halaman.`, "error");
+      // Jadwalkan retry otomatis setelah 5 detik
+      setTimeout(async () => {
+        const retryData = dataRef?.current;
+        if (!retryData) return;
+        for (const col of failedCols) {
+          try { await store.setCol(col, retryData[col]); } catch {}
+        }
+      }, 5000);
     }
     // --- BACKUP SYSTEM: async Firebase backup — throttled to once per 5 minutes ---
     const now = Date.now();
@@ -2218,12 +2264,12 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
     else setSelectedIds(new Set(filtered.map(q => q.id)));
   };
 
-  const handleBulkImport = (importedQuestions) => {
+  const handleBulkImport = async (importedQuestions) => {
     const latest = dataRef?.current || data;
     const questions = [...(latest.questions || []), ...importedQuestions.map(q => ({ id: genId(), ...q, type: q.type || "pilgan", createdBy: userId || "admin" }))];
-    saveData({ ...latest, questions }, ["questions"]);
+    showToast(`Menyimpan ${importedQuestions.length} soal...`, "success");
     setShowImport(false);
-    showToast(`${importedQuestions.length} soal berhasil diimpor`);
+    await saveData({ ...latest, questions }, ["questions"]);
   };
 
   const getSubjectName = (sid) => (data.subjects || []).find(s => s.id === sid)?.name || "-";

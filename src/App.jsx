@@ -299,7 +299,6 @@ export default function ExamApp() {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState("login");
-  const [loginAttempts, setLoginAttempts] = useState({});
   const loginAttemptsRef = useRef({});
   const [toast, setToast] = useState(null);
   const [theme, setTheme] = useState(() => ls.get(THEME_KEY) || "dark");
@@ -324,8 +323,7 @@ export default function ExamApp() {
     navText: isDark ? "#60a5fa" : "#1d4ed8",
     badge: isDark ? "rgba(51,65,85,0.8)" : "rgba(226,232,240,0.9)",
   };
-  const lastSaveRef = useRef(0);
-  const isWritingRef = useRef(false);
+
 
   const showToast = useCallback((msg, type = "success") => {
     setToast({ msg, type });
@@ -459,16 +457,14 @@ export default function ExamApp() {
 
   const saveData = useCallback(async (newData, hints) => {
     if (!newData) return;
+    const prev = dataRef.current;
     setData(newData);
-    // FIX BUG 1: Update dataRef immediately so rapid consecutive saves
-    // always read the latest data, not stale data from previous render cycle.
     if (dataRef.current !== undefined) dataRef.current = newData;
     ls.set(CACHE_KEY, newData);
     ls.set(BACKUP_KEY, newData);
     // --- BACKUP SYSTEM: save to rotating localStorage slots ---
     backupSystem.saveLocal(newData);
     const toSave = hints || COLS.filter(col => {
-      const prev = dataRef.current;
       return newData[col] !== undefined && (!prev || JSON.stringify(newData[col]) !== JSON.stringify(prev[col]));
     });
     // FIX BUG 2: Track which columns fail to write so we can alert the user.
@@ -2200,12 +2196,13 @@ function QuestionManager({ data, dataRef, saveData, showToast, userId }) {
 
   const handleBulkDelete = () => {
     if (selectedIds.size === 0) return;
-    if (!confirm(`Hapus ${selectedIds.size} soal yang dipilih? Tindakan ini tidak dapat dibatalkan.`)) return;
+    const count = selectedIds.size;
+    if (!confirm(`Hapus ${count} soal yang dipilih? Tindakan ini tidak dapat dibatalkan.`)) return;
     const latest = dataRef?.current || data;
     saveData({ ...latest, questions: (latest.questions || []).filter(q => !selectedIds.has(q.id)) }, ["questions"]);
     setSelectedIds(new Set());
     setBulkMode(false);
-    showToast(`${selectedIds.size} soal berhasil dihapus`);
+    showToast(`${count} soal berhasil dihapus`);
   };
 
   const toggleSelect = (id) => {
@@ -3099,6 +3096,7 @@ function ResultsView({ data }) {
       </body></html>`;
 
     const w = window.open("", "_blank");
+    if (!w) { toast("Browser memblokir popup. Izinkan popup untuk mencetak.", "error"); return; }
     w.document.write(printContent);
     w.document.close();
     w.onload = () => { w.print(); };
@@ -3112,7 +3110,7 @@ function ResultsView({ data }) {
     const submittedIds = new Set(results.map(r => r.studentId));
     const notSubmitted = targetStudents.filter(s => !submittedIds.has(s.id));
     const scoredResults = results.filter(r => r.score !== null && r.score !== undefined);
-    const avg = scoredResults.length > 0 ? (scoredResults.reduce((a, r) => a + r.score, 0) / scoredResults.length).toFixed(1) : "-";
+    const avg = scoredResults.length > 0 ? (scoredResults.reduce((a, r) => a + (r.score || 0), 0) / scoredResults.length).toFixed(1) : "-";
     const highest = scoredResults.length > 0 ? Math.max(...scoredResults.map(r => r.score)).toFixed(1) : "-";
     const lowest = scoredResults.length > 0 ? Math.min(...scoredResults.map(r => r.score)).toFixed(1) : "-";
     const rankedResults = [...results].sort((a, b) => (b.score||0) - (a.score||0));
@@ -3177,7 +3175,7 @@ function ResultsView({ data }) {
                         <span className="px-1.5 py-0.5 rounded text-xs" style={{ background: "rgba(168,85,247,0.2)", color: "#c084fc" }}>Dinilai</span>
                       ) : (
                         <span className="px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
-                          {r.score.toFixed(1)}
+                          {r.score != null ? r.score.toFixed(1) : "?"}
                         </span>
                       )}
                     </div>
@@ -3248,6 +3246,7 @@ function ResultsView({ data }) {
     }).join("")}
     </body></html>`;
     const w = window.open("", "_blank");
+    if (!w) { toast("Browser memblokir popup. Izinkan popup untuk mencetak.", "error"); return; }
     w.document.write(printContent);
     w.document.close();
     w.onload = () => w.print();
@@ -3263,7 +3262,7 @@ function ResultsView({ data }) {
         <div className="space-y-3">
           {examsWithData.map(ex => {
             const results = getExamResults(ex.id);
-            const avg = results.length > 0 ? (results.reduce((a, r) => a + r.score, 0) / results.length).toFixed(1) : "-";
+            const avg = results.length > 0 ? (results.filter(r => r.score != null).reduce((a, r) => a + r.score, 0) / results.length).toFixed(1) : "-";
             const passCount = results.filter(r => r.score >= 75).length;
             return (
               <Card key={ex.id} className="cursor-pointer hover:border-blue-500/40 transition" onClick={() => setSelectedExam(ex.id)}>
@@ -3304,7 +3303,7 @@ function GeminiApiKeySetting({ data, dataRef, saveData, showToast }) {
   // Sync from data when it loads (in case Firestore loads after component mount)
   useEffect(() => {
     const fromMeta = data?.meta?.geminiKey || "";
-    if (fromMeta && fromMeta !== keyVal) setKeyVal(fromMeta);
+    if (fromMeta) setKeyVal(prev => fromMeta !== prev ? fromMeta : prev);
   }, [data?.meta?.geminiKey]);
 
   const handleSave = async () => {
@@ -3762,7 +3761,7 @@ function StudentDashboard({ data, dataRef, saveData, user, onLogout, showToast, 
                       </div>
                       <div className="text-right">
                         <span className="px-3 py-1 rounded-full text-lg font-bold" style={{ background: r.score >= 75 ? "rgba(22,163,74,0.2)" : r.score >= 50 ? "rgba(217,119,6,0.2)" : "rgba(220,38,38,0.2)", color: r.score >= 75 ? "#4ade80" : r.score >= 50 ? "#fbbf24" : "#f87171" }}>
-                          {r.score.toFixed(1)}
+                          {r.score != null ? r.score.toFixed(1) : "Menunggu Penilaian"}
                         </span>
 
                       </div>
@@ -3807,7 +3806,7 @@ function TryoutView({ data, user, showToast }) {
           </div>
           <h2 className="text-2xl font-bold mb-1" style={{ color: "inherit" }}>Tryout Selesai!</h2>
           <p className="text-sm mb-4" style={{ color: "inherit", opacity: 0.7 }}>{exam?.title}</p>
-          <div className="text-6xl font-bold mb-2" style={{ color: tryoutResult.score >= 75 ? "#4ade80" : "#f87171" }}>{tryoutResult.score.toFixed(1)}</div>
+          <div className="text-6xl font-bold mb-2" style={{ color: tryoutResult.score >= 75 ? "#4ade80" : "#f87171" }}>{tryoutResult.score != null ? tryoutResult.score.toFixed(1) : "?"}</div>
           <p className="text-sm mb-1" style={{ color: "inherit", opacity: 0.7 }}>Benar: {tryoutResult.correct} dari {tryoutResult.total} soal</p>
           <p className="text-xs" style={{ color: "inherit", opacity: 0.5 }}>Ini adalah latihan — tidak tercatat sebagai nilai resmi</p>
         </div>
@@ -3987,8 +3986,9 @@ function StudentProfile({ data, saveData, user, showToast, updateUserSession }) 
   };
 
   const myResults = (data.results || []).filter(r => r.studentId === user.id);
-  const avg = myResults.length > 0 ? (myResults.reduce((a, r) => a + r.score, 0) / myResults.length).toFixed(1) : "-";
-  const best = myResults.length > 0 ? Math.max(...myResults.map(r => r.score)).toFixed(1) : "-";
+  const scoredMyResults = myResults.filter(r => r.score != null);
+  const avg = scoredMyResults.length > 0 ? (scoredMyResults.reduce((a, r) => a + r.score, 0) / scoredMyResults.length).toFixed(1) : "-";
+  const best = scoredMyResults.length > 0 ? Math.max(...scoredMyResults.map(r => r.score)).toFixed(1) : "-";
 
   return (
     <div>
@@ -4306,7 +4306,7 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
           <p className="text-slate-400 mb-4">{exam.title}</p>
           {exam.showResult ? (
             <div className="space-y-3 mb-6">
-              <div className="text-6xl font-bold" style={{ color: result.score >= 75 ? "#4ade80" : result.score >= 50 ? "#fbbf24" : "#f87171" }}>{result.score.toFixed(1)}</div>
+              <div className="text-6xl font-bold" style={{ color: result.score >= 75 ? "#4ade80" : result.score >= 50 ? "#fbbf24" : "#f87171" }}>{result.score != null ? result.score.toFixed(1) : "Menunggu Penilaian"}</div>
               <div className="text-slate-300">Benar: {result.correct} dari {questions.length} soal</div>
 
               {violations > 0 && <div className="text-red-400 text-sm flex items-center justify-center gap-1"><AlertTriangle size={14} />Pelanggaran: {violations}x</div>}

@@ -416,6 +416,8 @@ export default function ExamApp() {
       // 2. Load all collections in parallel
       try {
         const vals = await Promise.all(COLS.map(col => store.getCol(col)));
+        // CATATAN: COLS = ["meta","teachers","students","subjects","questions","exams"] (6 item, index 0-5)
+        // sessions & results di-load per-exam (bukan global) — jangan tambahkan ke sini
         const fbD = {
           meta: vals[0] !== null && vals[0] !== undefined ? vals[0] : DEFAULT_DATA.meta,
           teachers: vals[1] !== null && vals[1] !== undefined ? vals[1] : [],
@@ -423,8 +425,8 @@ export default function ExamApp() {
           subjects: (vals[3] !== null && vals[3] !== undefined && vals[3]?.length) ? vals[3] : MAPEL_K13,
           questions: vals[4] !== null && vals[4] !== undefined ? vals[4] : [],
           exams: vals[5] !== null && vals[5] !== undefined ? vals[5] : [],
-          sessions: vals[6] !== null && vals[6] !== undefined ? vals[6] : [],
-          results: vals[7] !== null && vals[7] !== undefined ? vals[7] : [],
+          sessions: [],
+          results: [],
         };
         // Jika ada collection yang error (null), gunakan data localStorage sebagai fallback
         const localCached2 = ls.get(CACHE_KEY);
@@ -505,11 +507,13 @@ export default function ExamApp() {
         const u = store.listenCol(col, (val, meta) => {
           if (val === null || val === undefined) return;
           if (meta.hasPendingWrites) return;
-          if (Date.now() - (writeTimesRef.current[col] || 0) < 1500) return;
+          if (Date.now() - (writeTimesRef.current[col] || 0) < 3000) return; // guard diperpanjang 3 detik
           setData(prev => {
             if (!prev) return prev;
             const next = { ...prev, [col]: val };
             ls.set(CACHE_KEY, next);
+            ls.set(BACKUP_KEY, next); // sync backup juga
+            dataRef.current = next;   // sync dataRef agar saveData tidak pakai data lama
             return next;
           });
         });
@@ -519,11 +523,15 @@ export default function ExamApp() {
     return () => { unsubsRef.current.forEach(u => u()); };
   }, []);
 
+  // dataRef HARUS dideklarasikan sebelum saveData agar tidak undefined saat dipanggil
+  // (useRef tidak di-hoist — kalau dideklarasi setelah useCallback, nilainya null saat saveData pertama kali jalan)
+  const dataRef = useRef(null);
+
   const saveData = useCallback(async (newData, hints) => {
     if (!newData) return;
     const prev = dataRef.current;
     setData(newData);
-    if (dataRef.current !== undefined) dataRef.current = newData;
+    dataRef.current = newData;
     ls.set(CACHE_KEY, newData);
     ls.set(BACKUP_KEY, newData);
     // --- BACKUP SYSTEM: save to rotating localStorage slots ---
@@ -570,8 +578,7 @@ export default function ExamApp() {
   }, [showToast]);
 
 
-  // Expose dataRef so ExamTaker can always access latest data
-  const dataRef = useRef(null);
+  // Sync dataRef dengan state data setiap kali data berubah
   useEffect(() => { dataRef.current = data; }, [data]);
 
   const handleLogin = useCallback((credentials) => {

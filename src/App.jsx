@@ -4146,9 +4146,10 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
   // Ref for handleSubmit to avoid stale closure in timer interval
   const handleSubmitRef = useRef(null);
 
-  // Timer
+  // Timer — tidak jalan jika soal belum tersedia (questions.length === 0)
   useEffect(() => {
     if (submitted) return;
+    if (questions.length === 0) return; // pause timer saat soal belum load
     const iv = setInterval(() => {
       setTimeLeft(t => {
         if (t <= 1) { clearInterval(iv); handleSubmitRef.current?.(true); return 0; }
@@ -4156,11 +4157,13 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
       });
     }, 1000);
     return () => clearInterval(iv);
-  }, [submitted]);
+  }, [submitted, questions.length]);
 
   // Anti-cheat: tab visibility + auto-submit if too many violations
+  // Tidak aktif jika soal belum load (questions.length === 0) atau masih di layar panduan
   useEffect(() => {
     if (submitted) return;
+    if (questions.length === 0) return; // jangan hitung pelanggaran sebelum soal siap
     const handler = () => {
       if (document.hidden) {
         setViolations(v => {
@@ -4399,8 +4402,30 @@ function ExamTaker({ data, dataRef, saveData, user, exam, onFinish, showToast })
     );
   }
 
+  // Guard: soal belum tersedia (race condition antara Firebase load dan ExamTaker mount)
+  if (questions.length === 0) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-4" style={{ background: "linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%)" }}>
+        <div className="text-center">
+          <div className="w-16 h-16 border-4 border-blue-400 border-t-transparent rounded-full mx-auto mb-4" style={{ animation: "spin 1s linear infinite" }} />
+          <p className="text-blue-200 text-lg font-semibold mb-2">Memuat soal ujian...</p>
+          <p className="text-slate-400 text-sm mb-6">Mohon tunggu, sedang mengambil data soal dari server.</p>
+          <button
+            onClick={onFinish}
+            className="px-4 py-2 rounded-lg text-sm"
+            style={{ background: "rgba(59,130,246,0.2)", color: "#60a5fa", border: "1px solid rgba(59,130,246,0.3)" }}
+          >
+            ← Kembali ke Dashboard
+          </button>
+          <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+        </div>
+      </div>
+    );
+  }
+
   const q = questions[currentQ];
-  if (!q) return null;
+  // Guard: currentQ out of range
+  if (!q) { return null; }
 
   // Lockdown guide screen — shown once before exam starts
   if (showLockdownGuide) {
